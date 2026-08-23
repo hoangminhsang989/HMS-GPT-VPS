@@ -7,6 +7,7 @@ from .powershell import ps_literal, run_powershell_json
 
 
 _MAX_GUEST_SCRIPT_BYTES = 16 * 1024
+_MAX_SECRET_PAYLOAD_BYTES = 8 * 1024
 
 
 @dataclass(frozen=True)
@@ -22,11 +23,14 @@ class PowerShellDirectCredential:
 
 
 def build_powershell_direct_host_script(vm_name: str) -> str:
-    """Build the host wrapper without embedding username/password/guest script.
+    """Build the host wrapper without embedding credentials, guest script or payload.
 
-    Credentials and the base64-encoded guest script are supplied only through
-    the child PowerShell process environment. The child removes those variables
-    immediately after creating the PSCredential/ScriptBlock.
+    Credentials, the base64-encoded guest script and an optional short-lived
+    secret payload are supplied only through the child PowerShell process
+    environment. The child removes all four environment variables before the
+    guest invocation. The optional payload then exists only in process memory
+    and is passed as the single `-ArgumentList` value to a guest script that
+    explicitly declares a parameter.
     """
     if not vm_name.strip():
         raise ValueError("VM name is required")
@@ -37,9 +41,11 @@ $vmName = {vm}
 $username = $env:HMS_PSDIRECT_USERNAME
 $passwordText = $env:HMS_PSDIRECT_PASSWORD
 $guestScriptB64 = $env:HMS_PSDIRECT_SCRIPT_B64
+$payloadB64 = $env:HMS_PSDIRECT_PAYLOAD_B64
 if ([string]::IsNullOrWhiteSpace($username)) {{ throw 'PowerShell Direct username missing' }}
 if ([string]::IsNullOrEmpty($passwordText)) {{ throw 'PowerShell Direct password missing' }}
 if ([string]::IsNullOrWhiteSpace($guestScriptB64)) {{ throw 'PowerShell Direct guest script missing' }}
+$hasPayload = -not [string]::IsNullOrWhiteSpace($payloadB64)
 
 $securePassword = ConvertTo-SecureString $passwordText -AsPlainText -Force
 $credential = [System.Management.Automation.PSCredential]::new($username, $securePassword)
@@ -51,16 +57,24 @@ $guestScript = [scriptblock]::Create($guestScriptText)
 Remove-Item Env:\HMS_PSDIRECT_PASSWORD -ErrorAction SilentlyContinue
 Remove-Item Env:\HMS_PSDIRECT_USERNAME -ErrorAction SilentlyContinue
 Remove-Item Env:\HMS_PSDIRECT_SCRIPT_B64 -ErrorAction SilentlyContinue
+Remove-Item Env:\HMS_PSDIRECT_PAYLOAD_B64 -ErrorAction SilentlyContinue
 $passwordText = $null
 $guestScriptB64 = $null
 
-Invoke-Command -VMName $vmName -Credential $credential -ScriptBlock $guestScript -ErrorAction Stop
+if ($hasPayload) {{
+  Invoke-Command -VMName $vmName -Credential $credential -ScriptBlock $guestScript -ArgumentList $payloadB64 -ErrorAction Stop
+}} else {{
+  Invoke-Command -VMName $vmName -Credential $credential -ScriptBlock $guestScript -ErrorAction Stop
+}}
+$payloadB64 = $null
 """.strip()
 
 
 def _direct_environment(
     credential: PowerShellDirectCredential,
     guest_script: str,
+    *,
+    secret_payload: bytes | None = None,
 ) -> dict[str, str]:
     credential.validate()
     if not guest_script.strip():
@@ -70,11 +84,24 @@ def _direct_environment(
         raise ValueError(
             f"guest PowerShell script exceeds {_MAX_GUEST_SCRIPT_BYTES} byte bootstrap limit"
         )
-    return {
+    environment = {
         "HMS_PSDIRECT_USERNAME": credential.username,
         "HMS_PSDIRECT_PASSWORD": credential.password,
         "HMS_PSDIRECT_SCRIPT_B64": base64.b64encode(encoded).decode("ascii"),
     }
+    if secret_payload is not None:
+        if not isinstance(secret_payload, bytes):
+            raise TypeError("PowerShell Direct secret payload must be bytes")
+        if not secret_payload:
+            raise ValueError("PowerShell Direct secret payload must not be empty")
+        if len(secret_payload) > _MAX_SECRET_PAYLOAD_BYTES:
+            raise ValueError(
+                f"PowerShell Direct secret payload exceeds {_MAX_SECRET_PAYLOAD_BYTES} byte limit"
+            )
+        environment["HMS_PSDIRECT_PAYLOAD_B64"] = base64.b64encode(secret_payload).decode(
+            "ascii"
+        )
+    return environment
 
 
 def run_vm_powershell_json(
@@ -83,16 +110,23 @@ def run_vm_powershell_json(
     guest_script: str,
     *,
     timeout_seconds: int = 120,
+    secret_payload: bytes | None = None,
 ) -> dict[str, object]:
     """Run a bootstrap-scoped PowerShell script inside a Hyper-V guest.
 
-    The secret is absent from the command line and host script text. Callers
-    must not log the child environment or the returned guest script payload.
+    The bootstrap credential, guest script and optional short-lived secret
+    payload are absent from the command line and host script text. Callers must
+    not log the child environment or payload. Guest scripts using a payload must
+    declare one string parameter and base64-decode it inside the guest.
     """
     return run_powershell_json(
         build_powershell_direct_host_script(vm_name),
         timeout_seconds=timeout_seconds,
-        env=_direct_environment(credential, guest_script),
+        env=_direct_environment(
+            credential,
+            guest_script,
+            secret_payload=secret_payload,
+        ),
     )
 
 
