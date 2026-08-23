@@ -7,7 +7,9 @@ name = "hms-gpt-vps"
 version = "0.1.0"
 description = "Secure VPS agent foundation for HMS GPT control workflows"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "pycdlib>=1.20,<2",
+]
 
 [project.optional-dependencies]
 dev = [
