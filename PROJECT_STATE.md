@@ -2,7 +2,7 @@
 
 ## Current revision
 
-R002 — Windows Hyper-V provisioning foundation
+R002A — Windows Hyper-V host execution foundation
 
 ## Status
 
@@ -17,27 +17,26 @@ IN_PROGRESS
 
 ## Product authority
 
-The canonical product is a **Windows desktop tool** that creates and manages an isolated **Windows Hyper-V VM on the same Windows PC**.
+The canonical product is a Windows desktop tool that creates and manages an isolated Windows Hyper-V VM on the same Windows PC.
 
 Primary workflow:
 
-`Tạo VPS -> create/recover Windows Hyper-V VM -> install HMS Agent -> create isolated VM workspace -> start outbound secure control channel -> display one-time pairing link -> pair with supported ChatGPT/HMS integration -> ChatGPT creates/reads/tests files inside the VM.`
+`Tạo VPS -> detect Hyper-V host readiness -> create/recover Windows Hyper-V VM -> install HMS Agent -> create isolated VM workspace -> start outbound secure control channel -> display one-time pairing link -> pair with supported ChatGPT/HMS integration -> ChatGPT creates/reads/tests files inside the VM.`
 
 Windows is the primary guest OS. Linux/WSL2 and remote VPS backends are optional future modes.
 
-## Current implementation
+## Delivered foundation
 
-R001 foundation already includes:
+R001 includes fail-closed policy, workspace isolation, audit log, policy-gated executor, read-only Git operations, health CLI, tests and CI.
 
-- fail-closed policy primitive;
-- workspace isolation resolver;
-- append-only audit log;
-- policy-gated command executor;
-- read-only Git operations;
-- health CLI;
-- unit tests and GitHub Actions CI definition.
+R002 includes the Hyper-V prerequisite model, deterministic Windows VM configuration and provisioning plan generation.
 
-R002 begins the Windows host/Hyper-V provisioning layer.
+R002A now adds:
+
+- read-only Windows/Hyper-V host probe using PowerShell;
+- persistent atomic VM instance registry;
+- idempotent PowerShell executor foundation that ensures a base Hyper-V VM shell;
+- tests for registry round-trip/update and generated VM script shape.
 
 ## Security baseline
 
@@ -50,15 +49,14 @@ R002 begins the Windows host/Hyper-V provisioning layer.
 7. Audit accepted and rejected actions.
 8. Do not store reusable plaintext credentials in the repository or pairing link.
 
-## R002 objectives
+## R002A remaining objectives
 
-- Model Hyper-V host prerequisites.
-- Model deterministic VM configuration.
-- Add provisioning phases/state machine.
-- Generate safe PowerShell provisioning commands/plans.
-- Keep planning separate from host mutation.
-- Add tests for defaults and validation.
-- Then implement actual Windows host execution with explicit elevation gates.
+- Add explicit elevation gate for host mutations.
+- Add Hyper-V feature enable/reboot recovery workflow.
+- Add Windows installation media/base-image management.
+- Add VM boot readiness detection.
+- Bootstrap guest Windows automatically.
+- Install HMS Agent inside the guest.
 
 ## Canonical end-to-end target
 
