@@ -2,7 +2,7 @@
 
 ## Current revision
 
-R002C — Guest bootstrap and Agent boundary foundation (Tranche 4)
+R002C — Post-install finalization + Agent application-health foundation (Tranche 4B)
 
 ## Status
 
@@ -21,7 +21,7 @@ The canonical product is a Windows desktop tool that creates and manages an isol
 
 Primary workflow:
 
-`Tạo VPS -> detect/enable Hyper-V with approval -> resume after reboot -> verify Windows image -> ensure isolated Internal vSwitch/NAT -> create/recover identity-pinned Windows VM -> create transient answer media -> unattended Windows install -> PowerShell Direct guest bootstrap -> copy/verify Agent artifact -> install least-privilege HMS Agent service -> retire bootstrap Administrator -> remove transient install secrets -> outbound authenticated Agent control -> one-time pairing -> supported ChatGPT/HMS integration -> workspace/test/git operations inside the VM.`
+`Tạo VPS -> detect/enable Hyper-V with approval -> resume after reboot -> verify Windows image -> ensure isolated Internal vSwitch/NAT -> create/recover identity-pinned Windows VM -> transient answer media -> unattended Windows install -> PowerShell Direct guest bootstrap -> copy/verify Agent artifact -> install least-privilege HMS Agent service -> prove Agent application health -> retire bootstrap Administrator -> detach answer media -> remove transient install secrets -> outbound authenticated Agent control -> one-time pairing -> supported ChatGPT/HMS integration -> workspace/test/git operations inside the VM.`
 
 Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optional future modes.
 
@@ -87,10 +87,10 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 - `WindowsInstallRuntime` postcondition-oriented execution;
 - `docs/R002C_WINDOWS_INSTALL.md`.
 
-### R002C Tranche 4 — guest bootstrap / Agent boundary foundation now adds
+### R002C Tranche 4 — guest bootstrap / Agent service boundary
 
 - Windows CI matrix (`windows-latest`, Python 3.11/3.12/3.13) in addition to Linux matrix;
-- existing DPAPI test now executes a native protect/unprotect round-trip on Windows CI;
+- existing DPAPI test executes a native protect/unprotect round-trip on Windows CI;
 - secret-safe Hyper-V PowerShell Direct runner;
 - bootstrap username/password/guest script passed through child-process environment instead of command line;
 - environment variables removed inside child PowerShell before guest invocation;
@@ -105,15 +105,34 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 - guest-side Agent SHA-256 verification before SCM mutation;
 - service failure-recovery configuration;
 - read-only Windows service-readiness probe for SCM account, command, hash, service SID and ACL invariants;
-- explicit `application_health = NOT_IMPLEMENTED` until real Agent protocol health exists;
 - bootstrap retirement primitive that disables (does not delete) the temporary account;
 - AutoLogon disabled and `DefaultPassword` residue removed;
 - cached unattend cleanup limited to known files whose content references the managed bootstrap username;
 - exact managed answer-ISO detach primitive;
 - transient install secret cleanup hardened to managed runtime path + persisted SHA-256;
 - cleanup remains idempotent when answer ISO was already removed during crash/resume;
-- new regression tests for package tamper detection, service-readiness non-claims, bootstrap retirement and secret cleanup;
+- regression tests for package tamper detection, service boundary, bootstrap retirement and managed secret cleanup;
 - `docs/R002C_GUEST_BOOTSTRAP_AGENT.md`.
+
+### R002C Tranche 4B — crash-safe finalization + application health now adds
+
+- `ProvisionState` explicitly separates `AGENT_SERVICE_READY` from `AGENT_HEALTHY`;
+- durable post-install checkpoints: `BOOTSTRAP_RETIRING`, `BOOTSTRAP_RETIRED`, `ANSWER_MEDIA_DETACHED`, `INSTALL_SECRETS_CLEARED`;
+- checked state transitions reject out-of-order cleanup;
+- orchestrator no longer interprets SCM/service readiness as application protocol health;
+- `AGENT_SERVICE_READY` waits for a real application-health proof before retirement;
+- bootstrap retirement uses a two-phase fail-closed checkpoint: persist `BOOTSTRAP_RETIRING` before the final credentialed action;
+- if the process dies in the retirement ambiguity window, automatic PowerShell Direct retry is forbidden and state remains `WAIT_FOR_BOOTSTRAP_RETIREMENT_PROOF`;
+- a future authenticated Agent observation can provide external retirement proof without reusing the disabled bootstrap credential;
+- host-side answer-media detach and secret cleanup remain idempotent/retriable after `BOOTSTRAP_RETIRED`;
+- `PostInstallFinalizationRuntime` enforces state guards and verified cleanup order;
+- regression tests prove retirement timeout leaves `BOOTSTRAP_RETIRING`, no credentialed auto-retry occurs, external proof can resume, cleanup cannot advance on hash mismatch, and out-of-order state transitions fail closed;
+- strict Agent `/healthz` schema version 1 added;
+- minimum application capability set: `workspace.read`, `workspace.write`, `process.test`, `git.status`, `audit.read`;
+- health proof requires exact managed instance, exact workspace, `NT SERVICE\HMSAgent`, `loopback-only`, `non-admin`, unique capabilities and non-empty boot identity;
+- health documents reject secret-bearing fields such as token/password/API key/authorization/cookie;
+- local health probe is fixed to `http://127.0.0.1:<port>/healthz`, with redirects disabled, and is executed through PowerShell Direct before bootstrap retirement;
+- application-health regression tests cover identity/workspace/privilege/listener/capability/secret-field failures.
 
 ## Architecture decisions locked
 
@@ -129,8 +148,10 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 10. Permanent HMS Agent service runs as `LocalService` plus a per-service SID, not as Administrator or LocalSystem.
 11. Guest Agent artifact is verified on host and again inside guest before service creation/start.
 12. Windows service readiness is not equivalent to Agent application/protocol health.
-13. Bootstrap account retirement must be durably checkpointed before DPAPI state is discarded because retirement invalidates PowerShell Direct credentials.
-14. A pairing URL/code is bootstrap authorization for a compatible HMS integration; ordinary ChatGPT does not gain shell access merely by receiving a URL.
+13. Bootstrap account retirement has an explicit ambiguity checkpoint (`BOOTSTRAP_RETIRING`); automatic credential reuse is forbidden once that checkpoint exists.
+14. DPAPI state is not discarded until retirement is proven and answer media has been detached.
+15. Agent application health must be secret-free, loopback-only for local health probing and prove non-admin capability readiness.
+16. A pairing URL/code is bootstrap authorization for a compatible HMS integration; ordinary ChatGPT does not gain shell access merely by receiving a URL.
 
 ## Security baseline
 
@@ -148,59 +169,47 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 12. `WillWipeDisk` is permitted only for the exact dedicated managed guest VHDX after destructive-target verification.
 13. Unknown DVD media is not silently replaced or deleted.
 14. Transient answer-media integrity is verified by SHA-256 before Windows Setup and again before local deletion.
-15. Temporary bootstrap Administrator is disabled after Agent bootstrap; it is not the long-lived Agent identity.
+15. Temporary bootstrap Administrator is disabled after Agent application health is proven; it is not the long-lived Agent identity.
 16. AutoLogon password residue and managed unattend copies must be removed during retirement.
 17. Agent binary directory is read/execute for the service SID; workspace/state are Modify only.
+18. Agent `/healthz` may contain no reusable authentication material.
+19. A crash during bootstrap retirement must fail closed rather than attempt blind credential reuse.
 
 ## Verification status
 
 ### Deterministic/code-level
 
-The repository contains regression coverage for core Python models, generated XML/ISO/PowerShell invariants, PowerShell escaping, secret redaction, DPAPI platform behavior, package hashing, service-boundary configuration, bootstrap retirement and managed secret cleanup.
+The repository contains regression coverage for core Python models, generated XML/ISO/PowerShell invariants, PowerShell escaping, secret redaction, DPAPI platform behavior, package hashing, service-boundary configuration, application-health schema, retirement crash handling and managed secret cleanup.
 
 ### CI visibility
 
-The repository CI workflow now contains both Linux and Windows Python matrices. The connected GitHub status surface currently exposes no checks for the latest direct-push HEAD, and the workflow-run connector available in this chat only returns PR-triggered runs. Therefore **CI is currently pending/unobservable from this chat and is not declared PASS**.
+The repository CI workflow contains both Linux and Windows Python matrices. The connected GitHub status surface has not exposed direct-push checks in this chat, so **CI is not declared PASS unless a visible check result is obtained**.
 
 ### Not yet runtime PASS
 
-A real Windows Hyper-V integration run is still mandatory. GitHub-hosted runners do not prove actual Hyper-V/vTPM/NAT/firmware behavior, Windows Setup answer-file consumption, PowerShell Direct bootstrap, Guest Service Interface copy semantics or real service SID ACL behavior on the target machine.
+A real Windows Hyper-V integration run remains mandatory. GitHub-hosted runners do not prove actual Hyper-V/vTPM/NAT/firmware behavior, Windows Setup answer-file consumption, PowerShell Direct bootstrap, Guest Service Interface copy semantics, service SID ACL behavior or the future HMS Agent executable/application endpoint on the target machine.
 
 Do **not** label R002C runtime PASS until those Windows-host tests are executed and non-secret evidence is captured.
 
 ## Next objectives
 
-### R002C Tranche 4B — persistent post-install finalization runtime
+### R002C Tranche 4C — real Agent executable + Windows/Hyper-V integration
 
-- extend durable provisioning state with guest-bootstrap/service-ready/bootstrap-retired/media-detached/secrets-cleared checkpoints;
-- make crash/resume safe after bootstrap account disablement;
-- require service readiness before retirement;
-- require persisted retirement checkpoint before DPAPI deletion;
-- add read-only post-reboot service proof;
-- define actual Agent `/healthz` and capability schema;
-- build/identify the real signed Agent executable artifact and package manifest generation path.
-
-### R002C Tranche 3B/4C — real Windows/Hyper-V integration harness
-
-- preflight Hyper-V/network/media conflicts;
-- reconcile Internal vSwitch/NAT twice for idempotency proof;
-- create VM, persist VMId, reconcile by VMId;
-- prove Secure Boot + vTPM readback;
-- run native DPAPI round-trip;
-- start unattended Windows installation on an explicitly disposable test VM;
-- prove PowerShell Direct, deterministic guest IP and Guest Service Interface copy;
-- install Agent service and prove service SID ACLs;
-- retire bootstrap account and clear install secrets;
-- reboot and re-prove service readiness;
+- build/identify the real HMS Agent Windows executable artifact;
+- implement the loopback-only `/healthz` endpoint matching schema v1;
+- implement the five minimum non-admin capabilities behind the Agent policy boundary;
+- verify package manifest + guest SHA-256 + service install on real Windows;
+- execute the full unattended install/bootstrap/finalization path on an explicitly disposable Hyper-V VM;
+- prove restart persistence and post-reboot Agent health;
 - capture deterministic non-secret evidence JSON;
 - no broad/destructive cleanup of operator resources.
 
 ### R002C Tranche 5 — pairing/control proof
 
-- one-time pair-token lifecycle;
-- outbound authenticated Agent <-> Bridge session;
+- one-time pair-token lifecycle with high entropy, expiration, single use and no plaintext-at-rest token;
+- outbound authenticated Agent <-> Bridge device session;
 - compatible ChatGPT MCP/connector/action surface;
-- `workspace.read`, `workspace.write`, `process.test`, `git.status`, `audit.read`;
+- per-instance capability/scoping enforcement;
 - session rotation/revocation/idempotency;
 - canonical end-to-end file proof.
 
