@@ -2,7 +2,7 @@
 
 ## Current revision
 
-R002C — Provisioning state machine and control-contract foundation (Tranche 1)
+R002C — Hyper-V reconciliation foundation (Tranche 2)
 
 ## Status
 
@@ -27,7 +27,7 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 
 ## Delivered foundation
 
-R001:
+### R001
 
 - fail-closed policy;
 - workspace isolation;
@@ -37,11 +37,11 @@ R001:
 - health CLI;
 - unit tests and CI.
 
-R002/R002A/R002B:
+### R002/R002A/R002B
 
 - Hyper-V prerequisite/configuration model;
 - host probe;
-- instance registry;
+- persistent instance registry;
 - idempotent VM shell executor;
 - explicit elevation gate;
 - Hyper-V enable flow;
@@ -49,26 +49,46 @@ R002/R002A/R002B:
 - Windows ISO/SHA-256 validation;
 - VM running/heartbeat readiness probe.
 
-R002C Tranche 1 now adds:
+### R002C Tranche 1
 
 - persistent `ProvisionState` model and atomic state store;
 - reconcile-oriented `ProvisioningOrchestrator`;
 - structured PowerShell runner foundation;
 - generated secret-free Windows unattend answer-file foundation;
-- R002C state-machine/unattend tests;
+- state-machine/unattend tests;
 - `docs/R002C_ARCHITECTURE.md`;
 - `docs/CONTROL_PROTOCOL.md` defining the real ChatGPT pairing/control contract.
+
+### R002C Tranche 2 now adds
+
+- hardened PowerShell single-quoted literal encoder;
+- fixed structured PowerShell JSON execution wrapper;
+- dedicated Internal Hyper-V vSwitch + NAT reconciler;
+- isolated-network default `HMS-GPT-VPS-Internal` instead of `Default Switch`;
+- fail-closed VM reconciliation bound to persisted Hyper-V `VMId`;
+- Generation-2 Secure Boot using Microsoft Windows template;
+- no automatic stop/reset of a running VM during reconciliation;
+- verified Windows ISO/DVD attach + first-boot-device reconciliation;
+- read-only Hyper-V observer for network/VM/media/heartbeat postconditions;
+- persistent VMId/switch/guest-IP metadata in the instance registry;
+- registry protection against silent VMId replacement;
+- `HyperVTranche2Runtime` with read-after-write verification;
+- state-machine fix: durable progress now advances only after observed postconditions;
+- legacy `hyperv_executor` routed through the hardened reconciler;
+- security-regression tests for PowerShell escaping, network isolation, VM identity, media attach and observe-before-advance semantics;
+- `docs/R002C_HYPERV_RECONCILIATION.md`.
 
 ## Architecture decisions locked by deep research
 
 1. **Hyper-V Windows VM is the production default** because it provides the appropriate isolation boundary for remote AI-controlled code/file execution.
 2. **Host and guest control planes are separate.** ChatGPT/HMS control targets the guest agent only; Hyper-V and host Administrator operations remain local desktop authority.
 3. **Provisioning is reconcile-oriented and persistent**, not a one-shot PowerShell script.
-4. **Internal vSwitch + NAT** is preferred over an external bridged switch for the managed guest.
-5. **PowerShell Direct** is the preferred local guest-bootstrap transport after Windows is installed; normal mode does not expose WinRM/RDP/SSH to LAN/Internet.
-6. **A pasted URL alone does not give ChatGPT shell access.** The pair link/code is only a one-time bootstrap credential for a compatible HMS MCP/connector/Bridge control integration.
-7. Pairing credentials must be short-lived, high entropy, single-use and contain no reusable VM/agent/host secret.
-8. Windows unattended installation is the MVP image strategy; generalized Sysprep VHDX may become the fast path later.
+4. **Every mutation uses observe -> decide -> mutate -> observe -> verify -> advance.** Durable state never advances just because a command was attempted.
+5. **Internal vSwitch + NAT** is preferred over an external bridged switch for the managed guest.
+6. **PowerShell Direct** is the preferred local guest-bootstrap transport after Windows is installed; normal mode does not expose WinRM/RDP/SSH to LAN/Internet.
+7. **A pasted URL alone does not give ChatGPT shell access.** The pair link/code is only a one-time bootstrap credential for a compatible HMS MCP/connector/Bridge control integration.
+8. Pairing credentials must be short-lived, high entropy, single-use and contain no reusable VM/agent/host secret.
+9. Windows unattended installation is the MVP image strategy; generalized Sysprep VHDX may become the fast path later.
 
 ## Security baseline
 
@@ -82,23 +102,33 @@ R002C Tranche 1 now adds:
 8. Agent/Bridge control is outbound-authenticated; no public inbound guest management port is required.
 9. Reusable plaintext credentials must not appear in Git, pairing links, or audit logs.
 10. Pairing/session authorization is per-instance, scoped, expiring, revocable and independently rotatable.
+11. Hyper-V VM identity is pinned by VMId after first creation; a conflicting identity fails closed.
+12. Default managed networking creates no inbound NAT static mapping and does not bridge the guest directly to the physical LAN.
 
-## R002C remaining objectives
+## R002C Tranche 2 verification status
 
-### Tranche 2 — Hyper-V reconciliation
+Code-level implementation is present. Python/unit tests and generated-PowerShell invariants are covered by GitHub CI.
 
-- ensure dedicated Internal vSwitch;
-- ensure NAT configuration;
-- reconcile VM by stable observed identity/VMId;
-- attach verified ISO/DVD;
-- configure Gen2 boot order/Secure Boot intentionally;
-- start VM and persist observed state;
-- postcondition checks after every mutation.
+A **real Windows Hyper-V integration run is still required** before Tranche 2 can be declared runtime PASS. Linux GitHub Actions cannot prove actual Hyper-V cmdlet behavior, Windows NAT behavior, firmware boot order, or VM heartbeat on a real host.
+
+## Next objectives
+
+### Tranche 2B — Windows Hyper-V integration harness
+
+- add Windows-only integration markers/harness;
+- dry-run/preflight report for host network conflicts;
+- run actual Internal vSwitch/NAT create/reconcile twice to prove idempotency;
+- create VM, persist VMId, reconcile again by VMId;
+- attach verified ISO and verify DVD/boot postconditions;
+- collect deterministic evidence JSON without exposing secrets;
+- rollback/cleanup only through explicit operator-approved test fixture workflow.
 
 ### Tranche 3 — Windows guest installation
 
 - finish unattended Windows Setup media pipeline;
-- safely supply bootstrap-only guest credential without storing reusable secret in Git;
+- generate bootstrap-only installation artifacts outside Git;
+- configure deterministic guest network parameters for the managed internal NAT;
+- safely supply bootstrap-only guest credential without embedding reusable secret in Git;
 - wait through install/reboot cycles;
 - detect final guest heartbeat/PowerShell Direct readiness;
 - optional prepared generalized VHDX optimization later.
@@ -114,7 +144,7 @@ R002C Tranche 1 now adds:
 ### Tranche 5 — Pairing/control proof
 
 - implement one-time pairing record/token lifecycle;
-- outbound authenticated Agent ↔ Bridge session;
+- outbound authenticated Agent <-> Bridge session;
 - compatible ChatGPT MCP/connector/action surface;
 - `workspace.read`, `workspace.write`, `process.test`, `git.status`, `audit.read`;
 - session expiration/rotation/revocation and idempotency keys;
