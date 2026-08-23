@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -12,6 +13,11 @@ from hms_gpt_vps.unattend import (
     UNATTEND_NS,
     UnattendConfig,
     generate_install_unattend,
+)
+from hms_gpt_vps.windows_dpapi import (
+    DpapiUnavailableError,
+    protect_bytes,
+    unprotect_bytes,
 )
 from hms_gpt_vps.windows_install_start import build_start_unattended_install_script
 from hms_gpt_vps.windows_provisioner import WindowsVMConfig
@@ -49,6 +55,24 @@ def test_bootstrap_credentials_are_random_and_repr_redacted() -> None:
     assert len(first.password) == 32
     assert first.password not in repr(first)
     assert first.username in repr(first)
+
+
+def test_unattend_bootstrap_password_is_redacted_from_repr() -> None:
+    config = install_config()
+    assert config.bootstrap.password not in repr(config.bootstrap)
+    assert config.bootstrap.password not in repr(config)
+    assert config.bootstrap.username in repr(config.bootstrap)
+
+
+def test_dpapi_is_windows_only_and_round_trips_when_available() -> None:
+    secret = b"hms-transient-secret"
+    if os.name == "nt":
+        protected = protect_bytes(secret)
+        assert protected != secret
+        assert unprotect_bytes(protected) == secret
+    else:
+        with pytest.raises(DpapiUnavailableError):
+            protect_bytes(secret)
 
 
 def test_install_unattend_requires_explicit_blank_disk_acknowledgement() -> None:
