@@ -8,21 +8,22 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 from tempfile import NamedTemporaryFile
 from typing import Any, Mapping
 
 from .audit import AuditLog
 from .control_request import ControlRequest
-from .executor import ExecutionDenied, run_command
+from .executor import CommandResult, ExecutionDenied, run_command
 from .policy import Decision, PolicyRequest, evaluate
 from .workspace import Workspace
 
 
 MAX_WORKSPACE_READ_BYTES = 1024 * 1024
 MAX_WORKSPACE_WRITE_BYTES = 1024 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 MAX_AUDIT_EVENTS = 100
 _SAFE_MAXFAIL = re.compile(r"^[1-9][0-9]{0,2}$")
+_PATH_SPLIT = re.compile(r"[\\/]+")
 
 
 class ControlActionError(RuntimeError):
@@ -82,6 +83,42 @@ class ControlActionRuntime:
         if raw in {".", "./", ".\\"}:
             raise ControlActionPreconditionError("path must identify a file")
         return raw
+
+    @staticmethod
+    def _reject_protected_write_path(relative: str) -> None:
+        # workspace.write is intentionally a source/content capability, not a
+        # Git metadata mutation surface.  Treat both slash styles as separators
+        # so this stays fail-closed on Windows even when tests run on POSIX.
+        for raw_part in _PATH_SPLIT.split(relative):
+            normalized = raw_part.rstrip(" .").casefold()
+            if normalized == ".git" or normalized.startswith(".git:"):
+                raise ControlActionPreconditionError(
+                    "workspace.write refuses paths inside Git metadata"
+                )
+
+    @staticmethod
+    def _bounded_output(value: str) -> tuple[str, bool, int]:
+        encoded = value.encode("utf-8", errors="replace")
+        original_bytes = len(encoded)
+        if original_bytes <= MAX_COMMAND_OUTPUT_BYTES:
+            return value, False, original_bytes
+        bounded = encoded[:MAX_COMMAND_OUTPUT_BYTES].decode("utf-8", errors="ignore")
+        return bounded, True, original_bytes
+
+    @classmethod
+    def _command_response(cls, result: CommandResult) -> dict[str, Any]:
+        stdout, stdout_truncated, stdout_bytes = cls._bounded_output(result.stdout)
+        stderr, stderr_truncated, stderr_bytes = cls._bounded_output(result.stderr)
+        return {
+            "ok": result.returncode == 0,
+            "returncode": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
+        }
 
     def execute(
         self,
@@ -150,6 +187,7 @@ class ControlActionRuntime:
         explicitly_approved: bool,
     ) -> dict[str, Any]:
         relative = self._relative_path(params)
+        self._reject_protected_write_path(relative)
         content = params.get("content")
         if not isinstance(content, str):
             raise ControlActionPreconditionError("workspace.write content must be UTF-8 text")
@@ -285,13 +323,9 @@ class ControlActionRuntime:
             audit_log=self.audit_log,
             timeout_seconds=float(timeout),
         )
-        return {
-            "ok": result.returncode == 0,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "argv": list(result.argv),
-        }
+        response = self._command_response(result)
+        response["argv"] = list(result.argv)
+        return response
 
     def _git_status(self) -> dict[str, Any]:
         result = run_command(
@@ -301,12 +335,7 @@ class ControlActionRuntime:
             audit_log=self.audit_log,
             timeout_seconds=30,
         )
-        return {
-            "ok": result.returncode == 0,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
+        return self._command_response(result)
 
     def _audit_read(self, params: Mapping[str, Any]) -> dict[str, Any]:
         self._require_policy("audit.read")
