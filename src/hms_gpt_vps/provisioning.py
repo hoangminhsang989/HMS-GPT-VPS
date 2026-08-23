@@ -16,7 +16,11 @@ class ProvisionObservation:
     vm_running: bool = False
     guest_booted: bool = False
     guest_bootstrap_ready: bool = False
+    agent_service_ready: bool = False
     agent_healthy: bool = False
+    bootstrap_retired: bool = False
+    answer_media_detached: bool = False
+    install_secrets_cleared: bool = False
     pairing_ready: bool = False
     paired: bool = False
 
@@ -41,9 +45,14 @@ class TransitionResult:
 class ProvisioningOrchestrator:
     """Persistent reconcile-oriented provisioning state machine.
 
-    Mutation actions do not advance durable state. A state advances only after
-    the next observation proves the previous mutation reached its postcondition.
-    This makes retries/reboots resumable without silently skipping failed steps.
+    Ordinary mutation actions do not advance durable state. A state advances only
+    after observation proves the previous mutation reached its postcondition.
+
+    Bootstrap retirement is a special two-phase boundary: the runtime first
+    persists BOOTSTRAP_RETIRING, then executes the final credentialed guest
+    action, then persists BOOTSTRAP_RETIRED after the guest script verifies its
+    own postconditions. If the process crashes in that narrow window, automatic
+    credential reuse is prohibited and recovery waits for an external proof.
     """
 
     def __init__(self, state_path: Path) -> None:
@@ -195,15 +204,57 @@ class ProvisioningOrchestrator:
             return TransitionResult(next_record, "GUEST_BOOTSTRAP_VERIFIED")
 
         if record.state in {ProvisionState.GUEST_BOOTSTRAP, ProvisionState.AGENT_INSTALLING}:
-            if not observed.agent_healthy:
+            if not observed.agent_service_ready:
                 return TransitionResult(record, "INSTALL_HMS_AGENT")
+            next_record = self.store.transition(
+                instance_id=context.instance_id,
+                state=ProvisionState.AGENT_SERVICE_READY,
+            )
+            return TransitionResult(next_record, "AGENT_SERVICE_VERIFIED")
+
+        if record.state is ProvisionState.AGENT_SERVICE_READY:
+            if not observed.agent_healthy:
+                return TransitionResult(record, "WAIT_FOR_AGENT_APPLICATION_HEALTH")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.AGENT_HEALTHY,
             )
-            return TransitionResult(next_record, "AGENT_VERIFIED")
+            return TransitionResult(next_record, "AGENT_APPLICATION_HEALTH_VERIFIED")
 
         if record.state is ProvisionState.AGENT_HEALTHY:
+            return TransitionResult(record, "RETIRE_BOOTSTRAP_ACCOUNT")
+
+        if record.state is ProvisionState.BOOTSTRAP_RETIRING:
+            if not observed.bootstrap_retired:
+                return TransitionResult(record, "WAIT_FOR_BOOTSTRAP_RETIREMENT_PROOF")
+            next_record = self.store.transition_checked(
+                instance_id=context.instance_id,
+                expected_state=ProvisionState.BOOTSTRAP_RETIRING,
+                state=ProvisionState.BOOTSTRAP_RETIRED,
+            )
+            return TransitionResult(next_record, "BOOTSTRAP_RETIREMENT_VERIFIED")
+
+        if record.state is ProvisionState.BOOTSTRAP_RETIRED:
+            if not observed.answer_media_detached:
+                return TransitionResult(record, "DETACH_ANSWER_MEDIA")
+            next_record = self.store.transition_checked(
+                instance_id=context.instance_id,
+                expected_state=ProvisionState.BOOTSTRAP_RETIRED,
+                state=ProvisionState.ANSWER_MEDIA_DETACHED,
+            )
+            return TransitionResult(next_record, "ANSWER_MEDIA_DETACH_VERIFIED")
+
+        if record.state is ProvisionState.ANSWER_MEDIA_DETACHED:
+            if not observed.install_secrets_cleared:
+                return TransitionResult(record, "CLEAR_INSTALL_SECRETS")
+            next_record = self.store.transition_checked(
+                instance_id=context.instance_id,
+                expected_state=ProvisionState.ANSWER_MEDIA_DETACHED,
+                state=ProvisionState.INSTALL_SECRETS_CLEARED,
+            )
+            return TransitionResult(next_record, "INSTALL_SECRETS_CLEAR_VERIFIED")
+
+        if record.state is ProvisionState.INSTALL_SECRETS_CLEARED:
             if not observed.pairing_ready:
                 return TransitionResult(record, "CREATE_ONE_TIME_PAIRING")
             next_record = self.store.transition(
@@ -228,6 +279,35 @@ class ProvisioningOrchestrator:
 
     def mark_agent_healthy(self, instance_id: str) -> ProvisionRecord:
         return self.store.transition(instance_id=instance_id, state=ProvisionState.AGENT_HEALTHY)
+
+    def begin_bootstrap_retirement(self, instance_id: str) -> ProvisionRecord:
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.AGENT_HEALTHY,
+            state=ProvisionState.BOOTSTRAP_RETIRING,
+            reason="final_credentialed_guest_action",
+        )
+
+    def mark_bootstrap_retired(self, instance_id: str) -> ProvisionRecord:
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.BOOTSTRAP_RETIRING,
+            state=ProvisionState.BOOTSTRAP_RETIRED,
+        )
+
+    def mark_answer_media_detached(self, instance_id: str) -> ProvisionRecord:
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.BOOTSTRAP_RETIRED,
+            state=ProvisionState.ANSWER_MEDIA_DETACHED,
+        )
+
+    def mark_install_secrets_cleared(self, instance_id: str) -> ProvisionRecord:
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.ANSWER_MEDIA_DETACHED,
+            state=ProvisionState.INSTALL_SECRETS_CLEARED,
+        )
 
     def mark_ready(self, instance_id: str) -> ProvisionRecord:
         return self.store.transition(instance_id=instance_id, state=ProvisionState.READY)
