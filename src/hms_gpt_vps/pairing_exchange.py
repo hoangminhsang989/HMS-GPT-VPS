@@ -28,7 +28,11 @@ from .pairing_store import PairingNotFoundError, PairingStore
 
 PAIRING_EXCHANGE_RECOVERY_SECONDS = 60
 PAIRING_EXCHANGE_KEY_BYTES = 32
-_PAIRING_EXCHANGE_DOMAIN = b"hms-gpt-vps/pairing-exchange/v1"
+PAIRING_EXCHANGE_NONCE_BYTES = 16
+_PAIRING_EXCHANGE_DOMAIN = b"hms-gpt-vps/pairing-exchange/v2"
+_NONCE_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
 
 
 class PairingExchangeError(RuntimeError):
@@ -40,6 +44,10 @@ class PairingExchangeStoreMismatchError(PairingExchangeError):
 
 
 class PairingExchangeRecoveryExpiredError(PairingExchangeError):
+    pass
+
+
+class PairingExchangeRecoveryMismatchError(PairingExchangeError):
     pass
 
 
@@ -72,6 +80,25 @@ class PairingExchangeKey:
         return bytes(self.value)
 
 
+def generate_pairing_exchange_nonce() -> str:
+    """Generate the client-side replay binder for one pairing exchange."""
+    return secrets.token_urlsafe(PAIRING_EXCHANGE_NONCE_BYTES)
+
+
+def _validate_client_nonce(value: str) -> None:
+    if not isinstance(value, str) or not (20 <= len(value) <= 128):
+        raise PairingExchangeError("pairing exchange client nonce is invalid")
+    if any(char not in _NONCE_ALLOWED for char in value):
+        raise PairingExchangeError(
+            "pairing exchange client nonce contains unsupported characters"
+        )
+
+
+def _nonce_digest(value: str) -> str:
+    _validate_client_nonce(value)
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _aware_utc(value: datetime | None) -> datetime:
     checked = value or datetime.now(timezone.utc)
     if checked.tzinfo is None or checked.utcoffset() is None:
@@ -93,13 +120,19 @@ def _deserialize_pairing(raw: str) -> PairingRecord:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise PairingExchangeIntegrityError("stored pairing exchange record is invalid JSON") from exc
+        raise PairingExchangeIntegrityError(
+            "stored pairing exchange record is invalid JSON"
+        ) from exc
     if not isinstance(payload, dict):
-        raise PairingExchangeIntegrityError("stored pairing exchange record must be an object")
+        raise PairingExchangeIntegrityError(
+            "stored pairing exchange record must be an object"
+        )
     try:
         return PairingRecord.from_dict(payload)
     except ValueError as exc:
-        raise PairingExchangeIntegrityError("stored pairing exchange record failed validation") from exc
+        raise PairingExchangeIntegrityError(
+            "stored pairing exchange record failed validation"
+        ) from exc
 
 
 def _serialize_session(record: ControlSessionRecord) -> str:
@@ -116,13 +149,17 @@ def _deserialize_session(raw: str) -> ControlSessionRecord:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise PairingExchangeIntegrityError("stored exchange session is invalid JSON") from exc
+        raise PairingExchangeIntegrityError(
+            "stored exchange session is invalid JSON"
+        ) from exc
     if not isinstance(payload, dict):
         raise PairingExchangeIntegrityError("stored exchange session must be an object")
     try:
         return ControlSessionRecord.from_dict(payload)
     except ValueError as exc:
-        raise PairingExchangeIntegrityError("stored exchange session failed validation") from exc
+        raise PairingExchangeIntegrityError(
+            "stored exchange session failed validation"
+        ) from exc
 
 
 def _pair_token_digest(token: str) -> str:
@@ -146,7 +183,9 @@ def _derive_material(
     label: bytes,
     record: PairingRecord,
     pair_token: str,
+    client_nonce: str,
 ) -> bytes:
+    _validate_client_nonce(client_nonce)
     message = b"\x00".join(
         (
             _PAIRING_EXCHANGE_DOMAIN,
@@ -154,6 +193,7 @@ def _derive_material(
             record.pair_id.encode("utf-8"),
             record.instance_id.encode("utf-8"),
             pair_token.encode("utf-8"),
+            client_nonce.encode("utf-8"),
         )
     )
     return hmac.new(key.value, message, hashlib.sha256).digest()
@@ -166,23 +206,50 @@ def _urlsafe(raw: bytes) -> str:
 def derive_initial_session_grant(
     record: PairingRecord,
     pair_token: str,
+    client_nonce: str,
     key: PairingExchangeKey,
 ) -> ControlSessionGrant:
     """Derive exactly one initial session from an already-consumed pairing.
 
-    The Bridge key keeps the session credential computationally independent for
-    anyone who only possesses the pairing URL/token. Determinism is used solely
-    so a post-commit/pre-response crash can return the exact same session during
-    the bounded recovery window without storing the raw session token.
+    Recovery requires three values: the one-time pairing token, the client-side
+    nonce from the original exchange request, and the Bridge-held root key. The
+    database stores only the nonce SHA-256. Determinism is used solely so a
+    post-commit/pre-response crash can return the exact same session during the
+    bounded recovery window without storing the raw session token.
     """
     record.validate()
     if record.consumed_at is None:
         raise PairingExchangeError("pairing must be consumed before deriving a session")
     _authenticate_pair_token(record, pair_token, record.instance_id)
+    _validate_client_nonce(client_nonce)
 
-    session_token = _urlsafe(_derive_material(key, b"session-token", record, pair_token))
-    session_id = _urlsafe(_derive_material(key, b"session-id", record, pair_token)[:18])
-    family_id = _urlsafe(_derive_material(key, b"family-id", record, pair_token)[:18])
+    session_token = _urlsafe(
+        _derive_material(
+            key,
+            b"session-token",
+            record,
+            pair_token,
+            client_nonce,
+        )
+    )
+    session_id = _urlsafe(
+        _derive_material(
+            key,
+            b"session-id",
+            record,
+            pair_token,
+            client_nonce,
+        )[:18]
+    )
+    family_id = _urlsafe(
+        _derive_material(
+            key,
+            b"family-id",
+            record,
+            pair_token,
+            client_nonce,
+        )[:18]
+    )
     issued_at = record.consumed_at.astimezone(timezone.utc)
     session_record = ControlSessionRecord(
         schema_version=SESSION_SCHEMA_VERSION,
@@ -203,8 +270,9 @@ class PairingSessionExchange:
     """Atomic pairing->initial-session exchange over one shared SQLite file.
 
     Both PairingStore and ControlSessionStore must point to the same database so
-    consuming the pairing and inserting its initial session can commit in one
-    transaction. A retry after commit may recover the same derived session for a
+    consuming the pairing, persisting the nonce digest and inserting its initial
+    session can commit in one transaction. A retry after commit must provide the
+    exact original client nonce and may recover the same session only during a
     short window; it never creates a second session or stores raw credentials.
     """
 
@@ -226,6 +294,7 @@ class PairingSessionExchange:
             pairing_store.timeout_seconds,
             session_store.timeout_seconds,
         )
+        self._initialize_exchange_table()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -238,15 +307,31 @@ class PairingSessionExchange:
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
+    def _initialize_exchange_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pairing_exchanges (
+                    pair_id TEXT PRIMARY KEY NOT NULL,
+                    nonce_sha256 TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    FOREIGN KEY(pair_id) REFERENCES pairing_records(pair_id),
+                    FOREIGN KEY(session_id) REFERENCES control_sessions(session_id)
+                ) WITHOUT ROWID
+                """
+            )
+
     def exchange(
         self,
         pair_id: str,
         pair_token: str,
+        client_nonce: str,
         *,
         instance_id: str,
         now: datetime | None = None,
     ) -> ControlSessionGrant:
         checked_at = _aware_utc(now)
+        nonce_sha256 = _nonce_digest(client_nonce)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -268,7 +353,12 @@ class PairingSessionExchange:
                     instance_id=instance_id,
                     now=checked_at,
                 )
-                grant = derive_initial_session_grant(consumed, pair_token, self.key)
+                grant = derive_initial_session_grant(
+                    consumed,
+                    pair_token,
+                    client_nonce,
+                    self.key,
+                )
                 collision = connection.execute(
                     "SELECT record_json FROM control_sessions WHERE session_id = ?",
                     (grant.record.session_id,),
@@ -276,6 +366,14 @@ class PairingSessionExchange:
                 if collision is not None:
                     raise PairingExchangeIntegrityError(
                         "derived initial session already exists before pairing consumption"
+                    )
+                existing_exchange = connection.execute(
+                    "SELECT pair_id FROM pairing_exchanges WHERE pair_id = ?",
+                    (pair_id,),
+                ).fetchone()
+                if existing_exchange is not None:
+                    raise PairingExchangeIntegrityError(
+                        "unconsumed pairing already has an exchange binding"
                     )
 
                 connection.execute(
@@ -297,6 +395,13 @@ class PairingSessionExchange:
                         _serialize_session(session),
                     ),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO pairing_exchanges(pair_id, nonce_sha256, session_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (pair_id, nonce_sha256, session.session_id),
+                )
                 connection.execute("COMMIT")
                 return grant
 
@@ -304,15 +409,45 @@ class PairingSessionExchange:
             consumed_at = record.consumed_at.astimezone(timezone.utc)
             if checked_at < consumed_at:
                 raise PairingExchangeError("pairing recovery time precedes consumption")
-            if checked_at - consumed_at > timedelta(seconds=PAIRING_EXCHANGE_RECOVERY_SECONDS):
+            if checked_at - consumed_at > timedelta(
+                seconds=PAIRING_EXCHANGE_RECOVERY_SECONDS
+            ):
                 raise PairingExchangeRecoveryExpiredError(
                     "pairing exchange recovery window has expired"
                 )
 
-            grant = derive_initial_session_grant(record, pair_token, self.key)
+            exchange_row = connection.execute(
+                """
+                SELECT nonce_sha256, session_id
+                FROM pairing_exchanges
+                WHERE pair_id = ?
+                """,
+                (pair_id,),
+            ).fetchone()
+            if exchange_row is None:
+                raise PairingExchangeIntegrityError(
+                    "consumed pairing has no atomically committed exchange binding"
+                )
+            stored_nonce_sha256 = str(exchange_row["nonce_sha256"])
+            if not hmac.compare_digest(stored_nonce_sha256.lower(), nonce_sha256.lower()):
+                raise PairingExchangeRecoveryMismatchError(
+                    "pairing exchange client nonce does not match original request"
+                )
+
+            grant = derive_initial_session_grant(
+                record,
+                pair_token,
+                client_nonce,
+                self.key,
+            )
+            stored_session_id = str(exchange_row["session_id"])
+            if grant.record.session_id != stored_session_id:
+                raise PairingExchangeIntegrityError(
+                    "derived session identity no longer matches exchange binding"
+                )
             session_row = connection.execute(
                 "SELECT record_json FROM control_sessions WHERE session_id = ?",
-                (grant.record.session_id,),
+                (stored_session_id,),
             ).fetchone()
             if session_row is None:
                 raise PairingExchangeIntegrityError(
