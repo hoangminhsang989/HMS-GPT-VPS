@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .provision_state import ProvisionRecord, ProvisionState, ProvisionStateStore
@@ -9,11 +9,25 @@ from .windows_provisioner import HyperVHostState, WindowsVMConfig
 
 
 @dataclass(frozen=True)
+class ProvisionObservation:
+    network_ready: bool = False
+    vm_id: str | None = None
+    install_media_ready: bool = False
+    vm_running: bool = False
+    guest_booted: bool = False
+    guest_bootstrap_ready: bool = False
+    agent_healthy: bool = False
+    pairing_ready: bool = False
+    paired: bool = False
+
+
+@dataclass(frozen=True)
 class ProvisionContext:
     instance_id: str
     config: WindowsVMConfig
     host: HyperVHostState
     image: WindowsImage | None
+    observation: ProvisionObservation = field(default_factory=ProvisionObservation)
 
 
 @dataclass(frozen=True)
@@ -25,10 +39,11 @@ class TransitionResult:
 
 
 class ProvisioningOrchestrator:
-    """Persistent reconcile-oriented R002C provisioning state machine.
+    """Persistent reconcile-oriented provisioning state machine.
 
-    This class decides the next safe state. Host mutation remains delegated to
-    the dedicated Hyper-V/elevation/image/bootstrap modules.
+    Mutation actions do not advance durable state. A state advances only after
+    the next observation proves the previous mutation reached its postcondition.
+    This makes retries/reboots resumable without silently skipping failed steps.
     """
 
     def __init__(self, state_path: Path) -> None:
@@ -44,6 +59,7 @@ class ProvisioningOrchestrator:
 
     def reconcile(self, context: ProvisionContext) -> TransitionResult:
         record = self.current(context.instance_id)
+        observed = context.observation
 
         if record.state in {ProvisionState.READY, ProvisionState.FAILED}:
             return TransitionResult(record=record, action="NOOP")
@@ -91,13 +107,28 @@ class ProvisioningOrchestrator:
                     resume_state=ProvisionState.PREFLIGHT,
                 )
                 return TransitionResult(pending, "REQUEST_REBOOT", requires_reboot=True)
+            if context.image is None:
+                waiting = self.store.transition(
+                    instance_id=context.instance_id,
+                    state=ProvisionState.PREFLIGHT,
+                    reason="windows_image_required",
+                )
+                return TransitionResult(waiting, "WAIT_FOR_WINDOWS_IMAGE")
+            try:
+                context.image.validate()
+            except (FileNotFoundError, ValueError) as exc:
+                failed = self.store.transition(
+                    instance_id=context.instance_id,
+                    state=ProvisionState.FAILED,
+                    last_error=f"Windows image validation failed: {exc}",
+                )
+                return TransitionResult(failed, "BLOCK_INVALID_WINDOWS_IMAGE")
             ready = self.store.transition(
                 instance_id=context.instance_id,
-                state=ProvisionState.IMAGE_READY if context.image else ProvisionState.PREFLIGHT,
-                reason=None if context.image else "windows_image_required",
+                state=ProvisionState.IMAGE_READY,
+                reason=None,
             )
-            action = "VERIFY_IMAGE" if context.image else "WAIT_FOR_WINDOWS_IMAGE"
-            return TransitionResult(ready, action)
+            return TransitionResult(ready, "IMAGE_VERIFIED")
 
         if record.state is ProvisionState.NEED_ELEVATION:
             return TransitionResult(
@@ -110,62 +141,85 @@ class ProvisioningOrchestrator:
             return TransitionResult(record, "WAIT_FOR_REBOOT", requires_reboot=True)
 
         if record.state is ProvisionState.IMAGE_READY:
+            if not observed.network_ready:
+                return TransitionResult(record, "ENSURE_INTERNAL_NAT_NETWORK")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.NETWORK_READY,
             )
-            return TransitionResult(next_record, "ENSURE_INTERNAL_NAT_NETWORK")
+            return TransitionResult(next_record, "NETWORK_VERIFIED")
 
         if record.state is ProvisionState.NETWORK_READY:
+            if observed.vm_id is None:
+                return TransitionResult(record, "ENSURE_VM")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.VM_CREATED,
             )
-            return TransitionResult(next_record, "ENSURE_VM")
+            return TransitionResult(next_record, "VM_VERIFIED")
 
         if record.state is ProvisionState.VM_CREATED:
+            if not observed.install_media_ready:
+                return TransitionResult(record, "ATTACH_INSTALL_MEDIA")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.INSTALL_MEDIA_READY,
             )
-            return TransitionResult(next_record, "ATTACH_INSTALL_MEDIA")
+            return TransitionResult(next_record, "INSTALL_MEDIA_VERIFIED")
 
         if record.state is ProvisionState.INSTALL_MEDIA_READY:
+            if not observed.vm_running:
+                return TransitionResult(record, "START_UNATTENDED_INSTALL")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.OS_INSTALLING,
             )
-            return TransitionResult(next_record, "START_UNATTENDED_INSTALL")
+            return TransitionResult(next_record, "OS_INSTALL_STARTED")
 
         if record.state is ProvisionState.OS_INSTALLING:
-            return TransitionResult(record, "WAIT_FOR_GUEST_HEARTBEAT")
+            if not observed.guest_booted:
+                return TransitionResult(record, "WAIT_FOR_GUEST_HEARTBEAT")
+            next_record = self.store.transition(
+                instance_id=context.instance_id,
+                state=ProvisionState.GUEST_BOOTED,
+            )
+            return TransitionResult(next_record, "GUEST_BOOT_VERIFIED")
 
         if record.state is ProvisionState.GUEST_BOOTED:
+            if not observed.guest_bootstrap_ready:
+                return TransitionResult(record, "BOOTSTRAP_GUEST_WITH_POWERSHELL_DIRECT")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.GUEST_BOOTSTRAP,
             )
-            return TransitionResult(next_record, "BOOTSTRAP_GUEST_WITH_POWERSHELL_DIRECT")
+            return TransitionResult(next_record, "GUEST_BOOTSTRAP_VERIFIED")
 
-        if record.state is ProvisionState.GUEST_BOOTSTRAP:
+        if record.state in {ProvisionState.GUEST_BOOTSTRAP, ProvisionState.AGENT_INSTALLING}:
+            if not observed.agent_healthy:
+                return TransitionResult(record, "INSTALL_HMS_AGENT")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
-                state=ProvisionState.AGENT_INSTALLING,
+                state=ProvisionState.AGENT_HEALTHY,
             )
-            return TransitionResult(next_record, "INSTALL_HMS_AGENT")
-
-        if record.state is ProvisionState.AGENT_INSTALLING:
-            return TransitionResult(record, "WAIT_FOR_AGENT_HEALTH")
+            return TransitionResult(next_record, "AGENT_VERIFIED")
 
         if record.state is ProvisionState.AGENT_HEALTHY:
+            if not observed.pairing_ready:
+                return TransitionResult(record, "CREATE_ONE_TIME_PAIRING")
             next_record = self.store.transition(
                 instance_id=context.instance_id,
                 state=ProvisionState.PAIRING_PENDING,
             )
-            return TransitionResult(next_record, "CREATE_ONE_TIME_PAIRING")
+            return TransitionResult(next_record, "PAIRING_RECORD_VERIFIED")
 
         if record.state is ProvisionState.PAIRING_PENDING:
-            return TransitionResult(record, "WAIT_FOR_PAIRING")
+            if not observed.paired:
+                return TransitionResult(record, "WAIT_FOR_PAIRING")
+            next_record = self.store.transition(
+                instance_id=context.instance_id,
+                state=ProvisionState.READY,
+            )
+            return TransitionResult(next_record, "CONTROL_READY")
 
         return TransitionResult(record, "RECONCILE_EXTERNAL_SIGNAL")
 
