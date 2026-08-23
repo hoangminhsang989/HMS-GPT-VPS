@@ -20,6 +20,10 @@ class ControlSessionError(ValueError):
     pass
 
 
+class ControlSessionNotYetValidError(ControlSessionError):
+    pass
+
+
 class ControlSessionExpiredError(ControlSessionError):
     pass
 
@@ -135,7 +139,9 @@ class ControlSessionRecord:
             if self.epoch <= 1:
                 raise ControlSessionError("rotated sessions must have epoch greater than one")
         if self.revoked_at is not None:
-            _aware_utc(self.revoked_at, "revoked_at")
+            revoked = _aware_utc(self.revoked_at, "revoked_at")
+            if revoked < issued:
+                raise ControlSessionError("revoked_at must not precede issued_at")
             if not self.revocation_reason:
                 raise ControlSessionError("revoked sessions require a revocation_reason")
         elif self.revocation_reason is not None:
@@ -222,6 +228,8 @@ def issue_control_session(
     if not (60 <= ttl_seconds <= MAX_SESSION_TTL_SECONDS):
         raise ControlSessionError("session TTL must be between 60 and 86400 seconds")
     issued_at = _aware_utc(now or utc_now(), "now")
+    if issued_at < pairing.consumed_at:
+        raise ControlSessionError("session cannot be issued before pairing consumption")
     requested = _normalize_scopes(scopes if scopes is not None else pairing.scopes)
     if not set(requested).issubset(pairing.scopes):
         raise ControlSessionScopeError("session scopes cannot exceed pairing scopes")
@@ -254,6 +262,8 @@ def verify_control_session(
         raise ControlSessionTokenMismatchError("session instance mismatch")
     if record.revoked_at is not None:
         raise ControlSessionRevokedError("session is revoked")
+    if checked_at < record.issued_at:
+        raise ControlSessionNotYetValidError("session is not yet valid")
     if checked_at >= record.expires_at:
         raise ControlSessionExpiredError("session has expired")
     if required_scope not in record.scopes:
@@ -272,8 +282,6 @@ def rotate_control_session(
     scopes: Iterable[str] | None = None,
 ) -> ControlSessionRotation:
     rotated_at = _aware_utc(now or utc_now(), "now")
-    # Rotation authentication requires one existing granted scope; every valid
-    # session has at least one scope by construction.
     verify_control_session(
         record,
         token,
