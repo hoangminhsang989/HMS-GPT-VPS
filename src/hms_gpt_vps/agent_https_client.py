@@ -28,6 +28,7 @@ from .agent_transport_protocol import (
 
 MAX_AGENT_RESPONSE_BYTES = MAX_AGENT_BODY_BYTES
 DEFAULT_AGENT_HTTP_TIMEOUT_SECONDS = 30
+RETRYABLE_AGENT_HTTP_STATUSES = frozenset({408, 425, 429})
 
 
 class AgentHttpsClientError(RuntimeError):
@@ -39,7 +40,18 @@ class AgentHttpsNetworkError(AgentHttpsClientError):
 
 
 class AgentHttpsResponseError(AgentHttpsClientError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def retryable(self) -> bool:
+        if self.status_code is None:
+            return False
+        return (
+            self.status_code in RETRYABLE_AGENT_HTTP_STATUSES
+            or 500 <= self.status_code <= 599
+        )
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -176,6 +188,8 @@ class AgentHttpsClient:
         now: datetime | None = None,
         nonce: str | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise AgentTransportError("Agent HTTP payload must be a JSON object")
         body = _canonical_json(payload)
         signed = sign_agent_request(
             self.credential,
@@ -205,8 +219,12 @@ class AgentHttpsClient:
         try:
             response = self._opener.open(request, timeout=self.config.timeout_seconds)
         except HTTPError as exc:
-            raise AgentHttpsResponseError(f"Bridge returned HTTP status {exc.code}") from None
-        except (URLError, TimeoutError, OSError) as exc:
+            status = int(exc.code)
+            raise AgentHttpsResponseError(
+                f"Bridge returned HTTP status {status}",
+                status_code=status,
+            ) from None
+        except (URLError, TimeoutError, OSError):
             raise AgentHttpsNetworkError("Bridge HTTPS request failed") from None
 
         try:
@@ -214,7 +232,11 @@ class AgentHttpsClient:
             if status is None and hasattr(response, "getcode"):
                 status = response.getcode()
             if status != 200:
-                raise AgentHttpsResponseError(f"Bridge returned HTTP status {status}")
+                numeric_status = status if isinstance(status, int) else None
+                raise AgentHttpsResponseError(
+                    f"Bridge returned HTTP status {status}",
+                    status_code=numeric_status,
+                )
 
             content_type = ""
             response_headers = getattr(response, "headers", None)
