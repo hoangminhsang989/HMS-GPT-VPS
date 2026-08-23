@@ -38,16 +38,33 @@ def _validate_identifier(value: str, name: str) -> None:
 
 
 class AgentConnectionEpochStore:
-    """SQLite monotonic epoch allocator for one guest Agent device identity."""
+    """SQLite monotonic epoch allocator for one guest Agent device identity.
+
+    The parent directory is a security boundary managed by guest provisioning
+    and must already exist with the intended NTFS ACL. This store never creates
+    that directory implicitly.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
+    def _require_parent(self) -> None:
+        parent = self.path.parent
+        if not parent.exists():
+            raise AgentConnectionEpochError(
+                "connection epoch store parent must already exist"
+            )
+        if not parent.is_dir():
+            raise AgentConnectionEpochError(
+                "connection epoch store parent is not a directory"
+            )
+
     def _connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._require_parent()
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA busy_timeout=30000")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_connection_epoch (
@@ -62,6 +79,7 @@ class AgentConnectionEpochStore:
 
     def load(self) -> AgentConnectionEpochRecord | None:
         if not self.path.exists():
+            self._require_parent()
             return None
         with self._connect() as connection:
             row = connection.execute(
