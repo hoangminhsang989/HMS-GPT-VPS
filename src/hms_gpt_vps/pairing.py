@@ -28,6 +28,10 @@ class PairingError(ValueError):
     pass
 
 
+class PairingNotYetValidError(PairingError):
+    pass
+
+
 class PairingExpiredError(PairingError):
     pass
 
@@ -148,10 +152,21 @@ class PairingRecord:
             raise PairingError("expires_at must be after issued_at")
         if (expires - issued).total_seconds() > MAX_PAIR_TTL_SECONDS:
             raise PairingError("pairing TTL exceeds maximum")
+
+        consumed = None
         if self.consumed_at is not None:
-            _require_aware_utc(self.consumed_at, "consumed_at")
+            consumed = _require_aware_utc(self.consumed_at, "consumed_at")
+            if consumed < issued or consumed >= expires:
+                raise PairingError("consumed_at must be within the pairing validity window")
+
+        revoked = None
         if self.revoked_at is not None:
-            _require_aware_utc(self.revoked_at, "revoked_at")
+            revoked = _require_aware_utc(self.revoked_at, "revoked_at")
+            if revoked < issued:
+                raise PairingError("revoked_at must not precede issued_at")
+
+        if consumed is not None and revoked is not None:
+            raise PairingError("pairing record cannot be both consumed and revoked")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -245,6 +260,8 @@ def verify_pairing_token(
         raise PairingRevokedError("pairing grant is revoked")
     if record.consumed_at is not None:
         raise PairingConsumedError("pairing grant is already consumed")
+    if checked_at < record.issued_at:
+        raise PairingNotYetValidError("pairing grant is not yet valid")
     if checked_at >= record.expires_at:
         raise PairingExpiredError("pairing grant has expired")
     actual = _token_digest(token)
