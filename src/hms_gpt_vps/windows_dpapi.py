@@ -35,27 +35,44 @@ def _input_blob(data: bytes) -> tuple[DataBlob, ctypes.Array[ctypes.c_char]]:
     return blob, buffer
 
 
+def _configure_native() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(DataBlob),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(DataBlob),
+    ]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(DataBlob),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(DataBlob),
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    return crypt32, kernel32
+
+
 def protect_bytes(data: bytes, *, description: str = "HMS-GPT-VPS transient secret") -> bytes:
     """Protect bytes to the current Windows user with DPAPI and no UI."""
     _require_windows()
     if not data:
         raise ValueError("secret data must not be empty")
 
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    crypt32.CryptProtectData.argtypes = [
-        ctypes.POINTER(DataBlob),
-        wintypes.LPCWSTR,
-        ctypes.POINTER(DataBlob),
-        wintypes.LPVOID,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        ctypes.POINTER(DataBlob),
-    ]
-    crypt32.CryptProtectData.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
-
+    crypt32, kernel32 = _configure_native()
     source, source_buffer = _input_blob(data)
     _ = source_buffer
     output = DataBlob()
@@ -74,7 +91,7 @@ def protect_bytes(data: bytes, *, description: str = "HMS-GPT-VPS transient secr
         return ctypes.string_at(output.pbData, output.cbData)
     finally:
         if output.pbData:
-            kernel32.LocalFree(ctypes.cast(output.pbData, wintypes.HLOCAL))
+            kernel32.LocalFree(ctypes.cast(output.pbData, ctypes.c_void_p))
 
 
 def unprotect_bytes(data: bytes) -> bytes:
@@ -83,21 +100,7 @@ def unprotect_bytes(data: bytes) -> bytes:
     if not data:
         raise ValueError("protected data must not be empty")
 
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    crypt32.CryptUnprotectData.argtypes = [
-        ctypes.POINTER(DataBlob),
-        ctypes.POINTER(wintypes.LPWSTR),
-        ctypes.POINTER(DataBlob),
-        wintypes.LPVOID,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        ctypes.POINTER(DataBlob),
-    ]
-    crypt32.CryptUnprotectData.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
-
+    crypt32, kernel32 = _configure_native()
     source, source_buffer = _input_blob(data)
     _ = source_buffer
     output = DataBlob()
@@ -116,7 +119,7 @@ def unprotect_bytes(data: bytes) -> bytes:
         return ctypes.string_at(output.pbData, output.cbData)
     finally:
         if output.pbData:
-            kernel32.LocalFree(ctypes.cast(output.pbData, wintypes.HLOCAL))
+            kernel32.LocalFree(ctypes.cast(output.pbData, ctypes.c_void_p))
 
 
 class DpapiSecretStore:
