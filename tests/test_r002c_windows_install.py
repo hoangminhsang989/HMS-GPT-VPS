@@ -17,6 +17,7 @@ from hms_gpt_vps.unattend import (
 from hms_gpt_vps.windows_dpapi import (
     DpapiUnavailableError,
     protect_bytes,
+    protect_bytes_machine,
     unprotect_bytes,
 )
 from hms_gpt_vps.windows_install_start import build_start_unattended_install_script
@@ -70,9 +71,15 @@ def test_dpapi_is_windows_only_and_round_trips_when_available() -> None:
         protected = protect_bytes(secret)
         assert protected != secret
         assert unprotect_bytes(protected) == secret
+
+        machine_protected = protect_bytes_machine(secret)
+        assert machine_protected != secret
+        assert unprotect_bytes(machine_protected) == secret
     else:
         with pytest.raises(DpapiUnavailableError):
             protect_bytes(secret)
+        with pytest.raises(DpapiUnavailableError):
+            protect_bytes_machine(secret)
 
 
 def test_install_unattend_requires_explicit_blank_disk_acknowledgement() -> None:
