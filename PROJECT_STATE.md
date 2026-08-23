@@ -2,7 +2,7 @@
 
 ## Current revision
 
-R002C — Pairing/control security foundation (Tranche 5A)
+R002C — Agent device identity + outbound transport foundation (Tranche 5B)
 
 ## Status
 
@@ -21,7 +21,7 @@ The canonical product is a Windows desktop tool that creates and manages an isol
 
 Primary workflow:
 
-`Tạo VPS -> detect/enable Hyper-V with approval -> resume after reboot -> verify Windows image -> ensure isolated Internal vSwitch/NAT -> create/recover identity-pinned Windows VM -> transient answer media -> unattended Windows install -> PowerShell Direct guest bootstrap -> copy/verify Agent artifact -> install least-privilege HMS Agent service -> prove Agent application health -> retire bootstrap Administrator -> detach answer media -> remove transient install secrets -> outbound authenticated Agent control -> one-time pairing -> scoped control session -> supported ChatGPT/HMS integration -> workspace/test/git operations inside the VM.`
+`Tạo VPS -> detect/enable Hyper-V with approval -> resume after reboot -> verify Windows image -> ensure isolated Internal vSwitch/NAT -> create/recover identity-pinned Windows VM -> transient answer media -> unattended Windows install -> PowerShell Direct guest bootstrap -> copy/verify Agent artifact -> secure Agent device enrollment -> install least-privilege HMS Agent service -> prove Agent application health -> retire bootstrap Administrator -> detach answer media -> remove transient install secrets -> outbound authenticated Agent control -> one-time pairing -> scoped control session -> supported ChatGPT/HMS integration -> workspace/test/git operations inside the VM.`
 
 Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optional future modes.
 
@@ -133,7 +133,7 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 - local health probe is fixed to `http://127.0.0.1:<port>/healthz`, redirects disabled, executed through PowerShell Direct before bootstrap retirement;
 - application-health and crash-recovery regression coverage.
 
-### R002C Tranche 5A — pairing/control security foundation now adds
+### R002C Tranche 5A — pairing/control security foundation
 
 - one-time pairing grant with 256-bit random token;
 - HTTPS-only pairing base URL and raw token in URL fragment `#token=...`, not query parameters;
@@ -174,7 +174,30 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 - Bridge root-key publication is create-once: fsynced temporary ciphertext + create-only hard-link, never silent overwrite;
 - corrupt/unprotectable existing root-key file is never silently regenerated;
 - native Windows DPAPI key-store regression plus injected cross-platform/concurrent create tests added;
-- `docs/R002C_PAIRING_CONTROL.md` is the Tranche 5 control authority.
+- `docs/R002C_PAIRING_CONTROL.md` is the Tranche 5A user/session control authority.
+
+### R002C Tranche 5B — Agent device identity + outbound transport foundation
+
+- persistent `AgentDeviceCredential` is separate from pairing/session credentials and binds exact `instance_id`, random `device_id` and independent 32-byte secret;
+- outbound Agent protocol is limited to `/agent/v1/hello`, `/agent/v1/heartbeat`, `/agent/v1/poll` and `/agent/v1/result`;
+- Agent requests use HMAC-SHA256 over exact device/instance/boot/connection-epoch/timestamp/nonce/body identity with a 90-second clock-skew bound and 2 MiB body bound;
+- signed Bridge command envelope binds request ID, exact instance, supported action, canonical parameters, deadline and optional exact approved-command SHA-256;
+- `AgentConnectionRegistry` serializes nonce claim and connection transition in SQLite;
+- duplicate nonce, stale epoch, same-epoch boot conflict and conflicting device ownership fail closed;
+- higher epoch is the explicit connection takeover mechanism for the same managed device/instance;
+- current-user DPAPI remains the default existing secret primitive; LocalMachine DPAPI protection was added separately for guest Agent credentials;
+- `BridgeAgentDeviceCredentialStore` uses current-user DPAPI and create-only/no-silent-rotation semantics;
+- `GuestAgentDeviceCredentialStore` uses LocalMachine DPAPI and requires the managed State ACL boundary;
+- PowerShell Direct supports an optional bounded 8 KiB secret payload through child-process environment only, removed before guest invocation;
+- stable Bridge load-or-create converges concurrent first provisioning to one device identity;
+- guest enrollment payload is secret-bearing only in the transient env-only PowerShell Direct channel; guest script text and returned result contain no raw secret;
+- guest enrollment requires the protected HMS runtime parent and reconciles State ACL before every credential read/write;
+- pre-service State ACL is SYSTEM + Administrators; retry after service creation preserves `NT SERVICE\HMSAgent` Modify;
+- guest credential is LocalMachine-DPAPI protected and published create-only; an existing credential must decrypt to the exact same instance/device/secret;
+- `ProvisionObservation.agent_device_enrolled` defaults fail-closed;
+- `ProvisionState.AGENT_INSTALLING` is reused as the durable enrollment checkpoint: `GUEST_BOOTSTRAP` cannot issue `INSTALL_HMS_AGENT` until device enrollment is observed and persisted;
+- regression coverage exists for credential stores, machine/current-user DPAPI roles, enrollment stability/concurrency, env-only payloads, ACL retry, provisioning gate, Agent request authentication and connection replay/epoch conflicts;
+- `docs/R002C_AGENT_TRANSPORT.md` is the Tranche 5B machine/device transport authority.
 
 ## Architecture decisions locked
 
@@ -202,6 +225,10 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 22. Network requests cannot self-approve destructive operations; trusted local approval is an out-of-band local boundary.
 23. Remote workspace write permission does not include Git metadata mutation or deletion.
 24. An unresolved idempotency claim is an ambiguity gate, not permission to retry a side effect automatically.
+25. Agent device credentials are a separate machine identity lifecycle and must never substitute for user pairing/control-session credentials.
+26. Bridge device credentials use current-user DPAPI; guest device credentials use LocalMachine DPAPI plus a mandatory managed NTFS ACL boundary.
+27. Device enrollment is a mandatory durable pre-service checkpoint; Agent service installation cannot intentionally bypass it.
+28. Permanent machine transport is guest-outbound only by default and authenticates fixed Agent endpoints with HMAC, nonce and monotonic connection epoch.
 
 ## Security baseline
 
@@ -229,12 +256,16 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 22. Completed idempotent requests may replay cached results; unresolved claims block automatic replay.
 23. `.git` metadata is outside current remote `workspace.write` authority.
 24. Destructive replace requires local approval plus an exact existing-content SHA-256 precondition.
+25. Raw Agent device secrets must not be persisted in normal state, control SQLite, Git or normal audit output.
+26. LocalMachine DPAPI does not replace NTFS authorization; the guest State ACL remains mandatory.
+27. No default inbound Agent management port is opened in the guest/NAT design.
+28. Duplicate Agent nonce, stale connection epoch and conflicting device/boot identity are authentication failures, not reconnect hints.
 
 ## Verification status
 
 ### Deterministic/code-level
 
-The repository now contains regression coverage for core provisioning models, generated XML/ISO/PowerShell invariants, PowerShell escaping, secret redaction, DPAPI platform behavior, package hashing, service-boundary configuration, application-health schema, retirement crash handling, pairing/token state, atomic pairing-session exchange, nonce-bound recovery, protected Bridge exchange-key persistence, session rotation/revocation, request authorization/idempotency, trusted local approval and the five minimum control actions.
+The repository now contains regression coverage for core provisioning models, generated XML/ISO/PowerShell invariants, PowerShell escaping, secret redaction, current-user and LocalMachine DPAPI platform behavior, package hashing, service-boundary configuration, application-health schema, retirement crash handling, pairing/token state, atomic pairing-session exchange, nonce-bound recovery, protected Bridge exchange-key persistence, session rotation/revocation, request authorization/idempotency, trusted local approval, the five minimum control actions, Agent device credential stores, secure pre-service enrollment, enrollment state gating, HMAC Agent transport protocol and Bridge connection nonce/epoch rules.
 
 A unit/in-process control proof creates a workspace file, replays the same request idempotently, reads the file back through the authenticated control service, and verifies matching SHA-256/size while checking that raw session token and file content are not written to normal audit output.
 
@@ -242,34 +273,33 @@ This is not equivalent to a real VM/Agent/network proof.
 
 ### CI visibility
 
-The repository CI workflow contains both Linux and Windows Python matrices. The connected GitHub status surface has not exposed direct-push checks in this chat, so **CI is not declared PASS unless a visible check result is obtained**.
+The repository CI workflow contains both Linux and Windows Python matrices. The connected GitHub workflow helper available in this chat exposes pull-request-associated runs but not the current direct-push run, and the generic push-run listing endpoint is blocked by the connector. Therefore **CI is not declared PASS unless a visible check result is obtained**.
 
 ### Not yet runtime PASS
 
-A real Windows Hyper-V integration run remains mandatory. GitHub-hosted runners do not prove actual Hyper-V/vTPM/NAT/firmware behavior, Windows Setup answer-file consumption, PowerShell Direct bootstrap, Guest Service Interface copy semantics, service SID ACL behavior, the real HMS Agent executable, outbound Agent transport, Bridge network endpoints or a supported ChatGPT connector on the target machine.
+A real Windows Hyper-V integration run remains mandatory. GitHub-hosted runners do not prove actual Hyper-V/vTPM/NAT/firmware behavior, Windows Setup answer-file consumption, PowerShell Direct bootstrap, Guest Service Interface copy semantics, cross-identity LocalMachine-DPAPI decrypt under `LocalService`, service SID ACL behavior, the real HMS Agent executable, outbound HTTPS Agent transport, Bridge network endpoints or a supported ChatGPT connector on the target machine.
 
-Do **not** label R002C runtime PASS until those Windows-host and integration tests are executed and non-secret evidence is captured.
+Do **not** label R002C or Tranche 5B runtime PASS until those Windows-host and integration tests are executed and non-secret evidence is captured.
 
 ## Next objectives
 
-### R002C Tranche 5B — Agent device identity + outbound transport
+### R002C Tranche 5B — runtime completion
 
-- define a persistent per-Agent device identity separate from user pairing/session credentials;
-- protect Agent/Bridge device credentials at rest;
-- implement outbound-only authenticated Agent -> Bridge connection with TLS;
-- bind connection to exact managed `instance_id`, Agent boot identity and capability set;
-- heartbeat/presence/reconnect with monotonic connection epoch;
-- reject stale/superseded Agent connections;
-- define command/response envelope with request ID, deadline and bounded payloads;
-- route control requests through the real Agent rather than executing only in the in-process test runtime;
-- preserve idempotency and local approval semantics across network disconnects.
+- implement the actual outbound HTTPS/TLS Agent client loop for hello/heartbeat/poll/result using the existing HMAC protocol;
+- implement Bridge `/agent/v1/*` endpoint runtime and authenticate before nonce/presence mutation;
+- persist/recover monotonic Agent connection epoch and boot identity across reconnects;
+- add bounded reconnect/backoff, poll duration and result queue behavior;
+- route signed Bridge commands through the real Agent service into the policy-gated action runtime;
+- preserve request idempotency and local approval semantics across network disconnects;
+- prove bootstrap-created LocalMachine-DPAPI credential can be decrypted later by the managed non-admin `LocalService`/service-SID Agent on the same guest;
+- execute a real Agent <-> Bridge reconnect/fault/heartbeat soak.
 
 ### R002C Tranche 4C — real Agent executable + Windows/Hyper-V integration
 
 - build/identify the real HMS Agent Windows executable artifact;
 - implement loopback-only `/healthz` schema v1 in that executable;
 - implement the five minimum non-admin capabilities behind the Agent policy boundary;
-- verify package manifest + guest SHA-256 + service install on real Windows;
+- verify package manifest + guest SHA-256 + secure device enrollment + service install on real Windows;
 - execute the full unattended install/bootstrap/finalization path on an explicitly disposable Hyper-V VM;
 - prove restart persistence and post-reboot Agent health;
 - capture deterministic non-secret evidence JSON;
