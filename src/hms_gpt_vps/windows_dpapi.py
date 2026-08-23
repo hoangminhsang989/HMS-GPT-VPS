@@ -8,6 +8,7 @@ from tempfile import NamedTemporaryFile
 
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
+CRYPTPROTECT_LOCAL_MACHINE = 0x4
 
 
 class DataBlob(ctypes.Structure):
@@ -66,8 +67,7 @@ def _configure_native() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
     return crypt32, kernel32
 
 
-def protect_bytes(data: bytes, *, description: str = "HMS-GPT-VPS transient secret") -> bytes:
-    """Protect bytes to the current Windows user with DPAPI and no UI."""
+def _protect_bytes(data: bytes, *, description: str, flags: int) -> bytes:
     _require_windows()
     if not data:
         raise ValueError("secret data must not be empty")
@@ -82,7 +82,7 @@ def protect_bytes(data: bytes, *, description: str = "HMS-GPT-VPS transient secr
         None,
         None,
         None,
-        CRYPTPROTECT_UI_FORBIDDEN,
+        flags,
         ctypes.byref(output),
     )
     if not ok:
@@ -94,8 +94,42 @@ def protect_bytes(data: bytes, *, description: str = "HMS-GPT-VPS transient secr
             kernel32.LocalFree(ctypes.cast(output.pbData, ctypes.c_void_p))
 
 
+def protect_bytes(data: bytes, *, description: str = "HMS-GPT-VPS transient secret") -> bytes:
+    """Protect bytes to the current Windows user with DPAPI and no UI.
+
+    This keeps the historical/default HMS behavior unchanged. Use the explicit
+    `protect_bytes_machine` API only for a secret that must be decrypted by a
+    different Windows identity on the same managed machine, and pair that scope
+    with a restrictive filesystem ACL.
+    """
+    return _protect_bytes(
+        data,
+        description=description,
+        flags=CRYPTPROTECT_UI_FORBIDDEN,
+    )
+
+
+def protect_bytes_machine(
+    data: bytes,
+    *,
+    description: str = "HMS-GPT-VPS machine secret",
+) -> bytes:
+    """Protect bytes to the local Windows machine with DPAPI and no UI.
+
+    Machine scope intentionally does not make the ciphertext private from every
+    local Windows identity. Callers must store the protected blob behind a
+    restrictive ACL. HMS uses this only when bootstrap and the long-lived Agent
+    service run under different Windows identities on the same managed guest.
+    """
+    return _protect_bytes(
+        data,
+        description=description,
+        flags=CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE,
+    )
+
+
 def unprotect_bytes(data: bytes) -> bytes:
-    """Decrypt bytes previously protected for the current Windows user."""
+    """Decrypt a DPAPI blob available to the current identity/machine scope."""
     _require_windows()
     if not data:
         raise ValueError("protected data must not be empty")
