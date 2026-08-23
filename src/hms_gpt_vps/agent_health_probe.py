@@ -38,12 +38,7 @@ def build_agent_health_probe_script(config: AgentHealthProbeConfig) -> str:
     return f"""
 $ErrorActionPreference = 'Stop'
 $uri = '{uri}'
-$response = Invoke-RestMethod \
-  -Uri $uri \
-  -Method Get \
-  -TimeoutSec {timeout} \
-  -MaximumRedirection 0 \
-  -ErrorAction Stop
+$response = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec {timeout} -MaximumRedirection 0 -ErrorAction Stop
 if ($null -eq $response) {{ throw 'HMS Agent health endpoint returned no document' }}
 $response
 """.strip()
