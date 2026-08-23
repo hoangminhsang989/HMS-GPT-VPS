@@ -14,6 +14,7 @@ from .unattend import (
     generate_install_unattend,
 )
 from .windows_dpapi import DpapiSecretStore
+from .windows_image import sha256_file
 
 
 class TextSecretStore(Protocol):
@@ -99,7 +100,39 @@ def load_bootstrap_credential(store: TextSecretStore) -> BootstrapCredential:
     return _deserialize_credential(store.load_text())
 
 
-def clear_install_secrets(answer_iso: Path, store: TextSecretStore) -> None:
-    """Remove only known transient provisioning secrets after guest bootstrap."""
-    answer_iso.unlink(missing_ok=True)
+def clear_install_secrets(
+    answer_iso: Path,
+    store: TextSecretStore,
+    *,
+    expected_sha256: str,
+    runtime_dir: Path,
+) -> None:
+    """Remove only the verified managed answer ISO and its transient secret.
+
+    The cleanup is intentionally idempotent for crash/resume. An existing ISO
+    is deleted only when it is under the expected runtime directory and its
+    SHA-256 still matches the persisted artifact metadata. A missing ISO is
+    treated as already removed; the DPAPI record may then be cleared safely.
+    """
+    if len(expected_sha256) != 64:
+        raise ValueError("expected answer ISO SHA-256 must contain 64 hex characters")
+    try:
+        int(expected_sha256, 16)
+    except ValueError as exc:
+        raise ValueError("expected answer ISO SHA-256 must be hexadecimal") from exc
+
+    runtime = runtime_dir.expanduser().resolve()
+    answer = answer_iso.expanduser().resolve()
+    try:
+        answer.relative_to(runtime)
+    except ValueError as exc:
+        raise ValueError("answer ISO is outside the managed runtime directory") from exc
+
+    if answer.exists():
+        if not answer.is_file():
+            raise ValueError("managed answer ISO path is not a file")
+        if sha256_file(answer).lower() != expected_sha256.lower():
+            raise ValueError("managed answer ISO SHA-256 changed before cleanup")
+        answer.unlink()
+
     store.clear()
