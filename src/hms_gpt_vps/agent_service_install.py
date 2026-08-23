@@ -109,11 +109,11 @@ foreach ($path in @($agentRoot, $workspace, $statePath)) {{
   if (-not (Test-Path -LiteralPath $path)) {{ throw "Required HMS path missing: $path" }}
 }}
 
-& icacls.exe $agentRoot '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "$servicePrincipal:(OI)(CI)RX" | Out-Null
+& icacls.exe $agentRoot '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)RX" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw 'Failed to protect HMS Agent binary directory ACL' }}
 
 foreach ($path in @($workspace, $statePath)) {{
-  & icacls.exe $path '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "$servicePrincipal:(OI)(CI)M" | Out-Null
+  & icacls.exe $path '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)M" | Out-Null
   if ($LASTEXITCODE -ne 0) {{ throw "Failed to grant service SID on $path" }}
 }}
 
