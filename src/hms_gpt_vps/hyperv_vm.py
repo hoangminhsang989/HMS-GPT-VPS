@@ -23,6 +23,9 @@ def build_reconcile_vm_script(
     If an expected VMId is known, a same-name VM with a different VMId is
     treated as an identity conflict. The reconciler never stops a running VM;
     settings that require an Off state fail closed instead.
+
+    The managed Windows baseline enables Secure Boot plus a local-key-protected
+    virtual TPM so a Windows 11 guest satisfies Hyper-V security requirements.
     """
     config.validate()
     vm_dir = config.vm_root / config.name
@@ -84,6 +87,13 @@ Set-VMMemory -VMName $vmName -StartupBytes {config.memory_mb}MB -DynamicMemoryEn
 Set-VM -Name $vmName -AutomaticCheckpointsEnabled $false
 Set-VMFirmware -VMName $vmName -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows
 
+$security = Get-VMSecurity -VMName $vmName
+if (-not $security.TpmEnabled) {{
+  Set-VMKeyProtector -VMName $vmName -NewLocalKeyProtector
+  Enable-VMTPM -VMName $vmName
+  $changed = $true
+}}
+
 $adapter = Get-VMNetworkAdapter -VMName $vmName | Select-Object -First 1
 if ($null -eq $adapter) {{
   Add-VMNetworkAdapter -VMName $vmName -SwitchName $switchName | Out-Null
@@ -93,6 +103,7 @@ if ($null -eq $adapter) {{
   $changed = $true
 }}
 
+$security = Get-VMSecurity -VMName $vmName
 [pscustomobject]@{{
   changed = $changed
   vm_name = $vmName
@@ -100,6 +111,7 @@ if ($null -eq $adapter) {{
   state = $vm.State.ToString()
   vhd_path = $vhdPath
   switch_name = $switchName
+  tpm_enabled = [bool]$security.TpmEnabled
 }}
 """.strip()
 
