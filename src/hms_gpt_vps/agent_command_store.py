@@ -75,6 +75,18 @@ def _json_dict(raw: str, name: str) -> dict[str, Any]:
     return value
 
 
+def _verified_stored_result(
+    result_json: object,
+    result_sha256: object,
+) -> AgentCommandResult:
+    if not isinstance(result_json, str) or not isinstance(result_sha256, str):
+        raise AgentCommandStoreError("completed Agent command result is incomplete")
+    raw = result_json.encode("utf-8")
+    if hashlib.sha256(raw).hexdigest() != result_sha256.lower():
+        raise AgentCommandStoreError("stored Agent result failed integrity check")
+    return parse_agent_command_result(_json_dict(result_json, "Agent result"))
+
+
 class AgentCommandStore:
     """Durable Bridge-side command/result queue.
 
@@ -156,7 +168,7 @@ class AgentCommandStore:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
-                SELECT state, command_sha256, result_json
+                SELECT state, command_sha256, result_json, result_sha256
                 FROM agent_commands
                 WHERE instance_id = ? AND request_id = ?
                 """,
@@ -170,13 +182,9 @@ class AgentCommandStore:
                 state = AgentCommandState(str(existing["state"]))
                 result = None
                 if state is AgentCommandState.COMPLETED:
-                    raw_result = existing["result_json"]
-                    if not isinstance(raw_result, str):
-                        raise AgentCommandStoreError(
-                            "completed Agent command result is missing"
-                        )
-                    result = parse_agent_command_result(
-                        _json_dict(raw_result, "Agent result")
+                    result = _verified_stored_result(
+                        existing["result_json"],
+                        existing["result_sha256"],
                     )
                 connection.execute("COMMIT")
                 return AgentCommandStatus(
@@ -324,19 +332,15 @@ class AgentCommandStore:
                     "Agent result arrived after command expiration"
                 )
             if state is AgentCommandState.COMPLETED:
-                existing_hash = row["result_sha256"]
-                existing_json = row["result_json"]
-                if not isinstance(existing_hash, str) or not isinstance(existing_json, str):
-                    raise AgentCommandStoreError(
-                        "completed Agent command result is incomplete"
-                    )
-                if existing_hash.lower() != result_sha256:
+                cached = _verified_stored_result(
+                    row["result_json"],
+                    row["result_sha256"],
+                )
+                existing_hash = str(row["result_sha256"]).lower()
+                if existing_hash != result_sha256:
                     raise AgentCommandConflictError(
                         "Agent command already has a different completed result"
                     )
-                cached = parse_agent_command_result(
-                    _json_dict(existing_json, "Agent result")
-                )
                 connection.execute("COMMIT")
                 return AgentCommandStatus(
                     instance_id=result.instance_id,
@@ -391,19 +395,9 @@ class AgentCommandStore:
         state = AgentCommandState(str(row["state"]))
         result = None
         if state is AgentCommandState.COMPLETED:
-            result_json = row["result_json"]
-            result_hash = row["result_sha256"]
-            if not isinstance(result_json, str) or not isinstance(result_hash, str):
-                raise AgentCommandStoreError(
-                    "completed Agent command result is incomplete"
-                )
-            raw = result_json.encode("utf-8")
-            if hashlib.sha256(raw).hexdigest() != result_hash.lower():
-                raise AgentCommandStoreError(
-                    "stored Agent result failed integrity check"
-                )
-            result = parse_agent_command_result(
-                _json_dict(result_json, "Agent result")
+            result = _verified_stored_result(
+                row["result_json"],
+                row["result_sha256"],
             )
         return AgentCommandStatus(
             instance_id=instance_id,
