@@ -13,6 +13,9 @@ class VMRecord:
     backend: str
     phase: str
     workspace_path: str
+    vm_id: str | None = None
+    switch_name: str | None = None
+    guest_ipv4: str | None = None
 
 
 class InstanceRegistry:
@@ -27,8 +30,23 @@ class InstanceRegistry:
             raise ValueError("registry root must be an object")
         return {key: VMRecord(**value) for key, value in data.items()}
 
+    def get(self, instance_id: str) -> VMRecord | None:
+        return self.load().get(instance_id)
+
     def upsert(self, record: VMRecord) -> None:
+        if not record.instance_id.strip():
+            raise ValueError("instance_id is required")
+        if not record.vm_name.strip():
+            raise ValueError("vm_name is required")
         records = self.load()
+        existing = records.get(record.instance_id)
+        if (
+            existing is not None
+            and existing.vm_id is not None
+            and record.vm_id is not None
+            and existing.vm_id != record.vm_id
+        ):
+            raise ValueError("refusing to replace persisted VM identity with a different VMId")
         records[record.instance_id] = record
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {key: asdict(value) for key, value in sorted(records.items())}
