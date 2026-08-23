@@ -21,6 +21,17 @@ class PowerShellError(RuntimeError):
     pass
 
 
+def ps_literal(value: object) -> str:
+    """Return a single-quoted PowerShell literal for untrusted scalar text.
+
+    PowerShell escapes a single quote inside a single-quoted string by doubling
+    it. Keeping all generated command arguments behind this helper prevents a
+    VM name, path or network label from becoming executable script text.
+    """
+    text = str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
 def run_powershell(
     script: str,
     *,
@@ -61,7 +72,15 @@ def run_powershell(
 
 
 def run_powershell_json(script: str, *, timeout_seconds: int = 60) -> dict[str, object]:
-    wrapped = f"$ErrorActionPreference = 'Stop'\n{script}\n| ConvertTo-Json -Compress"
+    if not script.strip():
+        raise ValueError("PowerShell script is required")
+    wrapped = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$hmsResult = & {\n"
+        f"{script}\n"
+        "}\n"
+        "$hmsResult | ConvertTo-Json -Compress -Depth 8"
+    )
     result = run_powershell(wrapped, timeout_seconds=timeout_seconds, check=True)
     text = result.stdout.strip()
     if not text:
