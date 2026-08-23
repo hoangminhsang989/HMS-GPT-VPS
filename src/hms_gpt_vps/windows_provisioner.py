@@ -45,7 +45,7 @@ class WindowsVMConfig:
     disk_size_gb: int = 80
     vm_root: Path = Path(r"C:\ProgramData\HMS-GPT-VPS\VMs")
     workspace_path: str = r"C:\HMS-Workspace"
-    switch_name: str = "Default Switch"
+    switch_name: str = "HMS-GPT-VPS-Internal"
 
     def validate(self) -> None:
         if not self.name.strip():
@@ -60,6 +60,8 @@ class WindowsVMConfig:
             raise ValueError("VM disk must be at least 40 GB")
         if not self.workspace_path.strip():
             raise ValueError("Workspace path is required")
+        if not self.switch_name.strip():
+            raise ValueError("Hyper-V switch name is required")
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,7 @@ def build_provision_plan(host: HyperVHostState, config: WindowsVMConfig) -> Prov
     vhd_path = vm_dir / f"{config.name}.vhdx"
     actions.extend(
         (
+            "ENSURE_INTERNAL_NAT_NETWORK",
             f"ENSURE_DIR: {vm_dir}",
             f"CREATE_VHDX: {vhd_path} size={config.disk_size_gb}GB dynamic",
             f"CREATE_VM: {config.name} generation={config.generation}",
