@@ -2,7 +2,7 @@
 
 ## Current revision
 
-R002C — Windows unattended install foundation (Tranche 3)
+R002C — Guest bootstrap and Agent boundary foundation (Tranche 4)
 
 ## Status
 
@@ -21,7 +21,7 @@ The canonical product is a Windows desktop tool that creates and manages an isol
 
 Primary workflow:
 
-`Tạo VPS -> detect/enable Hyper-V with approval -> resume after reboot -> verify Windows image -> ensure isolated Internal vSwitch/NAT -> create/recover identity-pinned Windows VM -> create transient answer media -> unattended Windows install -> PowerShell Direct guest bootstrap -> install least-privilege HMS Agent -> create C:\HMS-Workspace -> outbound authenticated control -> one-time pairing link/code -> supported ChatGPT/HMS integration -> file/test/git operations inside the VM.`
+`Tạo VPS -> detect/enable Hyper-V with approval -> resume after reboot -> verify Windows image -> ensure isolated Internal vSwitch/NAT -> create/recover identity-pinned Windows VM -> create transient answer media -> unattended Windows install -> PowerShell Direct guest bootstrap -> copy/verify Agent artifact -> install least-privilege HMS Agent service -> retire bootstrap Administrator -> remove transient install secrets -> outbound authenticated Agent control -> one-time pairing -> supported ChatGPT/HMS integration -> workspace/test/git operations inside the VM.`
 
 Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optional future modes.
 
@@ -66,50 +66,71 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 - no automatic stop/reset during static reconciliation;
 - Generation-2 Secure Boot using Microsoft Windows template;
 - read-only Hyper-V observation;
-- dual read-after-write verification semantics;
-- state-machine fix to `observe -> decide -> mutate -> observe -> verify -> advance`;
+- state-machine `observe -> decide -> mutate -> observe -> verify -> advance`;
 - `docs/R002C_HYPERV_RECONCILIATION.md`;
 - regression tests for network isolation, PowerShell escaping, VM identity and postconditions.
 
-### R002C Tranche 3 — Windows unattended install foundation now adds
+### R002C Tranche 3 — Windows unattended install foundation
 
-- `pycdlib` dependency for pure-Python local ISO authoring;
-- atomic `answer_media.py` creating a secondary ISO with root `Autounattend.xml` and exact readback verification;
-- full guarded `generate_install_unattend()` path;
+- pure-Python secondary answer-media ISO with root `Autounattend.xml`;
+- explicit `WillWipeDisk=true` acknowledgement gate for the dedicated managed VHDX only;
 - GPT guest layout: EFI 300 MB + MSR 16 MB + remaining Windows NTFS partition;
-- explicit acknowledgement gate before generating `WillWipeDisk=true`;
-- Windows image selection by `/IMAGE/INDEX` without product-key injection or activation bypass;
-- OOBE automation using explicit OOBE/account settings rather than `SkipMachineOOBE`;
-- temporary local Administrator bootstrap account only for post-install PowerShell Direct;
-- runtime cryptographic bootstrap password generation;
-- password redacted from Python dataclass `repr()`;
-- current-user Windows DPAPI store for transient resume credential;
-- DPAPI native x64 pointer-safe `LocalFree` handling;
-- Windows 11 VM baseline extended with local-key-protected vTPM;
-- Hyper-V observer extended with Secure Boot/vTPM postconditions;
-- dual-DVD install-bundle reconcile: Windows product ISO + transient answer ISO;
-- refusal to silently replace unrelated/operator-owned DVD media;
-- read-only install-bundle observer;
-- destructive install start gate requiring exactly one managed VHDX, complete media bundle, Secure Boot and vTPM;
-- answer-media SHA-256 revalidation immediately before attach/start;
-- `WindowsInstallRuntime` executing network/VM/media/start actions with postcondition verification;
-- transient install artifact pipeline returning only non-secret metadata;
-- regression tests for credential secrecy, DPAPI platform behavior, answer-media generation, GPT XML layout, vTPM baseline and destructive target gate;
+- Windows image selection by `/IMAGE/INDEX` without product-key injection;
+- temporary local Administrator bootstrap account;
+- random runtime bootstrap password with dataclass repr redaction;
+- current-user Windows DPAPI resume secret store;
+- x64-safe DPAPI native memory release;
+- Generation-2 Secure Boot + vTPM baseline;
+- Windows ISO + answer ISO dual-DVD reconcile and boot-order verification;
+- destructive install start gate requiring one managed VHDX, complete media, Secure Boot and vTPM;
+- answer-media SHA-256 revalidation before attach/start;
+- `WindowsInstallRuntime` postcondition-oriented execution;
 - `docs/R002C_WINDOWS_INSTALL.md`.
+
+### R002C Tranche 4 — guest bootstrap / Agent boundary foundation now adds
+
+- Windows CI matrix (`windows-latest`, Python 3.11/3.12/3.13) in addition to Linux matrix;
+- existing DPAPI test now executes a native protect/unprotect round-trip on Windows CI;
+- secret-safe Hyper-V PowerShell Direct runner;
+- bootstrap username/password/guest script passed through child-process environment instead of command line;
+- environment variables removed inside child PowerShell before guest invocation;
+- deterministic guest IP `172.29.240.10/24`, gateway `172.29.240.1` and managed DNS bootstrap;
+- guest bootstrap fails closed unless the expected single managed NIC is present;
+- initial `C:\HMS-Workspace` + runtime directory ACL foundation;
+- verified host-to-guest Agent artifact copy through Hyper-V Guest Service Interface / `Copy-VMFile`, without SMB or host-drive sharing;
+- temporary Guest Service Interface enablement restored in `finally`;
+- immutable `AgentPackageManifest` with filename/version/size/SHA-256 and tamper detection;
+- Agent Windows Service installer using `NT AUTHORITY\LocalService`, not LocalSystem;
+- per-service SID `NT SERVICE\HMSAgent` with restricted filesystem rights;
+- guest-side Agent SHA-256 verification before SCM mutation;
+- service failure-recovery configuration;
+- read-only Windows service-readiness probe for SCM account, command, hash, service SID and ACL invariants;
+- explicit `application_health = NOT_IMPLEMENTED` until real Agent protocol health exists;
+- bootstrap retirement primitive that disables (does not delete) the temporary account;
+- AutoLogon disabled and `DefaultPassword` residue removed;
+- cached unattend cleanup limited to known files whose content references the managed bootstrap username;
+- exact managed answer-ISO detach primitive;
+- transient install secret cleanup hardened to managed runtime path + persisted SHA-256;
+- cleanup remains idempotent when answer ISO was already removed during crash/resume;
+- new regression tests for package tamper detection, service-readiness non-claims, bootstrap retirement and secret cleanup;
+- `docs/R002C_GUEST_BOOTSTRAP_AGENT.md`.
 
 ## Architecture decisions locked
 
 1. Hyper-V Windows VM is the production default isolation boundary.
-2. Host and guest control planes remain separate; ChatGPT/HMS targets the guest agent, not Hyper-V host Administrator APIs.
+2. Host and guest control planes remain separate; ChatGPT/HMS targets the guest Agent, not Hyper-V host Administrator APIs.
 3. Provisioning is persistent/reconcile-oriented and state advances only after observed postconditions.
 4. Internal vSwitch + NAT is the managed default; guest is not bridged directly onto the physical LAN.
-5. PowerShell Direct is the preferred host-to-guest bootstrap transport because it does not require guest network management ports.
+5. PowerShell Direct is temporary bootstrap transport only; it is not the permanent ChatGPT control channel.
 6. Windows product ISO remains unchanged; a separate transient answer ISO carries `Autounattend.xml`.
 7. Windows 11 guest baseline requires Generation 2 + Secure Boot + vTPM.
-8. Full unattended media is a transient secret artifact because it contains the temporary bootstrap password; it must never be committed/logged and must be removed after bootstrap.
-9. Bootstrap credential recovery on Windows host uses DPAPI current-user scope, not plaintext JSON/state.
-10. No Windows product key, pairing token or reusable HMS Agent credential is embedded in unattended media.
-11. A pairing URL/code is only bootstrap authorization for a compatible HMS integration; ordinary ChatGPT cannot execute arbitrary URL commands by itself.
+8. Full unattended media is a transient secret artifact and must never be committed/logged.
+9. Bootstrap credential recovery on the host uses current-user DPAPI, not plaintext state.
+10. Permanent HMS Agent service runs as `LocalService` plus a per-service SID, not as Administrator or LocalSystem.
+11. Guest Agent artifact is verified on host and again inside guest before service creation/start.
+12. Windows service readiness is not equivalent to Agent application/protocol health.
+13. Bootstrap account retirement must be durably checkpointed before DPAPI state is discarded because retirement invalidates PowerShell Direct credentials.
+14. A pairing URL/code is bootstrap authorization for a compatible HMS integration; ordinary ChatGPT does not gain shell access merely by receiving a URL.
 
 ## Security baseline
 
@@ -117,56 +138,62 @@ Windows is the primary guest OS. Linux/WSL2 and remote VPS backends remain optio
 2. No default ChatGPT path to the physical Windows host.
 3. No implicit host-drive sharing.
 4. Guest workspace access restricted to configured roots.
-5. Normal HMS Agent work must run non-admin.
-6. Destructive/privileged operations require explicit approval.
+5. Normal HMS Agent work runs non-admin.
+6. Destructive/privileged operations require explicit approval or exact managed-artifact policy where cleanup is security-critical and deterministic.
 7. Host elevation is never implied by normal guest-control requests.
 8. Reusable plaintext credentials must not appear in Git, pairing URLs or normal audit logs.
 9. Pairing/session credentials are scoped, expiring, revocable and independently rotatable.
 10. VM identity is pinned by VMId; identity conflicts fail closed.
 11. Default NAT exposes no inbound guest management mapping.
 12. `WillWipeDisk` is permitted only for the exact dedicated managed guest VHDX after destructive-target verification.
-13. Unknown DVD media is not silently replaced.
-14. Transient answer-media integrity is verified by SHA-256 immediately before Windows Setup.
-15. Temporary bootstrap Administrator must be retired after Agent bootstrap and its answer-media/DPAPI artifacts cleared.
+13. Unknown DVD media is not silently replaced or deleted.
+14. Transient answer-media integrity is verified by SHA-256 before Windows Setup and again before local deletion.
+15. Temporary bootstrap Administrator is disabled after Agent bootstrap; it is not the long-lived Agent identity.
+16. AutoLogon password residue and managed unattend copies must be removed during retirement.
+17. Agent binary directory is read/execute for the service SID; workspace/state are Modify only.
 
 ## Verification status
 
 ### Deterministic/code-level
 
-The repository now contains tests for the core Python models, generated XML/ISO behavior, PowerShell command shape, secret redaction, fail-closed gates and provisioning postcondition semantics.
+The repository contains regression coverage for core Python models, generated XML/ISO/PowerShell invariants, PowerShell escaping, secret redaction, DPAPI platform behavior, package hashing, service-boundary configuration, bootstrap retirement and managed secret cleanup.
+
+### CI visibility
+
+The repository CI workflow now contains both Linux and Windows Python matrices. The connected GitHub status surface currently exposes no checks for the latest direct-push HEAD, and the workflow-run connector available in this chat only returns PR-triggered runs. Therefore **CI is currently pending/unobservable from this chat and is not declared PASS**.
 
 ### Not yet runtime PASS
 
-A real Windows Hyper-V integration run is still mandatory. Current GitHub CI cannot prove actual Hyper-V/vTPM/NAT/firmware behavior, Windows Setup answer-file consumption, DPAPI native round-trip on the target host, or PowerShell Direct bootstrap.
+A real Windows Hyper-V integration run is still mandatory. GitHub-hosted runners do not prove actual Hyper-V/vTPM/NAT/firmware behavior, Windows Setup answer-file consumption, PowerShell Direct bootstrap, Guest Service Interface copy semantics or real service SID ACL behavior on the target machine.
 
-Do **not** label R002C runtime PASS until those Windows-host tests are executed and evidence is captured.
+Do **not** label R002C runtime PASS until those Windows-host tests are executed and non-secret evidence is captured.
 
 ## Next objectives
 
-### R002C Tranche 3B — real Windows/Hyper-V install harness
+### R002C Tranche 4B — persistent post-install finalization runtime
 
-- add Windows-only integration marker/harness;
-- preflight report for Hyper-V/network/media conflicts;
+- extend durable provisioning state with guest-bootstrap/service-ready/bootstrap-retired/media-detached/secrets-cleared checkpoints;
+- make crash/resume safe after bootstrap account disablement;
+- require service readiness before retirement;
+- require persisted retirement checkpoint before DPAPI deletion;
+- add read-only post-reboot service proof;
+- define actual Agent `/healthz` and capability schema;
+- build/identify the real signed Agent executable artifact and package manifest generation path.
+
+### R002C Tranche 3B/4C — real Windows/Hyper-V integration harness
+
+- preflight Hyper-V/network/media conflicts;
 - reconcile Internal vSwitch/NAT twice for idempotency proof;
 - create VM, persist VMId, reconcile by VMId;
 - prove Secure Boot + vTPM readback;
-- attach Windows + answer ISO and verify boot order;
-- run DPAPI native round-trip;
-- start unattended Windows installation on an explicitly designated disposable test VM;
-- capture non-secret evidence JSON;
-- no automated destructive cleanup without explicit operator approval.
-
-### R002C Tranche 4 — PowerShell Direct guest bootstrap
-
-- implement secret-safe `Invoke-Command -VMName` runner;
-- load bootstrap credential from DPAPI without command-line exposure;
-- wait for PowerShell Direct readiness/user profile;
-- configure deterministic guest IP `172.29.240.10/24`, gateway `172.29.240.1`, managed DNS;
-- create `C:\HMS-Workspace` and NTFS ACLs;
-- install HMS Agent as a Windows Service with least privilege;
-- health/capability proof;
-- disable/remove temporary bootstrap Administrator and AutoLogon residue;
-- detach/delete answer ISO and clear DPAPI secret.
+- run native DPAPI round-trip;
+- start unattended Windows installation on an explicitly disposable test VM;
+- prove PowerShell Direct, deterministic guest IP and Guest Service Interface copy;
+- install Agent service and prove service SID ACLs;
+- retire bootstrap account and clear install secrets;
+- reboot and re-prove service readiness;
+- capture deterministic non-secret evidence JSON;
+- no broad/destructive cleanup of operator resources.
 
 ### R002C Tranche 5 — pairing/control proof
 
