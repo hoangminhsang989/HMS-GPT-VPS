@@ -172,14 +172,18 @@ class PairingRecord:
         scopes_raw = payload.get("scopes")
         if not isinstance(scopes_raw, list) or not all(isinstance(item, str) for item in scopes_raw):
             raise PairingError("pairing scopes must be a list of strings")
+        issued_at = _parse_iso(payload.get("issued_at"), "issued_at")
+        expires_at = _parse_iso(payload.get("expires_at"), "expires_at")
+        if issued_at is None or expires_at is None:
+            raise PairingError("issued_at and expires_at are required")
         record = cls(
             schema_version=int(payload.get("schema_version", -1)),
             pair_id=str(payload.get("pair_id", "")),
             instance_id=str(payload.get("instance_id", "")),
             token_sha256=str(payload.get("token_sha256", "")),
             scopes=tuple(scopes_raw),
-            issued_at=_parse_iso(payload.get("issued_at"), "issued_at") or utc_now(),
-            expires_at=_parse_iso(payload.get("expires_at"), "expires_at") or utc_now(),
+            issued_at=issued_at,
+            expires_at=expires_at,
             consumed_at=_parse_iso(payload.get("consumed_at"), "consumed_at"),
             revoked_at=_parse_iso(payload.get("revoked_at"), "revoked_at"),
         )
