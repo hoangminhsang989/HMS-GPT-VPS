@@ -18,6 +18,7 @@ from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_jso
 
 AGENT_DEVICE_ENROLLMENT_SCHEMA_VERSION = 1
 DEFAULT_GUEST_STATE_PATH = r"C:\ProgramData\HMS-GPT-VPS\State"
+DEFAULT_AGENT_SERVICE_NAME = "HMSAgent"
 _MAX_ENROLLMENT_PAYLOAD_BYTES = 4096
 _SAFE_IDENTIFIER_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -32,9 +33,11 @@ class AgentDeviceEnrollmentError(RuntimeError):
 class AgentDeviceEnrollmentConfig:
     instance_id: str
     guest_state_path: str = DEFAULT_GUEST_STATE_PATH
+    service_name: str = DEFAULT_AGENT_SERVICE_NAME
 
     def validate(self) -> None:
         _validate_identifier(self.instance_id, "instance_id")
+        _validate_identifier(self.service_name, "service_name")
         if not isinstance(self.guest_state_path, str) or not self.guest_state_path.strip():
             raise ValueError("guest_state_path is required")
         path = PureWindowsPath(self.guest_state_path)
@@ -115,14 +118,16 @@ def build_guest_device_enrollment_script(config: AgentDeviceEnrollmentConfig) ->
     """Build the secret-free guest script used before HMSAgent service start.
 
     The credential arrives only through the PowerShell Direct secret payload.
-    The script creates the State directory with a pre-service SYSTEM/Admin ACL
-    when absent, protects the credential with LocalMachine DPAPI, and publishes
-    the file create-only. Existing files must decrypt to the exact same
-    credential; they are never overwritten or silently rotated.
+    The runtime parent must already exist from the protected guest foundation.
+    State ACL is reconciled on every run before credential access, then the
+    credential is protected with LocalMachine DPAPI and published create-only.
+    Existing files must decrypt to the exact same credential; they are never
+    overwritten or silently rotated.
     """
     config.validate()
     expected_instance = ps_literal(config.instance_id)
     state_path = ps_literal(config.guest_state_path)
+    service_name = ps_literal(config.service_name)
     filename = ps_literal(GUEST_DEVICE_CREDENTIAL_FILENAME)
     secret_bytes = AGENT_DEVICE_SECRET_BYTES
     schema_version = AGENT_DEVICE_ENROLLMENT_SCHEMA_VERSION
@@ -132,6 +137,9 @@ param([Parameter(Mandatory=$true)][string]$PayloadB64)
 $ErrorActionPreference = 'Stop'
 $expectedInstance = {expected_instance}
 $statePath = {state_path}
+$stateParent = Split-Path -Parent $statePath
+$serviceName = {service_name}
+$servicePrincipal = "NT SERVICE\\$serviceName"
 $credentialFileName = {filename}
 $credentialPath = Join-Path $statePath $credentialFileName
 $schemaVersion = {schema_version}
@@ -167,10 +175,21 @@ function Read-HmsStoredCredential {{
     $cipher = $null
     $raw = $null
   }}
+  $storedFields = @($stored.PSObject.Properties.Name | Sort-Object)
+  if (($storedFields -join ',') -ne 'device_id,instance_id,protection_scope,schema_version,secret_b64') {{
+    throw 'Agent device credential fields do not match schema'
+  }}
   if ([int]$stored.schema_version -ne $schemaVersion) {{ throw 'Agent device credential schema mismatch' }}
   if ([string]$stored.protection_scope -ne 'local-machine') {{ throw 'Agent device credential scope mismatch' }}
   if (-not (Test-HmsIdentifier ([string]$stored.instance_id))) {{ throw 'Stored instance_id is invalid' }}
   if (-not (Test-HmsIdentifier ([string]$stored.device_id))) {{ throw 'Stored device_id is invalid' }}
+  try {{
+    $storedSecret = [System.Convert]::FromBase64String([string]$stored.secret_b64)
+  }} catch {{
+    throw 'Stored Agent device secret is not valid base64'
+  }}
+  if ($storedSecret.Length -ne $requiredSecretBytes) {{ throw 'Stored Agent device secret length is invalid' }}
+  $storedSecret = $null
   return $stored
 }}
 
@@ -188,7 +207,10 @@ try {{
   $PayloadB64 = $null
   $payloadBytes = $null
 }}
-
+$payloadFields = @($payload.PSObject.Properties.Name | Sort-Object)
+if (($payloadFields -join ',') -ne 'device_id,instance_id,schema_version,secret_b64') {{
+  throw 'Agent enrollment payload fields do not match schema'
+}}
 if ([int]$payload.schema_version -ne $schemaVersion) {{ throw 'Agent enrollment payload schema mismatch' }}
 $instanceId = [string]$payload.instance_id
 $deviceId = [string]$payload.device_id
@@ -203,14 +225,23 @@ try {{
 }}
 if ($secret.Length -ne $requiredSecretBytes) {{ throw 'Enrollment device secret length is invalid' }}
 
+if (-not (Test-Path -LiteralPath $stateParent -PathType Container)) {{
+  throw 'Protected Agent runtime parent must exist before device enrollment'
+}}
 if (-not (Test-Path -LiteralPath $statePath)) {{
-  New-Item -ItemType Directory -Path $statePath -Force | Out-Null
-  & icacls.exe $statePath '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-  if ($LASTEXITCODE -ne 0) {{ throw 'Failed to protect Agent State directory ACL' }}
+  New-Item -ItemType Directory -Path $statePath | Out-Null
 }}
 if (-not (Test-Path -LiteralPath $statePath -PathType Container)) {{
   throw 'Agent State path is not a directory'
 }}
+
+$service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if ($null -eq $service) {{
+  & icacls.exe $statePath '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+}} else {{
+  & icacls.exe $statePath '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)M" | Out-Null
+}}
+if ($LASTEXITCODE -ne 0) {{ throw 'Failed to reconcile Agent State directory ACL' }}
 
 $existing = Read-HmsStoredCredential
 if ($null -ne $existing) {{
@@ -244,10 +275,12 @@ $envelope = New-Object byte[] ($magic.Length + $protectedBytes.Length)
 [System.Array]::Copy($magic, 0, $envelope, 0, $magic.Length)
 [System.Array]::Copy($protectedBytes, 0, $envelope, $magic.Length, $protectedBytes.Length)
 $tempPath = Join-Path $statePath (([System.IO.Path]::GetRandomFileName()) + '.tmp')
+$created = $false
 try {{
   [System.IO.File]::WriteAllBytes($tempPath, $envelope)
   try {{
     [System.IO.File]::Move($tempPath, $credentialPath)
+    $created = $true
   }} catch [System.IO.IOException] {{
     if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf)) {{ throw }}
   }}
@@ -264,7 +297,7 @@ try {{
 
 [pscustomobject]@{{
   ready = $true
-  created = $true
+  created = $created
   instance_id = $instanceId
   device_id = $deviceId
   credential_path = $credentialPath
