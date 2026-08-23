@@ -2,169 +2,180 @@
 
 ## Product goal
 
-HMS-GPT-VPS is a Windows-hosted tool that can automatically provision an isolated Linux execution environment on the same Windows PC, install and configure the HMS VPS Agent, then expose a secure pairing link that the operator can paste into ChatGPT/HMS tooling.
+HMS-GPT-VPS is a Windows-hosted tool that automatically provisions an isolated **Windows virtual machine** on the same Windows PC, installs and configures the HMS Agent inside that VM, then exposes a secure one-time pairing link that the operator can paste into a supported ChatGPT/HMS control integration.
 
-The intended user flow is:
+The Windows VM is the primary execution target. Linux, WSL2, or remote rented VPS backends may be added later, but they are not the default product path.
+
+## Canonical user flow
 
 ```text
-Windows PC
+Windows host PC
    |
    +--> HMS-GPT-VPS desktop tool
            |
            +--> [Tạo VPS]
                   |
-                  +--> provision isolated Linux guest
-                  |      preferred backend: WSL2
-                  |      optional backend: Hyper-V VM
-                  |
-                  +--> install HMS VPS Agent
-                  +--> create workspace + device identity
-                  +--> establish outbound secure tunnel/control channel
+                  +--> check Hyper-V + virtualization prerequisites
+                  +--> create isolated Windows VM
+                  +--> install/configure HMS Agent in VM
+                  +--> create dedicated workspace in VM
+                  +--> start agent automatically
+                  +--> establish outbound authenticated control channel
                   +--> generate one-time pairing link
                                  |
                                  v
                          Copy link to ChatGPT
                                  |
                                  v
-                    ChatGPT / HMS control plane
+                    Supported ChatGPT/HMS integration
                                  |
                                  v
-                         HMS VPS Agent
+                          HMS Agent in VM
                                  |
                  +---------------+----------------+
                  |               |                |
-              Files            Tests             Git
-                 |               |                |
-           create/edit       run commands      status/diff
+              Files          PowerShell          Git/Test
 ```
 
-## Important terminology
+## Why Windows VM is primary
 
-The Linux environment created on the same Windows machine is technically a local virtualized Linux environment rather than a rented Internet VPS. The product UI may still call it `VPS` for simplicity, but internally the runtime backend must record whether the instance is WSL2, Hyper-V, or another supported virtualization backend.
+The project is intended to support Windows-native development and automation workloads. A Windows VM allows the isolated agent environment to use PowerShell, Git for Windows, Python, Codex CLI, Windows applications, UI Automation, and other Windows-only tooling without granting ChatGPT direct control of the physical host by default.
+
+## Virtualization backend
+
+### Primary: Hyper-V Windows VM
+
+Hyper-V is the canonical backend for the first full implementation. The provisioner must detect:
+
+- Windows edition and Hyper-V availability;
+- CPU virtualization support;
+- whether required Hyper-V components are enabled;
+- available RAM and disk space;
+- existence and health of an already-managed HMS VM.
+
+If elevation or a Windows restart is required, the tool must explain the reason and obtain explicit operator approval before changing host features.
+
+### Future/optional backends
+
+- Windows Sandbox for disposable short-lived test environments.
+- WSL2/Linux for Linux-specific workloads.
+- Remote rented VPS using the same agent/pairing contract.
+
+These are secondary modes and must not change the Windows-first default.
 
 ## One-button provisioning
 
-The Windows application must provide a primary action `Tạo VPS` that performs unattended provisioning as far as the host permits:
+The Windows application exposes a primary action `Tạo VPS`. The intended state machine is:
 
-1. Check virtualization prerequisites.
-2. Select the preferred supported backend.
-3. Install/enable required Windows components only with explicit operator approval when elevation is required.
-4. Create the Linux instance.
-5. Install Python/runtime dependencies and HMS VPS Agent.
-6. Create a dedicated unprivileged agent user.
-7. Create the authorized project workspace.
-8. Generate device identity and short-lived pairing credentials.
-9. Start the agent automatically.
-10. Establish an outbound secure connection so inbound router/NAT configuration is not required.
-11. Display the pairing link and a `Sao chép liên kết` action.
+1. `PREFLIGHT` — verify Windows/Hyper-V prerequisites.
+2. `HOST_READY` — enable prerequisites only after approval when needed.
+3. `IMAGE_READY` — validate the configured Windows base image/template.
+4. `VM_CREATING` — create VM, virtual disk, CPU/RAM and network configuration.
+5. `VM_BOOTING` — start the VM and wait for guest readiness.
+6. `GUEST_BOOTSTRAP` — install/configure HMS Agent and development prerequisites.
+7. `AGENT_READY` — agent health and workspace checks pass.
+8. `PAIRING_READY` — create a short-lived one-time pairing link.
+9. `CONTROL_READY` — supported ChatGPT/HMS integration has paired successfully.
 
-Provisioning must be resumable and idempotent: closing/reopening the Windows tool must not corrupt an existing instance or create duplicates blindly.
+Provisioning must be resumable and idempotent. Reopening the Windows tool must discover and recover a managed VM instead of blindly creating duplicates.
+
+## Host/guest isolation
+
+The physical Windows host and managed Windows VM are separate trust zones.
+
+By default:
+
+- the agent has no arbitrary host filesystem access;
+- host drives are not automatically shared into the VM;
+- clipboard, enhanced session, shared folders and device passthrough are disabled unless explicitly enabled by policy;
+- the VM workspace is authoritative for ChatGPT-created/test files;
+- destructive host operations are outside the default agent capability set.
 
 ## Pairing link contract
 
-The pairing link is a bootstrap credential, not a permanent bearer secret. It must:
+The displayed link is a bootstrap credential, not a permanent bearer secret. It must:
 
-- be HTTPS;
-- contain or resolve to a random high-entropy one-time token;
+- use HTTPS;
+- contain or resolve to a high-entropy one-time token;
 - expire quickly;
 - become invalid after successful pairing;
-- identify the target instance without revealing reusable host credentials;
-- never expose SSH passwords, root passwords, API keys, or long-lived tokens in the URL;
-- result in a bound session/device credential after pairing.
+- identify exactly one managed VM/agent instance;
+- never expose Windows passwords, administrator credentials, API keys or reusable host secrets;
+- result in a bound device/session credential after redemption.
 
-Example conceptual form only:
+Conceptual form only:
 
 ```text
-https://<control-service>/pair/<one-time-random-token>
+https://<control-service>/pair/<one-time-token>
 ```
 
-## ChatGPT control requirement
+A normal pasted web URL alone cannot magically give ChatGPT arbitrary machine-control capability. The URL must be consumed by a compatible ChatGPT/HMS connector/action/MCP/Bridge or equivalent supported integration that can authenticate and call the control API.
 
-Pasting a URL into ordinary ChatGPT does not by itself grant arbitrary command execution. HMS-GPT-VPS therefore requires a compatible ChatGPT/HMS control integration (connector/action/MCP/Bridge or equivalent supported tool surface) that can authenticate the pairing link and call the agent/control API.
-
-The product must not pretend that a normal web link alone is sufficient. The Windows UI should report pairing readiness separately from control-integration readiness.
-
-## Control-plane design
-
-Preferred topology:
+## Control-plane topology
 
 ```text
 ChatGPT / HMS tooling
         |
         v
-Authenticated HMS control service / connector
+Authenticated HMS control integration
+        |
+        v
+HMS control service
         |
         | HTTPS / WebSocket
         v
-Outbound tunnel/session from local Linux instance
+Outbound session from Windows VM
         |
         v
-HMS VPS Agent
+HMS Agent
         |
         +--> Policy engine
-        |      +--> identity/session checks
-        |      +--> project-root scope
-        |      +--> capability checks
-        |      +--> destructive-action approval gate
-        |
+        +--> Workspace isolation
         +--> File operations
-        +--> Shell/process execution
+        +--> PowerShell/process executor
         +--> Git operations
         +--> Test/build operations
-        +--> Telemetry/logging
+        +--> Audit + telemetry
 ```
 
-The local agent should initiate the Internet-facing connection whenever possible. Directly exposing an unauthenticated local agent port to the public Internet is forbidden.
+The VM agent should establish outbound connectivity whenever possible so the user does not need router port forwarding and the physical Windows host does not expose a public command port.
 
-## Initial proof-of-control acceptance test
+## First end-to-end acceptance test
 
-The first end-to-end milestone after pairing is intentionally small and observable:
+1. User clicks `Tạo VPS`.
+2. Tool reports managed Windows VM `READY`.
+3. Tool displays a one-time pairing link.
+4. User pastes/redeems the link in the supported ChatGPT/HMS integration.
+5. ChatGPT requests creation of `C:\\HMS-Workspace\\chatgpt-control-test.txt` inside the VM.
+6. Agent validates project scope and writes a deterministic payload.
+7. ChatGPT reads the file back through the same control path.
+8. Agent returns SHA-256, size, timestamp and audit event ID.
+9. User can open the VM and see the exact same file.
 
-1. Windows tool reports the instance `READY`.
-2. Operator copies the pairing link into the supported ChatGPT/HMS integration.
-3. ChatGPT requests creation of `workspace/chatgpt-control-test.txt`.
-4. Agent policy validates the project scope and path.
-5. Agent writes a deterministic test payload.
-6. ChatGPT reads the file back through the same control path.
-7. Agent returns SHA-256, size, timestamp, and audit event ID.
-8. Operator can see the file directly inside the Linux workspace.
-
-No destructive or privileged capability is required for this milestone.
+No destructive or administrator capability is required for this milestone.
 
 ## Core modules
 
-- `provisioner`: Windows-side WSL2/Hyper-V detection, installation and instance lifecycle.
-- `instance_registry`: stable IDs, backend type, state and recovery metadata.
-- `pairing`: one-time pairing token and device/session binding.
+- `windows_host`: host prerequisite and Hyper-V capability detection.
+- `provisioner`: Hyper-V Windows VM creation/recovery state machine.
+- `instance_registry`: stable VM IDs and lifecycle metadata.
+- `guest_bootstrap`: agent/runtime installation inside the Windows VM.
+- `pairing`: one-time pairing and device/session binding.
 - `transport`: authenticated outbound control channel.
-- `agent`: process lifecycle and request dispatch.
-- `policy`: authorization, scope and destructive-action decisions.
-- `workspace`: project-root validation and safe path resolution.
-- `executor`: controlled command execution.
+- `agent`: request dispatch and lifecycle.
+- `policy`: capability, scope and destructive-action decisions.
+- `workspace`: VM workspace validation and safe path resolution.
+- `executor`: controlled PowerShell/process execution.
 - `audit`: structured audit records.
-- `health`: host, guest and agent readiness diagnostics.
+- `health`: host, VM and agent diagnostics.
 
-## Trust boundaries
+## Security baseline
 
-1. A pasted pairing URL is untrusted until validated by the pairing service.
-2. ChatGPT/HMS control plane is not implicitly trusted for arbitrary host access.
-3. Every requested operation passes through local agent policy.
-4. Windows host files are not exposed by default; only explicitly mounted/project-bound roots are accessible.
-5. The Linux agent runs without root by default.
-6. Elevation, destructive operations and host-level changes require explicit policy and operator approval.
-7. Project boundaries are authoritative; path traversal and symlink escapes fail closed.
-8. Every accepted or rejected control request is auditable.
-
-## Runtime backend priority
-
-### Preferred: WSL2
-
-Use WSL2 first when available because it provides lightweight Linux virtualization, fast provisioning and strong Windows integration. The tool must still prevent accidental access to arbitrary Windows-mounted files.
-
-### Optional: Hyper-V
-
-Use Hyper-V when stronger VM separation is desired and the Windows edition/hardware supports it. Hyper-V support must not be a prerequisite for the first working release.
-
-## Remote rented VPS
-
-A future mode may provision or connect to an actual remote VPS. That is separate from the primary local-Windows one-button workflow and must reuse the same agent, pairing, policy and audit contracts.
+1. Deny capabilities by default.
+2. Do not grant ChatGPT direct host control by default.
+3. Do not run normal agent work as Windows Administrator by default.
+4. Restrict filesystem operations to configured VM project roots.
+5. Require explicit approval for destructive or privileged operations.
+6. Keep reusable credentials out of pairing URLs and the Git repository.
+7. Audit accepted and rejected operations.
+8. Treat VM-to-host sharing as an explicit privileged capability.
