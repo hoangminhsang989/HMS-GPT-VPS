@@ -16,10 +16,16 @@ class HyperVObservation:
     vm_switch_ready: bool
     install_media_ready: bool
     guest_heartbeat_ok: bool
+    secure_boot_enabled: bool = False
+    tpm_enabled: bool = False
 
     @property
     def vm_running(self) -> bool:
         return self.vm_state == "Running"
+
+    @property
+    def windows11_security_ready(self) -> bool:
+        return self.secure_boot_enabled and self.tpm_enabled
 
 
 def build_observe_hyperv_script(
@@ -69,6 +75,8 @@ $vmState = $null
 $vmSwitchReady = $false
 $installMediaReady = $false
 $guestHeartbeatOk = $false
+$secureBootEnabled = $false
+$tpmEnabled = $false
 
 if ($null -ne $vm) {{
   $vmId = $vm.Id.Guid
@@ -85,6 +93,12 @@ if ($null -ne $vm) {{
     $installMediaReady = $null -ne $dvd -and $dvd.Path -eq $isoPath
   }}
 
+  $firmware = Get-VMFirmware -VMName $vmName
+  $secureBootEnabled = $firmware.SecureBoot -eq 'On'
+
+  $security = Get-VMSecurity -VMName $vmName
+  $tpmEnabled = [bool]$security.TpmEnabled
+
   $heartbeat = Get-VMIntegrationService -VMName $vmName -Name 'Heartbeat' -ErrorAction SilentlyContinue
   if ($null -ne $heartbeat) {{
     $guestHeartbeatOk = $heartbeat.PrimaryStatusDescription -eq 'OK'
@@ -98,6 +112,8 @@ if ($null -ne $vm) {{
   vm_switch_ready = [bool]$vmSwitchReady
   install_media_ready = [bool]$installMediaReady
   guest_heartbeat_ok = [bool]$guestHeartbeatOk
+  secure_boot_enabled = [bool]$secureBootEnabled
+  tpm_enabled = [bool]$tpmEnabled
 }}
 """.strip()
 
@@ -125,4 +141,6 @@ def observe_hyperv(
         vm_switch_ready=bool(payload.get("vm_switch_ready", False)),
         install_media_ready=bool(payload.get("install_media_ready", False)),
         guest_heartbeat_ok=bool(payload.get("guest_heartbeat_ok", False)),
+        secure_boot_enabled=bool(payload.get("secure_boot_enabled", False)),
+        tpm_enabled=bool(payload.get("tpm_enabled", False)),
     )
