@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
 
@@ -35,7 +35,7 @@ class UnattendConfig:
 @dataclass(frozen=True)
 class BootstrapAccount:
     username: str
-    password: str
+    password: str = field(repr=False)
 
     def validate(self) -> None:
         username = self.username.strip()
