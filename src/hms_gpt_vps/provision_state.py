@@ -21,7 +21,12 @@ class ProvisionState(str, Enum):
     GUEST_BOOTED = "guest_booted"
     GUEST_BOOTSTRAP = "guest_bootstrap"
     AGENT_INSTALLING = "agent_installing"
+    AGENT_SERVICE_READY = "agent_service_ready"
     AGENT_HEALTHY = "agent_healthy"
+    BOOTSTRAP_RETIRING = "bootstrap_retiring"
+    BOOTSTRAP_RETIRED = "bootstrap_retired"
+    ANSWER_MEDIA_DETACHED = "answer_media_detached"
+    INSTALL_SECRETS_CLEARED = "install_secrets_cleared"
     PAIRING_PENDING = "pairing_pending"
     READY = "ready"
     FAILED = "failed"
@@ -113,3 +118,29 @@ class ProvisionStateStore:
         )
         self.save(record)
         return record
+
+    def transition_checked(
+        self,
+        *,
+        instance_id: str,
+        expected_state: ProvisionState,
+        state: ProvisionState,
+        reason: str | None = None,
+        last_error: str | None = None,
+    ) -> ProvisionRecord:
+        """Advance only from the exact persisted checkpoint expected by caller."""
+        current = self.load()
+        if current is None:
+            raise ValueError("provision state does not exist")
+        if current.instance_id != instance_id:
+            raise ValueError("provision state belongs to another instance")
+        if current.state is not expected_state:
+            raise ValueError(
+                f"expected provision state {expected_state.value}, found {current.state.value}"
+            )
+        return self.transition(
+            instance_id=instance_id,
+            state=state,
+            reason=reason,
+            last_error=last_error,
+        )
