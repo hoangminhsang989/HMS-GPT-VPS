@@ -16,6 +16,7 @@ class ProvisionObservation:
     vm_running: bool = False
     guest_booted: bool = False
     guest_bootstrap_ready: bool = False
+    agent_device_enrolled: bool = False
     agent_service_ready: bool = False
     agent_healthy: bool = False
     bootstrap_retired: bool = False
@@ -47,6 +48,11 @@ class ProvisioningOrchestrator:
 
     Ordinary mutation actions do not advance durable state. A state advances only
     after observation proves the previous mutation reached its postcondition.
+
+    Agent device enrollment is a mandatory pre-service checkpoint. The guest
+    bootstrap state cannot advance to HMS Agent installation until observation
+    proves the stable Bridge/guest device credential has been enrolled. The
+    existing AGENT_INSTALLING state is the durable checkpoint for that proof.
 
     Bootstrap retirement is a special two-phase boundary: the runtime first
     persists BOOTSTRAP_RETIRING, then executes the final credentialed guest
@@ -203,7 +209,17 @@ class ProvisioningOrchestrator:
             )
             return TransitionResult(next_record, "GUEST_BOOTSTRAP_VERIFIED")
 
-        if record.state in {ProvisionState.GUEST_BOOTSTRAP, ProvisionState.AGENT_INSTALLING}:
+        if record.state is ProvisionState.GUEST_BOOTSTRAP:
+            if not observed.agent_device_enrolled:
+                return TransitionResult(record, "ENROLL_AGENT_DEVICE")
+            next_record = self.store.transition(
+                instance_id=context.instance_id,
+                state=ProvisionState.AGENT_INSTALLING,
+                reason="agent_device_enrollment_verified",
+            )
+            return TransitionResult(next_record, "AGENT_DEVICE_ENROLLMENT_VERIFIED")
+
+        if record.state is ProvisionState.AGENT_INSTALLING:
             if not observed.agent_service_ready:
                 return TransitionResult(record, "INSTALL_HMS_AGENT")
             next_record = self.store.transition(
