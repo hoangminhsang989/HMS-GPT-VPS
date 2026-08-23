@@ -12,6 +12,7 @@ from hms_gpt_vps.pairing_exchange import (
     PairingExchangeIntegrityError,
     PairingExchangeKey,
     PairingExchangeRecoveryExpiredError,
+    PairingExchangeRecoveryMismatchError,
     PairingExchangeStoreMismatchError,
     PairingSessionExchange,
 )
@@ -20,6 +21,7 @@ from hms_gpt_vps.pairing_store import PairingStore
 
 NOW = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
 INSTANCE_ID = "hms-01"
+CLIENT_NONCE = "client-nonce-0123456789"
 
 
 def build_exchange(tmp_path, *, key_bytes: bytes = b"K" * 32):
@@ -51,6 +53,7 @@ def test_exchange_atomically_consumes_pairing_and_creates_one_session(tmp_path) 
     issued = exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=1),
     )
@@ -67,12 +70,14 @@ def test_retry_within_recovery_window_returns_exact_same_session(tmp_path) -> No
     first = exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=1),
     )
     replay = exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=30),
     )
@@ -82,11 +87,35 @@ def test_retry_within_recovery_window_returns_exact_same_session(tmp_path) -> No
     assert count_sessions(db_path) == 1
 
 
+def test_retry_with_different_client_nonce_is_rejected(tmp_path) -> None:
+    exchange, pair, _pairing_store, _session_store, db_path = build_exchange(tmp_path)
+    first = exchange.exchange(
+        pair.record.pair_id,
+        pair.token,
+        CLIENT_NONCE,
+        instance_id=INSTANCE_ID,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(PairingExchangeRecoveryMismatchError, match="client nonce"):
+        exchange.exchange(
+            pair.record.pair_id,
+            pair.token,
+            "different-nonce-0123456789",
+            instance_id=INSTANCE_ID,
+            now=NOW + timedelta(seconds=10),
+        )
+
+    assert count_sessions(db_path) == 1
+    assert _session_store.require(first.record.session_id) == first.record
+
+
 def test_retry_after_recovery_window_fails_closed(tmp_path) -> None:
     exchange, pair, _pairing_store, _session_store, _db_path = build_exchange(tmp_path)
     exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=1),
     )
@@ -95,6 +124,7 @@ def test_retry_after_recovery_window_fails_closed(tmp_path) -> None:
         exchange.exchange(
             pair.record.pair_id,
             pair.token,
+            CLIENT_NONCE,
             instance_id=INSTANCE_ID,
             now=NOW + timedelta(seconds=PAIRING_EXCHANGE_RECOVERY_SECONDS + 2),
         )
@@ -105,6 +135,7 @@ def test_recovery_with_different_bridge_key_is_rejected(tmp_path) -> None:
     exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=1),
     )
@@ -114,10 +145,11 @@ def test_recovery_with_different_bridge_key_is_rejected(tmp_path) -> None:
         PairingExchangeKey(b"Z" * 32),
     )
 
-    with pytest.raises(PairingExchangeIntegrityError, match="no atomically committed"):
+    with pytest.raises(PairingExchangeIntegrityError, match="session identity"):
         wrong_key_exchange.exchange(
             pair.record.pair_id,
             pair.token,
+            CLIENT_NONCE,
             instance_id=INSTANCE_ID,
             now=NOW + timedelta(seconds=10),
         )
@@ -128,6 +160,7 @@ def test_rotated_initial_session_cannot_be_recovered_from_old_pairing_token(tmp_
     issued = exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=1),
     )
@@ -142,6 +175,7 @@ def test_rotated_initial_session_cannot_be_recovered_from_old_pairing_token(tmp_
         exchange.exchange(
             pair.record.pair_id,
             pair.token,
+            CLIENT_NONCE,
             instance_id=INSTANCE_ID,
             now=NOW + timedelta(seconds=10),
         )
@@ -158,7 +192,7 @@ def test_exchange_requires_pairing_and_session_tables_in_same_database(tmp_path)
         )
 
 
-def test_raw_pairing_session_and_bridge_key_are_not_stored_in_sqlite(tmp_path) -> None:
+def test_raw_pairing_session_nonce_and_bridge_key_are_not_stored_in_sqlite(tmp_path) -> None:
     key_bytes = b"bridge-exchange-key-material!!" + b"XX"
     assert len(key_bytes) >= 32
     exchange, pair, _pairing_store, _session_store, db_path = build_exchange(
@@ -168,6 +202,7 @@ def test_raw_pairing_session_and_bridge_key_are_not_stored_in_sqlite(tmp_path) -
     session = exchange.exchange(
         pair.record.pair_id,
         pair.token,
+        CLIENT_NONCE,
         instance_id=INSTANCE_ID,
         now=NOW + timedelta(seconds=1),
     )
@@ -175,6 +210,7 @@ def test_raw_pairing_session_and_bridge_key_are_not_stored_in_sqlite(tmp_path) -
     raw_db = db_path.read_bytes()
     assert pair.token.encode("utf-8") not in raw_db
     assert session.token.encode("utf-8") not in raw_db
+    assert CLIENT_NONCE.encode("utf-8") not in raw_db
     assert key_bytes not in raw_db
 
 
