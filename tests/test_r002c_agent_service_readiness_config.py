@@ -64,6 +64,8 @@ def test_service_readiness_requires_exact_package_runtime_config_hash_and_acl() 
     assert "$actualRuntimeConfigHash = Get-HmsSha256 $runtimeConfigPath" in script
     assert "Get-FileHash" not in script
     assert "Get-Acl" not in script
+    assert "System.IO.FileSystem.AccessControl.dll" in script
+    assert "[System.Reflection.Assembly]::LoadFrom" in script
     assert "[System.IO.FileSystemAclExtensions]::GetAccessControl" in script
     ready_start = script.index("$serviceReady =")
     ready_end = script.index("[pscustomobject]@{", ready_start)

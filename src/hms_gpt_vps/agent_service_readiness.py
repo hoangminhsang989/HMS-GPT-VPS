@@ -128,6 +128,19 @@ if ($serviceExists) {{
   }}
 }}
 
+$aclExtensionsType = 'System.IO.FileSystemAclExtensions' -as [type]
+if ($null -eq $aclExtensionsType) {{
+  $aclAssemblyPath = [System.IO.Path]::Combine($PSHOME, 'System.IO.FileSystem.AccessControl.dll')
+  if (-not [System.IO.File]::Exists($aclAssemblyPath)) {{
+    throw 'System.IO.FileSystem.AccessControl.dll is unavailable for ACL readiness verification'
+  }}
+  [System.Reflection.Assembly]::LoadFrom($aclAssemblyPath) | Out-Null
+  $aclExtensionsType = 'System.IO.FileSystemAclExtensions' -as [type]
+}}
+if ($null -eq $aclExtensionsType) {{
+  throw 'System.IO.FileSystemAclExtensions is unavailable after explicit assembly load'
+}}
+
 function Test-HmsAclRight([string]$Path, [System.Security.AccessControl.FileSystemRights]$Required) {{
   if ($null -eq $serviceSid) {{ return $false }}
 
