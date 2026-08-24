@@ -24,7 +24,7 @@ jobs:
       - name: Test
         run: pytest
       - name: Compile
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests scripts
 
   windows-test:
     runs-on: windows-latest
@@ -44,4 +44,65 @@ jobs:
         run: pytest
       - name: Compile
         shell: pwsh
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests scripts
+
+  windows-package:
+    runs-on: windows-latest
+    needs: [linux-test, windows-test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pinned package toolchain
+        shell: pwsh
+        run: python -m pip install -e '.[package]'
+      - name: Build one-file Windows x64 Agent
+        shell: pwsh
+        run: >-
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          --onefile
+          --console
+          --name hms-agent
+          --paths src
+          --collect-submodules hms_gpt_vps
+          scripts/hms_agent_entry.py
+      - name: Smoke packaged executable version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (& .\dist\hms-agent.exe --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged hms-agent.exe --version failed' }
+          $expected = (python -c "import hms_gpt_vps; print('hms-agent ' + hms_gpt_vps.__version__)" | Out-String).Trim()
+          if ($actual -ne $expected) {
+            throw "Packaged Agent version mismatch: actual=$actual expected=$expected"
+          }
+      - name: Attest PE architecture size and SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path .\dist\package -Force | Out-Null
+          Copy-Item -LiteralPath .\dist\hms-agent.exe -Destination .\dist\package\hms-agent.exe
+          python .\scripts\attest_agent_package.py .\dist\package\hms-agent.exe .\dist\package\hms-agent.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Agent package attestation failed' }
+
+          $manifest = Get-Content -LiteralPath .\dist\package\hms-agent.manifest.json -Raw | ConvertFrom-Json
+          $artifact = Get-Item -LiteralPath .\dist\package\hms-agent.exe
+          $hash = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedVersion = (python -c "import hms_gpt_vps; print(hms_gpt_vps.__version__)" | Out-String).Trim()
+          if ([int]$manifest.schema_version -ne 1) { throw 'Agent manifest schema mismatch' }
+          if ($manifest.filename -ne 'hms-agent.exe') { throw 'Agent manifest filename mismatch' }
+          if ($manifest.version -ne $expectedVersion) { throw 'Agent manifest version mismatch' }
+          if ([int64]$manifest.size -ne [int64]$artifact.Length) { throw 'Agent manifest size mismatch' }
+          if ($manifest.sha256 -ne $hash) { throw 'Agent manifest SHA-256 mismatch' }
+      - name: Upload attested Agent package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hms-agent-windows-x64
+          path: |
+            dist/package/hms-agent.exe
+            dist/package/hms-agent.manifest.json
+          if-no-files-found: error
+          retention-days: 14
