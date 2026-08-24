@@ -51,12 +51,23 @@ def test_agent_install_is_durably_gated_on_device_enrollment(tmp_path) -> None:
     assert enrolled.record.state is ProvisionState.AGENT_INSTALLING
     assert enrolled.record.reason == "agent_device_enrollment_verified"
 
-    install = orchestrator.reconcile(context(ProvisionObservation()))
+    package = orchestrator.reconcile(context(ProvisionObservation()))
+    assert package.action == "STAGE_HMS_AGENT_PACKAGE"
+    assert package.record.state is ProvisionState.AGENT_INSTALLING
+
+    install = orchestrator.reconcile(
+        context(ProvisionObservation(agent_package_ready=True))
+    )
     assert install.action == "INSTALL_HMS_AGENT"
     assert install.record.state is ProvisionState.AGENT_INSTALLING
 
     service_ready = orchestrator.reconcile(
-        context(ProvisionObservation(agent_service_ready=True))
+        context(
+            ProvisionObservation(
+                agent_package_ready=True,
+                agent_service_ready=True,
+            )
+        )
     )
     assert service_ready.action == "AGENT_SERVICE_VERIFIED"
     assert service_ready.record.state is ProvisionState.AGENT_SERVICE_READY
@@ -65,6 +76,7 @@ def test_agent_install_is_durably_gated_on_device_enrollment(tmp_path) -> None:
 def test_agent_device_enrollment_observation_defaults_fail_closed() -> None:
     observation = ProvisionObservation()
     assert observation.agent_device_enrolled is False
+    assert observation.agent_package_ready is False
 
 
 def test_guest_enrollment_reconciles_acl_on_every_retry_and_preserves_service_sid() -> None:
