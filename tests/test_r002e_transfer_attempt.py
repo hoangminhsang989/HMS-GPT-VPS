@@ -143,6 +143,35 @@ def test_transfer_attempt_missing_secret_fails_closed(tmp_path: Path) -> None:
         store.load()
 
 
+def test_transfer_attempt_store_rejects_parent_redirect_after_construction(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority"
+    authority.mkdir()
+    redirected_target = tmp_path / "redirected-target"
+    redirected_target.mkdir()
+    preserved_authority = tmp_path / "preserved-authority"
+    secret_store = MemorySecretStore()
+    store = AgentPackageTransferAttemptStore(authority / "transfer.json", secret_store)
+
+    authority.rename(preserved_authority)
+    try:
+        authority.symlink_to(redirected_target, target_is_directory=True)
+    except OSError:
+        preserved_authority.rename(authority)
+        pytest.skip("host does not permit creating a directory symlink")
+
+    with pytest.raises(ValueError, match="metadata authority path traverses"):
+        store.begin_or_resume(
+            instance_id="hms-01",
+            vm_name="HMS-GPT-VPS-01",
+            manifest_sha256="9" * 64,
+        )
+
+    assert not (redirected_target / "transfer.json").exists()
+    assert secret_store.value is None
+
+
 def test_only_published_attempt_can_be_cleared(tmp_path: Path) -> None:
     store, secret_store = make_store(tmp_path)
     store.begin_or_resume(
