@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from hms_gpt_vps.agent_package_transfer_attempt import (
+    AGENT_PACKAGE_TRANSFER_ATTEMPT_SCHEMA_VERSION,
     AgentPackageTransferAttemptStore,
     AgentPackageTransferPhase,
 )
@@ -42,8 +44,12 @@ def test_transfer_attempt_metadata_never_contains_ownership_token(tmp_path: Path
 
     raw_text = (tmp_path / "transfer.json").read_text(encoding="utf-8")
     raw = json.loads(raw_text)
+    assert raw["schema_version"] == AGENT_PACKAGE_TRANSFER_ATTEMPT_SCHEMA_VERSION
     assert "ownership_token" not in raw
     assert raw["guest_service_interface_was_enabled"] is None
+    assert raw["ownership_token_sha256"] == hashlib.sha256(
+        attempt.ownership_token.encode("ascii")
+    ).hexdigest()
     assert attempt.ownership_token not in raw_text
     assert secret_store.value == attempt.ownership_token
     assert attempt.ownership_token not in repr(attempt)
@@ -140,6 +146,22 @@ def test_transfer_attempt_missing_secret_fails_closed(tmp_path: Path) -> None:
     secret_store.clear()
 
     with pytest.raises(ValueError, match="ownership token is missing"):
+        store.load()
+
+
+def test_transfer_attempt_rejects_valid_but_mismatched_secret_half(tmp_path: Path) -> None:
+    store, secret_store = make_store(tmp_path)
+    attempt = store.begin_or_resume(
+        instance_id="hms-01",
+        vm_name="HMS-GPT-VPS-01",
+        manifest_sha256="8" * 64,
+    )
+    replacement = "0" * 48
+    if replacement == attempt.ownership_token:
+        replacement = "1" * 48
+    secret_store.value = replacement
+
+    with pytest.raises(ValueError, match="ownership token does not match metadata"):
         store.load()
 
 
