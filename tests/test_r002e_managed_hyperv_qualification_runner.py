@@ -97,6 +97,36 @@ def test_proof_create_race_never_deletes_unowned_target(
     assert proof.read_text(encoding="utf-8") == "unowned-race-winner"
 
 
+def test_proof_target_substitution_after_open_never_deletes_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = load_runner()
+    proof = tmp_path / "proof.json"
+    displaced = tmp_path / "proof-created-by-runner.json"
+    original_match = runner._proof_target_matches_open_fd
+    mutated = False
+
+    def substitute(target: Path, fd_stat: os.stat_result) -> bool:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            target.replace(displaced)
+            target.write_text("unowned-replacement", encoding="utf-8")
+        return original_match(target, fd_stat)
+
+    monkeypatch.setattr(runner, "_proof_target_matches_open_fd", substitute)
+
+    with pytest.raises(RuntimeError, match="authority changed after create-only open"):
+        runner._write_proof_create_only(proof, {"replacement": True})
+
+    # Cleanup must not unlink a path that no longer names the file created by
+    # this invocation. The displaced runner-owned orphan is preferable to
+    # deleting the unowned replacement.
+    assert proof.read_text(encoding="utf-8") == "unowned-replacement"
+    assert displaced.exists()
+
+
 def test_authority_file_rejects_symlinked_parent(tmp_path: Path) -> None:
     runner = load_runner()
     real = tmp_path / "real"
