@@ -477,7 +477,7 @@ def qualify_managed_hyperv_agent(
         starting_state=starting_record.state.value,
         final_state=final_record.state.value,
         actions=tuple(actions),
-        package_schema_version=manifest.schema_version,
+        package_schema_version=AGENT_PACKAGE_MANIFEST_SCHEMA_VERSION,
         package_version=manifest.version,
         package_file_count=manifest.file_count,
         package_total_size=manifest.total_size,
