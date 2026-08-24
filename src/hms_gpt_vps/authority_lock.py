@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
+import math
 import os
 from pathlib import Path
 import time
@@ -10,6 +12,7 @@ from typing import Iterator
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _DEFAULT_TIMEOUT_SECONDS = 15.0
 _RETRY_SECONDS = 0.05
+_LOCK_CONTENTION_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK})
 
 
 class AuthorityLockError(RuntimeError):
@@ -57,8 +60,10 @@ def _try_lock(fd: int) -> bool:
 
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError:
-            return False
+        except OSError as exc:
+            if exc.errno in _LOCK_CONTENTION_ERRNOS:
+                return False
+            raise
         return True
 
     import fcntl
@@ -101,8 +106,9 @@ def exclusive_authority_lock(
 
     if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
         raise TypeError("authority lock timeout must be numeric")
-    if timeout_seconds <= 0 or timeout_seconds > 300:
-        raise ValueError("authority lock timeout must be between 0 and 300 seconds")
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
+        raise ValueError("authority lock timeout must be finite and between 0 and 300 seconds")
 
     lock_path = path.expanduser().absolute()
     _assert_lock_authority(lock_path)
@@ -120,7 +126,7 @@ def exclusive_authority_lock(
         if not _same_file_identity(opened_stat, current_stat):
             raise AuthorityLockError("authority lock identity changed during open")
 
-        deadline = time.monotonic() + float(timeout_seconds)
+        deadline = time.monotonic() + timeout
         while not _try_lock(fd):
             if time.monotonic() >= deadline:
                 raise AuthorityLockError("timed out waiting for authority lock")
