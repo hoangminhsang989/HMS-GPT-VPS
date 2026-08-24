@@ -12,6 +12,8 @@ from hms_gpt_vps.agent_package_transfer import AgentPackageTransferPlan
 from hms_gpt_vps.agent_package_transfer_recovery import (
     build_agent_package_ready_probe_script,
     build_reset_owned_agent_package_staging_script,
+    probe_guest_service_interface_enabled,
+    restore_guest_service_interface_state,
 )
 from hms_gpt_vps.agent_post_install_observe import (
     AgentPostInstallObservationConfig,
@@ -23,6 +25,7 @@ from hms_gpt_vps.agent_service_runtime_config import (
     AgentServiceRuntimeConfig,
 )
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
+from hms_gpt_vps import agent_package_transfer_recovery as recovery_module
 from hms_gpt_vps import agent_post_install_observe as observe_module
 
 
@@ -85,6 +88,48 @@ def test_package_ready_probe_is_read_only_and_verifies_complete_tree(tmp_path: P
     assert "Remove-Item" not in script
     assert "Move-Item" not in script
     assert "Copy-VMFile" not in script
+
+
+def test_integration_service_baseline_probe_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(script: str, *, timeout_seconds: int):
+        captured["script"] = script
+        captured["timeout_seconds"] = timeout_seconds
+        return {"enabled": False}
+
+    monkeypatch.setattr(recovery_module, "run_powershell_json", fake_run)
+    assert probe_guest_service_interface_enabled("HMS-GPT-VPS-01") is False
+    script = str(captured["script"])
+    assert "Get-VMIntegrationService" in script
+    assert "Enable-VMIntegrationService" not in script
+    assert "Disable-VMIntegrationService" not in script
+    assert captured["timeout_seconds"] == 30
+
+
+@pytest.mark.parametrize("baseline", [False, True])
+def test_integration_service_restore_targets_exact_persisted_baseline(
+    baseline: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(script: str, *, timeout_seconds: int):
+        captured["script"] = script
+        captured["timeout_seconds"] = timeout_seconds
+        return {"restored": True, "enabled": baseline, "changed": True}
+
+    monkeypatch.setattr(recovery_module, "run_powershell_json", fake_run)
+    result = restore_guest_service_interface_state("HMS-GPT-VPS-01", baseline)
+    script = str(captured["script"])
+    expected = "$true" if baseline else "$false"
+    assert f"$expectedEnabled = {expected}" in script
+    assert "Enable-VMIntegrationService" in script
+    assert "Disable-VMIntegrationService" in script
+    assert "Get-VMIntegrationService" in script
+    assert result["enabled"] is baseline
 
 
 def test_post_install_observer_passes_full_manifest_to_readiness(
