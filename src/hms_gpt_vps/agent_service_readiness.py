@@ -6,6 +6,7 @@ from .agent_service_install import AgentServiceConfig
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
+from .powershell_sha256 import POWERSHELL_SHA256_FUNCTION
 
 
 def _same_windows_path(left: str, right: str) -> bool:
@@ -64,6 +65,8 @@ $expectedRuntimeConfigHash = {expected_runtime_config_hash}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 $expectedCommand = '"' + $binaryPath + '" service'
 
+{POWERSHELL_SHA256_FUNCTION}
+
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 $serviceExists = $null -ne $service
 $serviceRunning = $serviceExists -and $service.Status -eq 'Running'
@@ -80,7 +83,7 @@ $binaryExists = Test-Path -LiteralPath $binaryPath -PathType Leaf
 $binaryHashOk = $false
 $actualHash = $null
 if ($binaryExists) {{
-  $actualHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+  $actualHash = Get-HmsSha256 $binaryPath
   $binaryHashOk = $actualHash -eq $expectedHash
 }}
 
@@ -88,7 +91,7 @@ $runtimeConfigExists = Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf
 $runtimeConfigHashOk = $false
 $actualRuntimeConfigHash = $null
 if ($runtimeConfigExists) {{
-  $actualRuntimeConfigHash = (Get-FileHash -LiteralPath $runtimeConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+  $actualRuntimeConfigHash = Get-HmsSha256 $runtimeConfigPath
   $runtimeConfigHashOk = $actualRuntimeConfigHash -eq $expectedRuntimeConfigHash
 }}
 
