@@ -135,6 +135,21 @@ jobs:
           if (-not [bool]$proof.cleanup_verified) { throw 'Native qualification cleanup was not verified' }
           if ([bool]$proof.hyperv_guest_proven) { throw 'Native host smoke must not claim Hyper-V guest proof' }
           if ([bool]$proof.full_bridge_command_flow_proven) { throw 'Native host smoke must not claim Bridge command-flow proof' }
+      - name: Capture raw SCM diagnostics on qualification failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host '--- sc.exe queryex HMSAgent ---'
+          & sc.exe queryex HMSAgent
+          Write-Host "queryex_exit=$LASTEXITCODE"
+          Write-Host '--- sc.exe qc HMSAgent ---'
+          & sc.exe qc HMSAgent
+          Write-Host "qc_exit=$LASTEXITCODE"
+          Write-Host '--- sc.exe qsidtype HMSAgent ---'
+          & sc.exe qsidtype HMSAgent
+          Write-Host "qsidtype_exit=$LASTEXITCODE"
+          exit 0
       - name: Upload native SCM proof
         uses: actions/upload-artifact@v4
         with:
