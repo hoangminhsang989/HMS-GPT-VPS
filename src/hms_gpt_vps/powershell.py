@@ -91,14 +91,30 @@ def run_powershell_json(
     timeout_seconds: int = 60,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
+    """Run PowerShell and require exactly one JSON object result.
+
+    ``powershell.exe -Command -`` can otherwise return process exit code zero
+    after a terminating error read from stdin. The explicit try/catch and exit
+    below makes script failures observable to the Python caller. An empty
+    result is also invalid: callers of this helper rely on a concrete object
+    for postcondition checks, so silently converting no output to ``{}`` would
+    turn a failed provisioning action into an ambiguous success.
+    """
     if not script.strip():
         raise ValueError("PowerShell script is required")
     wrapped = (
         "$ErrorActionPreference = 'Stop'\n"
-        "$hmsResult = & {\n"
+        "try {\n"
+        "  $hmsResult = & {\n"
         f"{script}\n"
+        "  }\n"
+        "  $hmsJson = $hmsResult | ConvertTo-Json -Compress -Depth 8\n"
+        "  if ($null -ne $hmsJson) { [Console]::Out.Write($hmsJson) }\n"
+        "} catch {\n"
+        "  [Console]::Error.WriteLine($_.Exception.Message)\n"
+        "  exit 1\n"
         "}\n"
-        "$hmsResult | ConvertTo-Json -Compress -Depth 8"
+        "exit 0"
     )
     result = run_powershell(
         wrapped,
@@ -108,8 +124,11 @@ def run_powershell_json(
     )
     text = result.stdout.strip()
     if not text:
-        return {}
-    parsed = json.loads(text)
+        raise PowerShellError("PowerShell JSON result was empty")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PowerShellError("PowerShell result was not valid JSON") from exc
     if not isinstance(parsed, dict):
         raise PowerShellError("PowerShell JSON result must be an object")
     return parsed
