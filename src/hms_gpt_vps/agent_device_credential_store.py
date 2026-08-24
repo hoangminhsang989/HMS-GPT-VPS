@@ -21,6 +21,7 @@ MAX_PROTECTED_DEVICE_CREDENTIAL_BYTES = 64 * 1024
 GUEST_DEVICE_CREDENTIAL_FILENAME = "agent-device-credential.dpapi"
 BRIDGE_PROTECTION_SCOPE = "current-user"
 GUEST_PROTECTION_SCOPE = "local-machine"
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 
 class AgentDeviceCredentialStoreError(RuntimeError):
@@ -55,6 +56,29 @@ def _guest_protect(data: bytes) -> bytes:
 
 def _unprotect(data: bytes) -> bytes:
     return unprotect_bytes(data)
+
+
+def _path_chain_has_redirect(path: Path) -> bool:
+    """Observe symlink/junction/reparse redirects without resolving them away."""
+
+    chain: list[Path] = []
+    current = path.expanduser().absolute()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
 
 
 def guest_device_credential_path(state_path: Path) -> Path:
@@ -111,7 +135,12 @@ def _deserialize_credential(
         raise AgentDeviceCredentialIntegrityError(
             "Agent device credential payload fields do not match schema"
         )
-    if payload.get("schema_version") != AGENT_DEVICE_CREDENTIAL_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != AGENT_DEVICE_CREDENTIAL_SCHEMA_VERSION
+    ):
         raise AgentDeviceCredentialIntegrityError(
             "unsupported Agent device credential schema"
         )
@@ -172,13 +201,31 @@ class _ProtectedAgentDeviceCredentialStore:
         unprotector: UnprotectFn,
         create_parent: bool,
     ) -> None:
+        # Preserve the lexical authority path. resolve() would erase evidence of
+        # a symlink/junction/reparse redirect before this store can reject it.
         self.path = path.expanduser().absolute()
         self.protection_scope = protection_scope
         self._protect = protector
         self._unprotect = unprotector
         self._create_parent = create_parent
 
+    def _assert_safe_authority_path(self) -> None:
+        if _path_chain_has_redirect(self.path):
+            raise AgentDeviceCredentialIntegrityError(
+                "Agent device credential authority path traverses a link or reparse point"
+            )
+        parent = self.path.parent
+        if parent.exists() and not parent.is_dir():
+            raise AgentDeviceCredentialIntegrityError(
+                "Agent device credential parent authority is not a directory"
+            )
+        if self.path.exists() and not self.path.is_file():
+            raise AgentDeviceCredentialIntegrityError(
+                "Agent device credential authority path is not a regular file"
+            )
+
     def exists(self) -> bool:
+        self._assert_safe_authority_path()
         return self.path.is_file()
 
     def _decode_file(
@@ -220,6 +267,7 @@ class _ProtectedAgentDeviceCredentialStore:
         expected_instance_id: str | None = None,
         expected_device_id: str | None = None,
     ) -> AgentDeviceCredential:
+        self._assert_safe_authority_path()
         try:
             stat = self.path.stat()
         except FileNotFoundError:
@@ -232,21 +280,32 @@ class _ProtectedAgentDeviceCredentialStore:
             raise AgentDeviceCredentialIntegrityError(
                 "protected Agent device credential exceeds maximum size"
             )
-        return self._decode_file(
-            self.path.read_bytes(),
+        raw = self.path.read_bytes()
+        self._assert_safe_authority_path()
+        if len(raw) != stat.st_size:
+            raise AgentDeviceCredentialIntegrityError(
+                "protected Agent device credential changed during read"
+            )
+        credential = self._decode_file(
+            raw,
             expected_instance_id=expected_instance_id,
             expected_device_id=expected_device_id,
         )
+        self._assert_safe_authority_path()
+        return credential
 
     def save_create_only(self, credential: AgentDeviceCredential) -> AgentDeviceCredential:
         """Persist one stable credential or prove an identical one already exists.
 
-        Existing credentials are never silently replaced.  This is important on
+        Existing credentials are never silently replaced. This is important on
         both sides: the Bridge must not silently rebind a managed instance, and
         the guest Agent must not rotate its transport identity merely because a
-        provisioning step is retried.
+        provisioning step is retried. The lexical authority path is revalidated
+        around every filesystem mutation so a later redirect cannot retarget the
+        DPAPI credential store.
         """
         credential.validate()
+        self._assert_safe_authority_path()
         if self.path.exists():
             existing = self.load(
                 expected_instance_id=credential.instance_id,
@@ -260,19 +319,19 @@ class _ProtectedAgentDeviceCredentialStore:
 
         if self._create_parent:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._assert_safe_authority_path()
         elif not self.path.parent.is_dir():
             raise AgentDeviceCredentialStoreError(
                 "guest Agent state directory must exist with managed ACL before credential write"
             )
+        else:
+            self._assert_safe_authority_path()
 
         plain = _serialize_credential(
             credential,
             protection_scope=self.protection_scope,
         )
-        try:
-            protected = self._protect(plain)
-        except Exception:
-            raise
+        protected = self._protect(plain)
         if not protected:
             raise AgentDeviceCredentialStoreError(
                 "protector returned an empty Agent device credential payload"
@@ -285,6 +344,7 @@ class _ProtectedAgentDeviceCredentialStore:
 
         temp_path: Path | None = None
         try:
+            self._assert_safe_authority_path()
             with NamedTemporaryFile(
                 "wb",
                 dir=self.path.parent,
@@ -296,6 +356,7 @@ class _ProtectedAgentDeviceCredentialStore:
                 handle.flush()
                 os.fsync(handle.fileno())
                 temp_path = Path(handle.name)
+            self._assert_safe_authority_path()
             try:
                 os.link(temp_path, self.path)
             except FileExistsError:
@@ -308,9 +369,13 @@ class _ProtectedAgentDeviceCredentialStore:
                         "concurrent Agent device credential publication conflicted"
                     )
                 return existing
+            self._assert_safe_authority_path()
             return credential
         finally:
-            if temp_path is not None:
+            if temp_path is not None and not _path_chain_has_redirect(temp_path):
+                # If the parent authority was redirected concurrently, leave an
+                # inert orphan temp in the original location rather than risk a
+                # destructive unlink through attacker-controlled redirection.
                 temp_path.unlink(missing_ok=True)
 
 
