@@ -149,8 +149,10 @@ def test_agent_service_restarts_only_when_runtime_config_changed() -> None:
 
     assert "$configChanged" in script
     assert "$configChanged -and $null -ne $existing" in script
-    assert "Stop-Service -Name $serviceName" in script
-    assert "WaitForStatus" in script
+    assert "$null = Stop-Service -Name $serviceName -ErrorAction Stop -WarningAction SilentlyContinue" in script
+    assert "$null = $existing.WaitForStatus(" in script
+    assert "$null = $existing.Refresh()" in script
+    assert "$null = Start-Service -Name $serviceName -ErrorAction Stop -WarningAction SilentlyContinue" in script
     assert "runtime_config_changed" in script
 
 
