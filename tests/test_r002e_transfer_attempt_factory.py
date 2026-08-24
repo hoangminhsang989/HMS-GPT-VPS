@@ -30,3 +30,20 @@ def test_production_transfer_attempt_factory_rejects_non_directory_runtime_path(
 
     with pytest.raises(ValueError, match="runtime directory is unsafe"):
         create_dpapi_agent_package_transfer_attempt_store(runtime_path)
+
+
+def test_production_transfer_attempt_factory_rejects_symlinked_parent(
+    tmp_path: Path,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    redirected_parent = tmp_path / "redirected-parent"
+    try:
+        redirected_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("host does not permit creating a directory symlink")
+
+    with pytest.raises(ValueError, match="must not traverse a symbolic link"):
+        create_dpapi_agent_package_transfer_attempt_store(
+            redirected_parent / "instance-01"
+        )
