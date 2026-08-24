@@ -4,6 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from hms_gpt_vps.agent_health_contract import (
+    DEFAULT_REQUIRED_CAPABILITIES,
+    AgentHealthDocument,
+)
 from hms_gpt_vps.agent_service_install import AgentServiceConfig
 from hms_gpt_vps import managed_hyperv_agent_strict_qualification as strict_module
 from hms_gpt_vps.managed_hyperv_agent_strict_qualification import (
@@ -13,6 +17,7 @@ from hms_gpt_vps.managed_hyperv_agent_strict_qualification import (
     validate_strict_managed_hyperv_proof_payload,
 )
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
+from hms_gpt_vps.provisioning import ProvisionObservation
 
 
 VM_ID = "11111111-2222-3333-4444-555555555555"
@@ -22,6 +27,12 @@ OTHER_VM_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 class FakeBaseProof:
     vm_id = VM_ID
     hyperv_guest_proven = True
+    health_boot_id = "boot-01"
+    health_agent_version = "0.1.0"
+    package_file_count = 2
+    package_total_size = 20
+    package_entrypoint_sha256 = "a" * 64
+    package_manifest_sha256 = "b" * 64
 
     def validate(self) -> None:
         return None
@@ -34,11 +45,54 @@ class FakeBaseProof:
             "bootstrap_retired": False,
             "pairing_ready": False,
             "health_listener_scope": "loopback-only",
+            "health_boot_id": self.health_boot_id,
+            "health_agent_version": self.health_agent_version,
+            "package_file_count": self.package_file_count,
+            "package_total_size": self.package_total_size,
+            "package_entrypoint_sha256": self.package_entrypoint_sha256,
+            "package_manifest_sha256": self.package_manifest_sha256,
         }
 
 
-def runtime(vm_ids: list[str] | None = None):  # type: ignore[no-untyped-def]
-    observed = list(vm_ids or [VM_ID, VM_ID])
+def health_document(*, boot_id: str = "boot-01") -> AgentHealthDocument:
+    return AgentHealthDocument(
+        schema_version=1,
+        status="ok",
+        instance_id="hms-01",
+        agent_version="0.1.0",
+        workspace_root=r"C:\HMS-Workspace",
+        capabilities=tuple(sorted(DEFAULT_REQUIRED_CAPABILITIES)),
+        service_identity=r"NT SERVICE\HMSAgent",
+        listener_scope="loopback-only",
+        privilege="non-admin",
+        boot_id=boot_id,
+    )
+
+
+def service_evidence(**overrides: object) -> dict[str, object]:
+    evidence: dict[str, object] = {
+        "package_file_count": 2,
+        "package_total_size": 20,
+        "binary_sha256": "a" * 64,
+        "package_manifest_sha256": "b" * 64,
+        "package_tree_ok": True,
+        "package_manifest_sha256_ok": True,
+        "local_service_account": True,
+        "service_sid_unrestricted": True,
+        "runtime_config_sha256_ok": True,
+        "service_ready": True,
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def runtime(
+    vm_ids: list[str] | None = None,
+    *,
+    boot_id: str = "boot-01",
+    evidence: dict[str, object] | None = None,
+):  # type: ignore[no-untyped-def]
+    observed = list(vm_ids or [VM_ID, VM_ID, VM_ID])
     last = observed[-1]
 
     def assert_vm_identity() -> str:
@@ -47,6 +101,23 @@ def runtime(vm_ids: list[str] | None = None):  # type: ignore[no-untyped-def]
             last = observed.pop(0)
         return last
 
+    def observe(_credential):  # type: ignore[no-untyped-def]
+        health = health_document(boot_id=boot_id)
+        post = SimpleNamespace(
+            service_ready=True,
+            agent_healthy=True,
+            health=health,
+            service_evidence=evidence or service_evidence(),
+        )
+        return (
+            ProvisionObservation(
+                agent_package_ready=True,
+                agent_service_ready=True,
+                agent_healthy=True,
+            ),
+            post,
+        )
+
     agent_runtime = SimpleNamespace(
         config=SimpleNamespace(
             vm_name="HMS-GPT-VPS-01",
@@ -54,6 +125,7 @@ def runtime(vm_ids: list[str] | None = None):  # type: ignore[no-untyped-def]
             runtime=SimpleNamespace(health_port=8765),
         ),
         _assert_vm_identity=assert_vm_identity,
+        observe=observe,
     )
     return SimpleNamespace(agent_runtime=agent_runtime)
 
@@ -88,11 +160,11 @@ def install_base_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def good_listener(*_args, **_kwargs) -> dict[str, object]:  # type: ignore[no-untyped-def]
+def listener(process_id: int = 4321) -> dict[str, object]:
     return {
         "os_listener_proven": True,
         "service_name": "HMSAgent",
-        "process_id": 4321,
+        "process_id": process_id,
         "health_port": 8765,
         "listener_count": 1,
         "local_addresses": ["127.0.0.1"],
@@ -100,25 +172,21 @@ def good_listener(*_args, **_kwargs) -> dict[str, object]:  # type: ignore[no-un
     }
 
 
-def test_strict_qualification_adds_independent_os_listener_evidence(
+def test_strict_qualification_brackets_fresh_health_with_same_listener_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_base_mock(monkeypatch)
-    seen: dict[str, object] = {}
+    calls: list[tuple[str, str, int]] = []
 
-    def listener(vm_id, vm_name, _credential, service, health_port):  # type: ignore[no-untyped-def]
-        seen.update(
-            vm_id=vm_id,
-            vm_name=vm_name,
-            service_name=service.service_name,
-            health_port=health_port,
-        )
-        return good_listener()
+    def probe(vm_id, vm_name, _credential, service, health_port):  # type: ignore[no-untyped-def]
+        calls.append((vm_id, vm_name, health_port))
+        assert service.service_name == "HMSAgent"
+        return listener()
 
     monkeypatch.setattr(
         strict_module,
         "probe_managed_agent_health_listener_by_id",
-        listener,
+        probe,
     )
 
     payload = qualify_managed_hyperv_agent_strict(
@@ -128,12 +196,7 @@ def test_strict_qualification_adds_independent_os_listener_evidence(
         SimpleNamespace(),  # type: ignore[arg-type]
     )
 
-    assert seen == {
-        "vm_id": VM_ID,
-        "vm_name": "HMS-GPT-VPS-01",
-        "service_name": "HMSAgent",
-        "health_port": 8765,
-    }
+    assert calls == [(VM_ID, "HMS-GPT-VPS-01", 8765)] * 2
     assert payload["strict_publication_schema_version"] == 1
     assert payload["hyperv_guest_proven"] is True
     assert payload["os_listener_proven"] is True
@@ -166,6 +229,25 @@ def test_strict_qualification_reproves_vm_id_before_listener(
         )
 
 
+def test_strict_qualification_reproves_vm_id_during_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        lambda *_args, **_kwargs: listener(),
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="health observation"):
+        qualify_managed_hyperv_agent_strict(
+            runtime([VM_ID, OTHER_VM_ID]),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            credential(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+
+
 def test_strict_qualification_reproves_vm_id_after_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -173,12 +255,70 @@ def test_strict_qualification_reproves_vm_id_after_listener(
     monkeypatch.setattr(
         strict_module,
         "probe_managed_agent_health_listener_by_id",
-        good_listener,
+        lambda *_args, **_kwargs: listener(),
     )
 
-    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="during strict"):
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="during strict listener"):
         qualify_managed_hyperv_agent_strict(
-            runtime([VM_ID, OTHER_VM_ID]),
+            runtime([VM_ID, VM_ID, OTHER_VM_ID]),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            credential(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+
+
+def test_strict_qualification_rejects_service_pid_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    probes = iter((listener(4321), listener(9876)))
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        lambda *_args, **_kwargs: next(probes),
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="service process changed"):
+        qualify_managed_hyperv_agent_strict(
+            runtime(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            credential(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+
+
+def test_strict_qualification_rejects_service_boot_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        lambda *_args, **_kwargs: listener(),
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="service incarnation"):
+        qualify_managed_hyperv_agent_strict(
+            runtime(boot_id="boot-02"),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            credential(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+
+
+def test_strict_qualification_rejects_package_evidence_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        lambda *_args, **_kwargs: listener(),
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="package_file_count"):
+        qualify_managed_hyperv_agent_strict(
+            runtime(evidence=service_evidence(package_file_count=3)),
             SimpleNamespace(),  # type: ignore[arg-type]
             credential(),
             SimpleNamespace(),  # type: ignore[arg-type]
