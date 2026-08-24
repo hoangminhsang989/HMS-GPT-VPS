@@ -74,7 +74,17 @@ class ManagedAgentReconcileRuntime:
             raise ValueError("managed Agent runtime instance_id is required")
 
     def _current_late_state(self, instance_id: str) -> ProvisionState:
-        record = self.orchestrator.current(instance_id)
+        # Late reconcile must never create/initialize provisioning state as a
+        # side effect of a misplaced call. Missing state is an explicit error.
+        record = self.orchestrator.store.load()
+        if record is None:
+            raise ManagedAgentReconcileError(
+                "late Agent reconcile requires an existing provisioning checkpoint"
+            )
+        if record.instance_id != instance_id:
+            raise ManagedAgentReconcileError(
+                "provision state instance does not match reconcile context"
+            )
         if record.instance_id != self.agent_runtime.config.instance_id:
             raise ManagedAgentReconcileError(
                 "provision state instance does not match managed Agent runtime"
