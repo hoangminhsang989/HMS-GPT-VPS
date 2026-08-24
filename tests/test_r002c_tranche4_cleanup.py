@@ -55,32 +55,47 @@ def service_runtime_config() -> AgentServiceRuntimeConfig:
     )
 
 
+def _package(tmp_path: Path) -> tuple[Path, object]:
+    root = tmp_path / "hms-agent"
+    internal = root / "_internal"
+    internal.mkdir(parents=True)
+    (root / "hms-agent.exe").write_bytes(b"agent-v1")
+    (internal / "runtime.bin").write_bytes(b"runtime-v1")
+    manifest = build_agent_package_manifest(root, version="0.1.0")
+    return root, manifest
+
+
 def test_agent_package_manifest_detects_tamper(tmp_path: Path) -> None:
-    artifact = tmp_path / "hms-agent.exe"
-    artifact.write_bytes(b"agent-v1")
-    manifest = build_agent_package_manifest(artifact, version="0.1.0")
+    package, manifest = _package(tmp_path)
     assert manifest.filename == "hms-agent.exe"
     assert manifest.size == len(b"agent-v1")
-    verify_agent_package(artifact, manifest)
+    assert manifest.file_count == 2
+    verify_agent_package(package, manifest)
 
-    artifact.write_bytes(b"agent-v1-tampered")
+    (package / "hms-agent.exe").write_bytes(b"agent-v1-tampered")
     with pytest.raises(ValueError, match="size|SHA-256"):
-        verify_agent_package(artifact, manifest)
+        verify_agent_package(package, manifest)
 
 
-def test_service_readiness_is_not_application_health() -> None:
+def test_service_readiness_is_not_application_health(tmp_path: Path) -> None:
+    _package_root, manifest = _package(tmp_path)
     script = build_agent_service_readiness_script(
         AgentServiceConfig(),
-        expected_sha256="a" * 64,
+        package_manifest=manifest,
         runtime_config=service_runtime_config(),
     )
     assert "application_health = 'NOT_IMPLEMENTED'" in script
     assert "NT AUTHORITY\\LocalService" in script
     assert "qsidtype" in script
-    assert "ReadAndExecute" in script
-    assert "FileSystemRights]::Modify" in script
-    assert "Get-FileHash" in script
+    assert "icacls.exe $Path" in script
+    assert "@('RX', 'M', 'F')" in script
+    assert "@('M', 'F')" in script
+    assert "Get-HmsSha256" in script
+    assert "System.Security.Cryptography.SHA256" in script
+    assert "Get-FileHash" not in script
+    assert "Get-Acl" not in script
     assert "runtime_config_sha256_ok" in script
+    assert "package_tree_ok" in script
 
     require_agent_service_ready({"service_ready": True})
     with pytest.raises(RuntimeError, match="service readiness"):

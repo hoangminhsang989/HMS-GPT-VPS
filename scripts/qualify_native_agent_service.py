@@ -1,0 +1,573 @@
+from __future__ import annotations
+
+import argparse
+import ctypes
+import http.client
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import sys
+import time
+
+from hms_gpt_vps.agent_connection_epoch_store import AgentConnectionEpochStore
+from hms_gpt_vps.agent_device_credential_store import (
+    GuestAgentDeviceCredentialStore,
+    guest_device_credential_path,
+)
+from hms_gpt_vps.agent_health_contract import (
+    DEFAULT_REQUIRED_CAPABILITIES,
+    AgentHealthDocument,
+    AgentHealthExpectation,
+    parse_agent_health,
+)
+from hms_gpt_vps.agent_package import (
+    AgentPackageManifest,
+    load_agent_package_manifest,
+    require_windows_amd64_pe,
+    verify_agent_package,
+)
+from hms_gpt_vps.agent_service_install import (
+    AgentServiceConfig,
+    build_agent_service_install_script,
+)
+from hms_gpt_vps.agent_service_readiness import build_agent_service_readiness_script
+from hms_gpt_vps.agent_service_runtime_config import (
+    AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+    AgentServiceRuntimeConfig,
+)
+from hms_gpt_vps.agent_transport_protocol import (
+    AGENT_DEVICE_SECRET_BYTES,
+    AgentDeviceCredential,
+)
+from hms_gpt_vps.powershell import ps_literal, run_powershell_json
+
+
+_INSTANCE_ID = "ci-native-scm"
+_DEVICE_ID = "ci-native-device"
+_PROJECT_ID = "ci-native-project"
+_HEALTH_PORT = 18765
+_BRIDGE_ORIGIN = "https://127.0.0.1:9"
+_EPOCH_FILENAME = "agent-connection-epoch.sqlite3"
+_MARKER_FILENAME = ".hms-ci-native-service-owned"
+_WORKSPACE_MARKER_FILENAME = ".hms-ci-native-workspace-owned"
+_MAX_HEALTH_BYTES = 32 * 1024
+
+
+def _require_github_hosted_windows_admin() -> None:
+    if os.name != "nt":
+        raise OSError("native packaged Agent qualification requires Windows")
+    if os.environ.get("GITHUB_ACTIONS", "").casefold() != "true":
+        raise PermissionError("native packaged Agent qualification is CI-only")
+    if not bool(ctypes.windll.shell32.IsUserAnAdmin()):  # type: ignore[attr-defined]
+        raise PermissionError("native packaged Agent qualification requires Administrator")
+
+
+def _find_git_executable() -> str:
+    candidate = shutil.which("git.exe") or shutil.which("git")
+    if not candidate:
+        raise FileNotFoundError("git executable is unavailable on Windows runner")
+    path = Path(candidate).resolve(strict=True)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return str(path)
+
+
+def _service_exists(service_name: str) -> bool:
+    name = ps_literal(service_name)
+    result = run_powershell_json(
+        f"""
+$service = Get-Service -Name {name} -ErrorAction SilentlyContinue
+$exists = $null -ne $service
+if ($null -ne $service) {{ $service.Dispose() }}
+[pscustomobject]@{{ exists = [bool]$exists }}
+""".strip(),
+        timeout_seconds=30,
+    )
+    return bool(result.get("exists", False))
+
+
+def _service_diagnostics(service_name: str) -> dict[str, object]:
+    escaped_name = service_name.replace("'", "''")
+    return run_powershell_json(
+        f"""
+$service = Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction SilentlyContinue
+if ($null -eq $service) {{
+  [pscustomobject]@{{ exists = $false }}
+}} else {{
+  [pscustomobject]@{{
+    exists = $true
+    state = [string]$service.State
+    status = [string]$service.Status
+    process_id = [int]$service.ProcessId
+    exit_code = [int]$service.ExitCode
+    service_specific_exit_code = [int]$service.ServiceSpecificExitCode
+    start_name = [string]$service.StartName
+  }}
+}}
+""".strip(),
+        timeout_seconds=30,
+    )
+
+
+def _local_health_once(port: int) -> AgentHealthDocument:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+    try:
+        connection.request(
+            "GET",
+            "/healthz",
+            headers={"Connection": "close", "Accept": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read(_MAX_HEALTH_BYTES + 1)
+        if response.status != 200:
+            raise RuntimeError(f"Agent health returned HTTP {response.status}")
+        if len(body) > _MAX_HEALTH_BYTES:
+            raise RuntimeError("Agent health response exceeded qualification bound")
+        content_type = response.getheader("Content-Type", "")
+        if not content_type.lower().startswith("application/json"):
+            raise RuntimeError("Agent health response is not JSON")
+    finally:
+        connection.close()
+
+    try:
+        raw = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Agent health response is not valid UTF-8 JSON") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError("Agent health response must be a JSON object")
+    document = parse_agent_health(
+        raw,
+        AgentHealthExpectation(
+            instance_id=_INSTANCE_ID,
+            workspace_root=r"C:\HMS-Workspace",
+            required_capabilities=DEFAULT_REQUIRED_CAPABILITIES,
+        ),
+    )
+    if document.capability_set() != DEFAULT_REQUIRED_CAPABILITIES:
+        raise RuntimeError("Agent health capability set is not exact")
+    return document
+
+
+def _wait_for_health(version: str, *, timeout_seconds: float = 20.0) -> AgentHealthDocument:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        try:
+            document = _local_health_once(_HEALTH_PORT)
+            if document.agent_version != version:
+                raise RuntimeError("packaged Agent health version mismatch")
+            return document
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            last_error = exc
+            time.sleep(0.25)
+    raise RuntimeError("packaged Agent health did not become ready") from last_error
+
+
+def _require_health_unreachable(*, timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            _local_health_once(_HEALTH_PORT)
+        except (ConnectionError, OSError, RuntimeError):
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Agent loopback health listener remained reachable after service stop")
+
+
+def _probe_listener(service_name: str) -> dict[str, object]:
+    name = ps_literal(service_name)
+    escaped_name = service_name.replace("'", "''")
+    result = run_powershell_json(
+        f"""
+$service = Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction Stop
+$pidValue = [int]$service.ProcessId
+if ($pidValue -le 0) {{ throw 'HMS Agent service has no live process id' }}
+$connections = @(
+  Get-NetTCPConnection -State Listen -LocalPort {_HEALTH_PORT} -ErrorAction Stop |
+    Where-Object {{ [int]$_.OwningProcess -eq $pidValue }}
+)
+[pscustomobject]@{{
+  service_name = {name}
+  process_id = $pidValue
+  listener_count = [int]$connections.Count
+  local_addresses = @($connections | ForEach-Object {{ $_.LocalAddress }})
+}}
+""".strip(),
+        timeout_seconds=30,
+    )
+    addresses_raw = result.get("local_addresses", [])
+    if isinstance(addresses_raw, str):
+        addresses = [addresses_raw]
+    elif isinstance(addresses_raw, list):
+        addresses = [str(value) for value in addresses_raw]
+    else:
+        raise RuntimeError("listener address evidence has invalid shape")
+    if int(result.get("listener_count", 0)) != 1:
+        raise RuntimeError("Agent health must have exactly one listening socket")
+    if addresses != ["127.0.0.1"]:
+        raise RuntimeError("Agent health listener is not bound exclusively to IPv4 loopback")
+    result["local_addresses"] = addresses
+    return result
+
+
+def _wait_for_epoch(
+    state_root: Path,
+    *,
+    minimum_epoch: int,
+    timeout_seconds: float = 10.0,
+) -> int:
+    store = AgentConnectionEpochStore(state_root / _EPOCH_FILENAME)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        record = store.load()
+        if record is not None:
+            if record.instance_id != _INSTANCE_ID or record.device_id != _DEVICE_ID:
+                raise RuntimeError("connection epoch identity mismatch")
+            if record.epoch >= minimum_epoch:
+                return record.epoch
+        time.sleep(0.2)
+    raise RuntimeError("Agent outbound reconnect epoch did not reach expected value")
+
+
+def _stop_service(service_name: str) -> None:
+    name = ps_literal(service_name)
+    result = run_powershell_json(
+        f"""
+$service = Get-Service -Name {name} -ErrorAction Stop
+try {{
+  if ($service.Status -ne 'Stopped') {{
+    $null = Stop-Service -Name {name} -ErrorAction Stop -WarningAction SilentlyContinue
+    $null = $service.WaitForStatus(
+      [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+      [TimeSpan]::FromSeconds(30)
+    )
+  }}
+  $null = $service.Refresh()
+  $stopped = $service.Status -eq 'Stopped'
+}} finally {{
+  $null = $service.Dispose()
+}}
+[pscustomobject]@{{ stopped = [bool]$stopped }}
+""".strip(),
+        timeout_seconds=45,
+    )
+    if not bool(result.get("stopped", False)):
+        raise RuntimeError("HMS Agent service did not stop cleanly")
+
+
+def _start_service(service_name: str) -> None:
+    name = ps_literal(service_name)
+    result = run_powershell_json(
+        f"""
+$service = Get-Service -Name {name} -ErrorAction Stop
+try {{
+  if ($service.Status -ne 'Running') {{
+    $null = Start-Service -Name {name} -ErrorAction Stop -WarningAction SilentlyContinue
+    $null = $service.WaitForStatus(
+      [System.ServiceProcess.ServiceControllerStatus]::Running,
+      [TimeSpan]::FromSeconds(30)
+    )
+  }}
+  $null = $service.Refresh()
+  $running = $service.Status -eq 'Running'
+}} finally {{
+  $null = $service.Dispose()
+}}
+[pscustomobject]@{{ running = [bool]$running }}
+""".strip(),
+        timeout_seconds=45,
+    )
+    if not bool(result.get("running", False)):
+        raise RuntimeError("HMS Agent service did not restart cleanly")
+
+
+def _delete_service_if_present(service_name: str) -> None:
+    name = ps_literal(service_name)
+    escaped_name = service_name.replace("'", "''")
+    result = run_powershell_json(
+        f"""
+$service = Get-Service -Name {name} -ErrorAction SilentlyContinue
+if ($null -ne $service) {{
+  try {{
+    if ($service.Status -ne 'Stopped') {{
+      $null = Stop-Service -Name {name} -ErrorAction Stop -WarningAction SilentlyContinue
+      $null = $service.WaitForStatus(
+        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+        [TimeSpan]::FromSeconds(30)
+      )
+    }}
+  }} finally {{
+    $null = $service.Dispose()
+    $service = $null
+  }}
+  & sc.exe delete {name} | Out-Null
+  if ($LASTEXITCODE -ne 0) {{ throw 'sc.exe delete HMS Agent failed' }}
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+}}
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+do {{
+  $remaining = Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction SilentlyContinue
+  if ($null -eq $remaining) {{ break }}
+  Start-Sleep -Milliseconds 200
+}} while ([DateTime]::UtcNow -lt $deadline)
+[pscustomobject]@{{ deleted = [bool]($null -eq (Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction SilentlyContinue)) }}
+""".strip(),
+        timeout_seconds=60,
+    )
+    if not bool(result.get("deleted", False)):
+        raise RuntimeError("HMS Agent service cleanup did not complete")
+
+
+def _require_owned_marker(marker: Path, ownership_token: str, label: str) -> None:
+    if not marker.is_file() or marker.read_text(encoding="utf-8") != ownership_token:
+        raise PermissionError(f"refusing to remove unowned HMS {label} path")
+
+
+def _cleanup_owned_paths(service: AgentServiceConfig, *, ownership_token: str) -> None:
+    _delete_service_if_present(service.service_name)
+    runtime_root = Path(service.runtime_path)
+    runtime_marker = runtime_root / _MARKER_FILENAME
+    if runtime_root.exists():
+        _require_owned_marker(runtime_marker, ownership_token, "runtime")
+        shutil.rmtree(runtime_root)
+    workspace = Path(service.workspace_path)
+    workspace_marker = workspace / _WORKSPACE_MARKER_FILENAME
+    if workspace.exists():
+        _require_owned_marker(workspace_marker, ownership_token, "workspace")
+        shutil.rmtree(workspace)
+
+
+def _write_result(path: Path, result: dict[str, object]) -> None:
+    data = json.dumps(
+        result,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
+    path.write_text(data, encoding="utf-8")
+
+
+def _print_failure_evidence(service_name: str, exc: BaseException) -> None:
+    try:
+        service = _service_diagnostics(service_name)
+    except Exception as diagnostic_exc:
+        service = {"diagnostic_error": type(diagnostic_exc).__name__}
+    evidence = {"qualification_failure": type(exc).__name__, "service": service}
+    print(json.dumps(evidence, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+
+
+def _package_proof_summary(manifest: AgentPackageManifest) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "platform": manifest.platform,
+        "version": manifest.version,
+        "entrypoint": manifest.entrypoint,
+        "file_count": manifest.file_count,
+        "total_size": manifest.total_size,
+        "entrypoint_sha256": manifest.sha256,
+    }
+
+
+def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
+    _require_github_hosted_windows_admin()
+    service = AgentServiceConfig()
+    service.validate()
+
+    source_package = package_dir / "hms-agent"
+    source_manifest_path = (package_dir / "hms-agent.manifest.json").resolve(strict=True)
+    manifest: AgentPackageManifest = load_agent_package_manifest(source_manifest_path)
+    verify_agent_package(source_package, manifest)
+    require_windows_amd64_pe(source_package / manifest.entrypoint)
+
+    runtime_root = Path(service.runtime_path)
+    workspace_root = Path(service.workspace_path)
+    if _service_exists(service.service_name):
+        raise RuntimeError("HMSAgent service already exists on qualification runner")
+    if runtime_root.exists() or workspace_root.exists():
+        raise RuntimeError("managed HMS qualification paths already exist on runner")
+
+    ownership_token = secrets.token_hex(24)
+    agent_root = Path(service.agent_root_path)
+    target_package = Path(service.package_path)
+    state_root = Path(service.state_path)
+    runtime_root.mkdir(parents=True)
+    (runtime_root / _MARKER_FILENAME).write_text(ownership_token, encoding="utf-8")
+    agent_root.mkdir(parents=True)
+    state_root.mkdir(parents=True)
+    workspace_root.mkdir(parents=True)
+    (workspace_root / _WORKSPACE_MARKER_FILENAME).write_text(ownership_token, encoding="utf-8")
+
+    shutil.copytree(source_package, target_package)
+    verify_agent_package(target_package, manifest)
+    require_windows_amd64_pe(Path(service.binary_path))
+
+    credential = AgentDeviceCredential(
+        instance_id=_INSTANCE_ID,
+        device_id=_DEVICE_ID,
+        secret=secrets.token_bytes(AGENT_DEVICE_SECRET_BYTES),
+    )
+    GuestAgentDeviceCredentialStore(
+        guest_device_credential_path(state_root)
+    ).save_create_only(credential)
+
+    runtime = AgentServiceRuntimeConfig(
+        schema_version=AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+        instance_id=_INSTANCE_ID,
+        project_id=_PROJECT_ID,
+        bridge_origin=_BRIDGE_ORIGIN,
+        workspace_root=service.workspace_path,
+        state_root=service.state_path,
+        python_executable=str(Path(sys.executable).resolve(strict=True)),
+        git_executable=_find_git_executable(),
+        health_port=_HEALTH_PORT,
+    )
+    runtime.validate()
+
+    result: dict[str, object] = {}
+    try:
+        install_result = run_powershell_json(
+            build_agent_service_install_script(
+                service,
+                package_manifest=manifest,
+                runtime_config=runtime,
+            ),
+            timeout_seconds=180,
+        )
+        if not bool(install_result.get("ready", False)):
+            raise RuntimeError("native HMS Agent installer did not prove service Running")
+        if int(install_result.get("package_file_count", 0)) != manifest.file_count:
+            raise RuntimeError("native installer package file-count proof mismatch")
+        if int(install_result.get("package_total_size", 0)) != manifest.total_size:
+            raise RuntimeError("native installer package size proof mismatch")
+
+        readiness = run_powershell_json(
+            build_agent_service_readiness_script(
+                service,
+                package_manifest=manifest,
+                runtime_config=runtime,
+            ),
+            timeout_seconds=90,
+        )
+        if not bool(readiness.get("service_ready", False)):
+            raise RuntimeError("native HMS Agent service readiness contract failed")
+        if not bool(readiness.get("package_tree_ok", False)):
+            raise RuntimeError("native readiness did not prove exact package tree")
+
+        first_health = _wait_for_health(manifest.version)
+        first_listener = _probe_listener(service.service_name)
+        first_epoch = _wait_for_epoch(state_root, minimum_epoch=1)
+        reconnect_epoch = _wait_for_epoch(
+            state_root,
+            minimum_epoch=first_epoch + 1,
+            timeout_seconds=10.0,
+        )
+
+        _stop_service(service.service_name)
+        _require_health_unreachable()
+        _start_service(service.service_name)
+
+        second_health = _wait_for_health(manifest.version)
+        second_listener = _probe_listener(service.service_name)
+        if second_health.boot_id == first_health.boot_id:
+            raise RuntimeError("Agent boot_id did not change across SCM restart")
+        post_restart_epoch = _wait_for_epoch(
+            state_root,
+            minimum_epoch=reconnect_epoch + 1,
+            timeout_seconds=10.0,
+        )
+
+        verify_agent_package(target_package, manifest)
+        result = {
+            "schema_version": 1,
+            "qualification": "native_windows_scm_packaged_agent",
+            "package": _package_proof_summary(manifest),
+            "install": {
+                "ready": bool(install_result.get("ready", False)),
+                "start_name": str(install_result.get("start_name", "")),
+                "service_sid_type": str(install_result.get("service_sid_type", "")),
+                "package_file_count": int(install_result.get("package_file_count", 0)),
+                "package_total_size": int(install_result.get("package_total_size", 0)),
+                "binary_sha256": str(install_result.get("binary_sha256", "")),
+                "runtime_config_sha256": str(
+                    install_result.get("runtime_config_sha256", "")
+                ),
+            },
+            "readiness": {
+                "service_ready": bool(readiness.get("service_ready", False)),
+                "local_service_account": bool(readiness.get("local_service_account", False)),
+                "service_sid_unrestricted": bool(
+                    readiness.get("service_sid_unrestricted", False)
+                ),
+                "package_tree_ok": bool(readiness.get("package_tree_ok", False)),
+                "package_file_count": int(readiness.get("package_file_count", 0)),
+                "package_total_size": int(readiness.get("package_total_size", 0)),
+                "runtime_config_sha256_ok": bool(
+                    readiness.get("runtime_config_sha256_ok", False)
+                ),
+            },
+            "first_health": {
+                "instance_id": first_health.instance_id,
+                "agent_version": first_health.agent_version,
+                "service_identity": first_health.service_identity,
+                "privilege": first_health.privilege,
+                "listener_scope": first_health.listener_scope,
+                "boot_id": first_health.boot_id,
+            },
+            "first_listener": first_listener,
+            "first_epoch": first_epoch,
+            "reconnect_epoch": reconnect_epoch,
+            "second_health": {
+                "boot_id": second_health.boot_id,
+                "service_identity": second_health.service_identity,
+                "privilege": second_health.privilege,
+                "listener_scope": second_health.listener_scope,
+            },
+            "second_listener": second_listener,
+            "post_restart_epoch": post_restart_epoch,
+            "transport_target": "loopback-closed-port-retry-only",
+            "full_bridge_command_flow_proven": False,
+            "hyperv_guest_proven": False,
+        }
+    except BaseException as exc:
+        _print_failure_evidence(service.service_name, exc)
+        try:
+            _cleanup_owned_paths(service, ownership_token=ownership_token)
+        except Exception as cleanup_exc:
+            print(
+                json.dumps(
+                    {"cleanup_failure": type(cleanup_exc).__name__},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                file=sys.stderr,
+            )
+        raise
+
+    _cleanup_owned_paths(service, ownership_token=ownership_token)
+    result["cleanup_verified"] = True
+    _write_result(result_path, result)
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Qualify the packaged HMS Agent as a native Windows SCM service"
+    )
+    parser.add_argument("package_dir", type=Path)
+    parser.add_argument("result", type=Path)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    result = qualify(args.package_dir.resolve(), args.result.resolve())
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

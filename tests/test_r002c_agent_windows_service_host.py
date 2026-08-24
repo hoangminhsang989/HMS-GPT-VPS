@@ -21,6 +21,10 @@ from hms_gpt_vps.agent_windows_service_host import (
     SERVICE_CONTROL_INTERROGATE,
     SERVICE_CONTROL_SHUTDOWN,
     SERVICE_CONTROL_STOP,
+    SERVICE_FAILURE_CONFIG,
+    SERVICE_FAILURE_IDENTITY,
+    SERVICE_FAILURE_RUNTIME_CONSTRUCTION,
+    SERVICE_FAILURE_RUNTIME_EXECUTION,
     SERVICE_RUNNING,
     SERVICE_START_PENDING,
     SERVICE_STOP_PENDING,
@@ -149,7 +153,46 @@ def test_identity_failure_stops_before_config_or_credential_runtime(tmp_path: Pa
     ]
     failed = backend.statuses[-1]
     assert failed.win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR
-    assert failed.service_specific_exit_code != 0
+    assert failed.service_specific_exit_code == SERVICE_FAILURE_IDENTITY
+
+
+def test_config_failure_has_distinct_safe_phase_code(tmp_path: Path) -> None:
+    backend = FakeBackend()
+
+    def config_loader():  # type: ignore[no-untyped-def]
+        raise ValueError("config detail must not become an SCM code")
+
+    AgentWindowsServiceHost(
+        backend,
+        identity_probe=identity,
+        config_loader=config_loader,
+        runtime_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("not reached")),
+    ).run()
+
+    failed = backend.statuses[-1]
+    assert failed.current_state == SERVICE_STOPPED
+    assert failed.win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR
+    assert failed.service_specific_exit_code == SERVICE_FAILURE_CONFIG
+
+
+def test_runtime_construction_failure_has_distinct_safe_phase_code(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    config = make_service_config(tmp_path)
+
+    def runtime_factory(*_args):  # type: ignore[no-untyped-def]
+        raise PermissionError("credential/tool detail must not become an SCM code")
+
+    AgentWindowsServiceHost(
+        backend,
+        identity_probe=identity,
+        config_loader=lambda: config,
+        runtime_factory=runtime_factory,
+    ).run()
+
+    failed = backend.statuses[-1]
+    assert failed.current_state == SERVICE_STOPPED
+    assert failed.win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR
+    assert failed.service_specific_exit_code == SERVICE_FAILURE_RUNTIME_CONSTRUCTION
 
 
 @pytest.mark.parametrize("control", [SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN])
@@ -229,7 +272,9 @@ def test_runtime_failure_reports_service_specific_stopped_error(tmp_path: Path) 
         SERVICE_RUNNING,
         SERVICE_STOPPED,
     ]
-    assert backend.statuses[-1].win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR
+    failed = backend.statuses[-1]
+    assert failed.win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR
+    assert failed.service_specific_exit_code == SERVICE_FAILURE_RUNTIME_EXECUTION
 
 
 def test_service_status_contract_rejects_controls_during_pending_and_stable_checkpoint() -> None:

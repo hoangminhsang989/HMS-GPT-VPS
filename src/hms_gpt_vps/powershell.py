@@ -64,9 +64,8 @@ def run_powershell(
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "-",
+            script,
         ],
-        input=script,
         text=True,
         capture_output=True,
         timeout=timeout_seconds,
@@ -91,14 +90,31 @@ def run_powershell_json(
     timeout_seconds: int = 60,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
+    """Run PowerShell and require exactly one JSON object result.
+
+    The script is passed directly as the ``-Command`` argv rather than through
+    ``-Command -`` stdin mode. On Windows PowerShell 5.1, stdin command mode can
+    report process exit code zero or produce no output for a multi-line wrapper
+    even when the embedded command failed. Direct argv execution preserves the
+    script as one PowerShell command without invoking a shell. The explicit
+    try/catch then makes failures observable, and an empty result remains
+    invalid because callers rely on a concrete postcondition object.
+    """
     if not script.strip():
         raise ValueError("PowerShell script is required")
     wrapped = (
         "$ErrorActionPreference = 'Stop'\n"
-        "$hmsResult = & {\n"
+        "try {\n"
+        "  $hmsResult = & {\n"
         f"{script}\n"
+        "  }\n"
+        "  $hmsJson = $hmsResult | ConvertTo-Json -Compress -Depth 8\n"
+        "  if ($null -ne $hmsJson) { [Console]::Out.Write($hmsJson) }\n"
+        "} catch {\n"
+        "  [Console]::Error.WriteLine($_.Exception.Message)\n"
+        "  exit 1\n"
         "}\n"
-        "$hmsResult | ConvertTo-Json -Compress -Depth 8"
+        "exit 0"
     )
     result = run_powershell(
         wrapped,
@@ -108,8 +124,11 @@ def run_powershell_json(
     )
     text = result.stdout.strip()
     if not text:
-        return {}
-    parsed = json.loads(text)
+        raise PowerShellError("PowerShell JSON result was empty")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PowerShellError("PowerShell result was not valid JSON") from exc
     if not isinstance(parsed, dict):
         raise PowerShellError("PowerShell JSON result must be an object")
     return parsed
