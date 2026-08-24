@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Mapping
 
+from .authority_lock import exclusive_authority_lock
 from .managed_agent_provisioning_runtime import ManagedAgentProvisioningRuntime
 from .powershell_direct import PowerShellDirectCredential
 from .provision_state import ProvisionState
@@ -61,6 +62,11 @@ class ManagedAgentReconcileRuntime:
     approved late-guest mutation. Mutation actions intentionally do not advance
     durable provisioning state in the same call; a later call must re-observe
     the postcondition before the orchestrator may advance.
+
+    The complete observe -> decide -> optional mutation sequence is serialized
+    across host processes using an OS-backed authority lock. A crashed holder
+    releases ownership automatically; a contender cannot overlap a package/SCM
+    mutation using a stale pre-mutation observation.
     """
 
     def __init__(
@@ -72,6 +78,10 @@ class ManagedAgentReconcileRuntime:
         self.agent_runtime = agent_runtime
         if agent_runtime.config.instance_id.strip() == "":
             raise ValueError("managed Agent runtime instance_id is required")
+        state_path = orchestrator.store.path
+        self.reconcile_lock_path = state_path.with_name(
+            state_path.name + ".late-agent-reconcile.lock"
+        )
 
     def _current_late_state(self, instance_id: str) -> ProvisionState:
         # Late reconcile must never create/initialize provisioning state as a
@@ -129,16 +139,11 @@ class ManagedAgentReconcileRuntime:
             agent_healthy=agent.agent_healthy,
         )
 
-    def reconcile_once(
+    def _reconcile_once_locked(
         self,
         context: ProvisionContext,
         credential: PowerShellDirectCredential,
     ) -> ManagedAgentReconcileResult:
-        credential.validate()
-        if context.instance_id != self.agent_runtime.config.instance_id:
-            raise ManagedAgentReconcileError(
-                "provision context instance does not match managed Agent runtime"
-            )
         self._current_late_state(context.instance_id)
 
         agent_observation = self.agent_runtime.provision_observation(credential)
@@ -172,3 +177,16 @@ class ManagedAgentReconcileRuntime:
         raise ManagedAgentReconcileError(
             f"unexpected action in late Agent reconcile boundary: {transition.action}"
         )
+
+    def reconcile_once(
+        self,
+        context: ProvisionContext,
+        credential: PowerShellDirectCredential,
+    ) -> ManagedAgentReconcileResult:
+        credential.validate()
+        if context.instance_id != self.agent_runtime.config.instance_id:
+            raise ManagedAgentReconcileError(
+                "provision context instance does not match managed Agent runtime"
+            )
+        with exclusive_authority_lock(self.reconcile_lock_path):
+            return self._reconcile_once_locked(context, credential)
