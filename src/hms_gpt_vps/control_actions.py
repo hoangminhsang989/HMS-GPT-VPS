@@ -325,6 +325,7 @@ class ControlActionRuntime:
             capability="process.test",
             audit_log=self.audit_log,
             timeout_seconds=float(timeout),
+            require_trusted_executable=True,
         )
         response = self._command_response(result)
         response["argv"] = list(result.argv)
@@ -343,6 +344,7 @@ class ControlActionRuntime:
             capability="git.status",
             audit_log=self.audit_log,
             timeout_seconds=30,
+            require_trusted_executable=True,
         )
         return self._command_response(result)
 
