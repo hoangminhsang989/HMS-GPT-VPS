@@ -168,12 +168,12 @@ if (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf) {{
 
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($configChanged -and $null -ne $existing -and $existing.Status -eq 'Running') {{
-  Stop-Service -Name $serviceName -ErrorAction Stop
-  $existing.WaitForStatus(
+  $null = Stop-Service -Name $serviceName -ErrorAction Stop -WarningAction SilentlyContinue
+  $null = $existing.WaitForStatus(
     [System.ServiceProcess.ServiceControllerStatus]::Stopped,
     [TimeSpan]::FromSeconds(30)
   )
-  $existing.Refresh()
+  $null = $existing.Refresh()
   if ($existing.Status -ne 'Stopped') {{
     throw 'HMS Agent did not stop for runtime config replacement'
   }}
@@ -256,7 +256,7 @@ if ([string]$packageProof.entrypoint_sha256 -ne $expectedHash) {{
 
 $service = Get-Service -Name $serviceName -ErrorAction Stop
 if ($service.Status -ne 'Running') {{
-  Start-Service -Name $serviceName -ErrorAction Stop
+  $null = Start-Service -Name $serviceName -ErrorAction Stop -WarningAction SilentlyContinue
 }}
 $service = Get-Service -Name $serviceName -ErrorAction Stop
 $wmi = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
