@@ -23,7 +23,9 @@ from .agent_package_transfer_attempt import (
 )
 from .agent_package_transfer_recovery import (
     probe_agent_package_ready,
+    probe_guest_service_interface_enabled,
     reset_owned_agent_package_staging,
+    restore_guest_service_interface_state,
 )
 from .agent_post_install_observe import (
     AgentPostInstallObservation,
@@ -76,9 +78,10 @@ class ManagedAgentProvisioningRuntime:
     """Crash-safe host runtime for Agent package, SCM readiness and health.
 
     This runtime starts only after device enrollment has already been observed
-    and the durable provisioning state is AGENT_INSTALLING. It deliberately does
-    not retire the bootstrap credential; retirement remains gated by the later
-    AGENT_HEALTHY checkpoint.
+    and durable provisioning state is AGENT_INSTALLING. It preserves the exact
+    pre-transfer Hyper-V Guest Service Interface state across crash/retry, and it
+    deliberately does not retire the bootstrap credential; retirement remains
+    gated by the later AGENT_HEALTHY checkpoint.
     """
 
     def __init__(
@@ -114,6 +117,17 @@ class ManagedAgentProvisioningRuntime:
             ownership_token=attempt.ownership_token,
         )
 
+    def _require_transfer_baseline(
+        self,
+        attempt: AgentPackageTransferAttempt,
+    ) -> bool:
+        baseline = attempt.guest_service_interface_was_enabled
+        if not isinstance(baseline, bool):
+            raise ManagedAgentProvisioningError(
+                "persisted Guest Service Interface baseline is missing"
+            )
+        return baseline
+
     def stage_package(
         self,
         credential: PowerShellDirectCredential,
@@ -126,9 +140,26 @@ class ManagedAgentProvisioningRuntime:
             vm_name=self.config.vm_name,
             manifest_sha256=manifest_sha,
         )
+
+        if attempt.phase is AgentPackageTransferPhase.PLANNED:
+            if attempt.guest_service_interface_was_enabled is None:
+                baseline = probe_guest_service_interface_enabled(self.config.vm_name)
+                attempt = self.transfer_attempt_store.bind_guest_service_interface_baseline(
+                    baseline
+                )
+            attempt = self.transfer_attempt_store.transition(
+                AgentPackageTransferPhase.PLANNED,
+                AgentPackageTransferPhase.TRANSFERRING,
+            )
+
+        baseline = self._require_transfer_baseline(attempt)
         plan = self._plan(manifest, attempt)
 
         if attempt.phase is AgentPackageTransferPhase.PUBLISHED:
+            # A crash may occur after Copy-VMFile changed the integration service
+            # but before the normal finally path restored it. Recover host state
+            # before trusting/clearing the durable published checkpoint.
+            restore_guest_service_interface_state(self.config.vm_name, baseline)
             proof = probe_agent_package_ready(
                 self.config.vm_name,
                 credential,
@@ -143,32 +174,35 @@ class ManagedAgentProvisioningRuntime:
             return {
                 "package_ready": True,
                 "resumed_published_attempt": True,
+                "guest_service_interface_restored": True,
                 "file_count": manifest.file_count,
                 "total_size": manifest.total_size,
                 "entrypoint_sha256": manifest.sha256.lower(),
             }
 
-        if attempt.phase is AgentPackageTransferPhase.PLANNED:
-            attempt = self.transfer_attempt_store.transition(
-                AgentPackageTransferPhase.PLANNED,
-                AgentPackageTransferPhase.TRANSFERRING,
-            )
-            plan = self._plan(manifest, attempt)
-        elif attempt.phase is not AgentPackageTransferPhase.TRANSFERRING:
+        if attempt.phase is not AgentPackageTransferPhase.TRANSFERRING:
             raise ManagedAgentProvisioningError("unsupported Agent transfer attempt phase")
 
-        # On both first execution and retry, reset only the exact staging root
-        # bound to the persisted transfer id + protected ownership token.
+        # First repair any host integration-service state left by a prior crash,
+        # then reset only the exact guest staging root bound to the persisted id
+        # and protected ownership token.
+        restore_guest_service_interface_state(self.config.vm_name, baseline)
         reset_owned_agent_package_staging(
             self.config.vm_name,
             credential,
             plan,
         )
-        transfer = transfer_agent_package_to_guest(
-            self.config.vm_name,
-            credential,
-            plan,
-        )
+        try:
+            transfer = transfer_agent_package_to_guest(
+                self.config.vm_name,
+                credential,
+                plan,
+            )
+        finally:
+            # Fail closed if the bounded copy window cannot restore the persisted
+            # baseline. The attempt remains TRANSFERRING for explicit recovery.
+            restore_guest_service_interface_state(self.config.vm_name, baseline)
+
         attempt = self.transfer_attempt_store.transition(
             AgentPackageTransferPhase.TRANSFERRING,
             AgentPackageTransferPhase.PUBLISHED,
@@ -190,6 +224,7 @@ class ManagedAgentProvisioningRuntime:
             **transfer,
             "package_ready": True,
             "resumed_published_attempt": False,
+            "guest_service_interface_restored": True,
         }
 
     def install_service(
