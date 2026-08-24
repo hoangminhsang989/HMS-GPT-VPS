@@ -97,7 +97,7 @@ def runtime(
     vm_ids: list[str] | None = None,
     *,
     boot_id: str = "boot-01",
-    evidence: dict[str, object] | None = None,
+    evidence_override: dict[str, object] | None = None,
 ):  # type: ignore[no-untyped-def]
     observed = list(vm_ids or [VM_ID, VM_ID, VM_ID, VM_ID])
     last = observed[-1]
@@ -114,7 +114,7 @@ def runtime(
             service_ready=True,
             agent_healthy=True,
             health=health,
-            service_evidence=evidence or service_evidence(),
+            service_evidence=evidence_override or service_evidence(),
         )
         return (
             ProvisionObservation(
@@ -333,7 +333,7 @@ def test_strict_qualification_rejects_package_evidence_change(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="package_file_count"):
-        qualify(runtime(evidence=service_evidence(package_file_count=3)))
+        qualify(runtime(evidence_override=service_evidence(package_file_count=3)))
 
 
 def test_strict_qualification_rejects_publication_enrollment_identity_change(
