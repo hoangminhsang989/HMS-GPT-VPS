@@ -78,6 +78,12 @@ def _normalize_vm_id(value: str, label: str) -> str:
         raise ManagedAgentProvisioningError(f"{label} is not a valid GUID") from exc
 
 
+def _require_true(evidence: dict[str, object], key: str, message: str) -> None:
+    """Require an exact JSON boolean true; never accept truthy coercions."""
+    if evidence.get(key) is not True:
+        raise ManagedAgentProvisioningError(message)
+
+
 @dataclass(frozen=True)
 class ManagedAgentProvisioningConfig:
     instance_id: str
@@ -101,14 +107,21 @@ class ManagedAgentProvisioningConfig:
             raise ValueError("runtime workspace_root conflicts with service workspace path")
         if not _same_windows_path(self.runtime.state_root, self.service.state_path):
             raise ValueError("runtime state_root conflicts with service state path")
+
+        authority_paths = (
+            ("Agent package source root", self.package_source_root),
+            ("Agent package manifest", self.package_manifest_path),
+            ("instance registry", self.registry_path),
+        )
+        for label, path in authority_paths:
+            if _path_chain_has_redirect(path):
+                raise ValueError(f"{label} path must not traverse a link or reparse point")
         if not self.package_source_root.is_dir():
             raise FileNotFoundError(self.package_source_root)
         if not self.package_manifest_path.is_file():
             raise FileNotFoundError(self.package_manifest_path)
         if not self.registry_path.is_file():
             raise FileNotFoundError(self.registry_path)
-        if _path_chain_has_redirect(self.registry_path):
-            raise ValueError("instance registry path must not traverse a link or reparse point")
 
 
 class ManagedAgentProvisioningRuntime:
@@ -190,13 +203,43 @@ if ($vm.Name -ine $expectedVmName) {{
         return expected_vm_id
 
     def _load_approved_manifest(self) -> AgentPackageManifest:
+        # Revalidate lexical package authority on every use. A path that was safe
+        # at construction time must not remain trusted if a parent is later
+        # replaced by a symlink/junction/reparse redirect.
+        if _path_chain_has_redirect(self.config.package_source_root):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package source authority path traverses a link or reparse point"
+            )
+        if _path_chain_has_redirect(self.config.package_manifest_path):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest authority path traverses a link or reparse point"
+            )
+        if not self.config.package_source_root.is_dir():
+            raise ManagedAgentProvisioningError("approved Agent package source root disappeared")
+        if not self.config.package_manifest_path.is_file():
+            raise ManagedAgentProvisioningError("approved Agent package manifest disappeared")
+
         manifest = load_agent_package_manifest(self.config.package_manifest_path)
         canonical = canonical_agent_package_manifest_bytes(manifest)
         if self.config.package_manifest_path.read_bytes() != canonical:
             raise ManagedAgentProvisioningError(
                 "approved Agent package manifest is not canonical"
             )
+        # Check again around the reads so a redirect introduced concurrently is
+        # detected before the package can authorize a managed guest mutation.
+        if _path_chain_has_redirect(self.config.package_source_root) or _path_chain_has_redirect(
+            self.config.package_manifest_path
+        ):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package authority path changed during validation"
+            )
         verify_agent_package(self.config.package_source_root, manifest)
+        if _path_chain_has_redirect(self.config.package_source_root) or _path_chain_has_redirect(
+            self.config.package_manifest_path
+        ):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package authority path changed during verification"
+            )
         return manifest
 
     def _plan(
@@ -271,10 +314,11 @@ if ($vm.Name -ine $expectedVmName) {{
                 self.config.service,
                 manifest,
             )
-            if not bool(proof.get("package_ready", False)):
-                raise ManagedAgentProvisioningError(
-                    "published Agent package attempt no longer has an exact final proof"
-                )
+            _require_true(
+                proof,
+                "package_ready",
+                "published Agent package attempt no longer has an exact final proof",
+            )
             self.transfer_attempt_store.clear_published()
             return {
                 "package_ready": True,
@@ -331,10 +375,11 @@ if ($vm.Name -ine $expectedVmName) {{
             self.config.service,
             manifest,
         )
-        if not bool(proof.get("package_ready", False)):
-            raise ManagedAgentProvisioningError(
-                "Agent package publication completed without exact package-ready proof"
-            )
+        _require_true(
+            proof,
+            "package_ready",
+            "Agent package publication completed without exact package-ready proof",
+        )
         self.transfer_attempt_store.clear_published()
         return {
             **transfer,
@@ -357,10 +402,11 @@ if ($vm.Name -ine $expectedVmName) {{
             self.config.service,
             manifest,
         )
-        if not bool(package_proof.get("package_ready", False)):
-            raise ManagedAgentProvisioningError(
-                "HMS Agent service install requires exact package-ready proof"
-            )
+        _require_true(
+            package_proof,
+            "package_ready",
+            "HMS Agent service install requires exact package-ready proof",
+        )
         vm_id = self._assert_vm_identity()
         result = install_agent_service_by_id(
             vm_id,
@@ -370,8 +416,11 @@ if ($vm.Name -ine $expectedVmName) {{
             package_manifest=manifest,
             runtime_config=self.config.runtime,
         )
-        if not bool(result.get("ready", False)):
-            raise ManagedAgentProvisioningError("HMS Agent service install did not become ready")
+        _require_true(
+            result,
+            "ready",
+            "HMS Agent service install did not become ready",
+        )
         return result
 
     def observe(
@@ -388,7 +437,7 @@ if ($vm.Name -ine $expectedVmName) {{
             self.config.service,
             manifest,
         )
-        package_ready = bool(package_proof.get("package_ready", False))
+        package_ready = package_proof.get("package_ready") is True
         if not package_ready:
             return ProvisionObservation(agent_package_ready=False), None
 
