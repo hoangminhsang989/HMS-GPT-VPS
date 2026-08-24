@@ -136,21 +136,34 @@ def install_host_integration_mocks(
     baseline: bool = False,
 ) -> list[bool]:
     restored: list[bool] = []
+
+    def probe(vm_id: str, vm_name: str) -> bool:
+        assert vm_id == VM_ID
+        assert vm_name == VM_NAME
+        return baseline
+
     monkeypatch.setattr(
         runtime_module,
-        "probe_guest_service_interface_enabled",
-        lambda *_args, **_kwargs: baseline,
+        "probe_guest_service_interface_enabled_by_id",
+        probe,
     )
 
-    def restore(_vm_name: str, expected_enabled: bool):  # type: ignore[no-untyped-def]
+    def restore(vm_id: str, vm_name: str, expected_enabled: bool):  # type: ignore[no-untyped-def]
+        assert vm_id == VM_ID
+        assert vm_name == VM_NAME
         restored.append(expected_enabled)
         return {
             "restored": True,
             "enabled": expected_enabled,
             "changed": False,
+            "vm_id": VM_ID,
         }
 
-    monkeypatch.setattr(runtime_module, "restore_guest_service_interface_state", restore)
+    monkeypatch.setattr(
+        runtime_module,
+        "restore_guest_service_interface_state_by_id",
+        restore,
+    )
     return restored
 
 
@@ -164,8 +177,8 @@ def test_vm_name_reuse_with_different_vm_id_fails_before_guest_mutation(
     def forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("guest mutation/probe must not run after VMId mismatch")
 
-    monkeypatch.setattr(runtime_module, "probe_agent_package_ready", forbidden)
-    monkeypatch.setattr(runtime_module, "install_agent_service", forbidden)
+    monkeypatch.setattr(runtime_module, "probe_agent_package_ready_by_id", forbidden)
+    monkeypatch.setattr(runtime_module, "install_agent_service_by_id", forbidden)
 
     with pytest.raises(ManagedAgentProvisioningError, match="does not match persisted"):
         runtime.install_service(credential())
@@ -206,18 +219,22 @@ def test_stage_retry_reuses_exact_owned_attempt_and_restores_host_baseline(
     install_vm_identity_mock(monkeypatch)
     seen: list[tuple[str, str]] = []
     restored = install_host_integration_mocks(monkeypatch, baseline=False)
-    monkeypatch.setattr(
-        runtime_module,
-        "reset_owned_agent_package_staging",
-        lambda *args, **kwargs: {"reset": True},
-    )
+
+    def reset(vm_id: str, vm_name: str, *_args: object, **_kwargs: object):
+        assert vm_id == VM_ID
+        assert vm_name == VM_NAME
+        return {"reset": True}
+
+    monkeypatch.setattr(runtime_module, "reset_owned_agent_package_staging_by_id", reset)
 
     def interrupted(*args: object, **kwargs: object) -> dict[str, object]:
-        plan = args[2]
+        assert args[0] == VM_ID
+        assert args[1] == VM_NAME
+        plan = args[3]
         seen.append((plan.layout.transfer_id, plan.ownership_token))
         raise TimeoutError("simulated host interruption")
 
-    monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest", interrupted)
+    monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest_by_id", interrupted)
     with pytest.raises(TimeoutError):
         runtime.stage_package(credential())
 
@@ -228,26 +245,31 @@ def test_stage_retry_reuses_exact_owned_attempt_and_restores_host_baseline(
     assert restored == [False, False]
 
     def completed(*args: object, **kwargs: object) -> dict[str, object]:
-        plan = args[2]
+        assert args[0] == VM_ID
+        assert args[1] == VM_NAME
+        plan = args[3]
         seen.append((plan.layout.transfer_id, plan.ownership_token))
         return {
             "published": True,
             "file_count": manifest.file_count,
             "total_size": manifest.total_size,
             "entrypoint_sha256": manifest.sha256,
+            "vm_id": VM_ID,
         }
 
-    monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest", completed)
-    monkeypatch.setattr(
-        runtime_module,
-        "probe_agent_package_ready",
-        lambda *args, **kwargs: {
+    monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest_by_id", completed)
+
+    def package_ready(vm_id: str, vm_name: str, *_args: object, **_kwargs: object):
+        assert vm_id == VM_ID
+        assert vm_name == VM_NAME
+        return {
             "package_ready": True,
             "file_count": manifest.file_count,
             "total_size": manifest.total_size,
             "entrypoint_sha256": manifest.sha256,
-        },
-    )
+        }
+
+    monkeypatch.setattr(runtime_module, "probe_agent_package_ready_by_id", package_ready)
     result = runtime.stage_package(credential())
 
     assert result["package_ready"] is True
@@ -267,19 +289,22 @@ def test_enabled_integration_baseline_is_preserved_not_forced_disabled(
     restored = install_host_integration_mocks(monkeypatch, baseline=True)
     monkeypatch.setattr(
         runtime_module,
-        "reset_owned_agent_package_staging",
-        lambda *args, **kwargs: {"reset": True},
+        "reset_owned_agent_package_staging_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {"reset": vm_id == VM_ID and vm_name == VM_NAME},
     )
     monkeypatch.setattr(
         runtime_module,
-        "transfer_agent_package_to_guest",
-        lambda *args, **kwargs: {"published": True},
+        "transfer_agent_package_to_guest_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {
+            "published": vm_id == VM_ID and vm_name == VM_NAME,
+            "vm_id": vm_id,
+        },
     )
     monkeypatch.setattr(
         runtime_module,
-        "probe_agent_package_ready",
-        lambda *args, **kwargs: {
-            "package_ready": True,
+        "probe_agent_package_ready_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {
+            "package_ready": vm_id == VM_ID and vm_name == VM_NAME,
             "file_count": manifest.file_count,
             "total_size": manifest.total_size,
             "entrypoint_sha256": manifest.sha256,
@@ -310,13 +335,13 @@ def test_published_attempt_only_restores_host_baseline_and_reprobes_final_packag
     def forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("published retry must not reset guest staging or retransfer")
 
-    monkeypatch.setattr(runtime_module, "reset_owned_agent_package_staging", forbidden)
-    monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest", forbidden)
+    monkeypatch.setattr(runtime_module, "reset_owned_agent_package_staging_by_id", forbidden)
+    monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest_by_id", forbidden)
     monkeypatch.setattr(
         runtime_module,
-        "probe_agent_package_ready",
-        lambda *args, **kwargs: {
-            "package_ready": True,
+        "probe_agent_package_ready_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {
+            "package_ready": vm_id == VM_ID and vm_name == VM_NAME,
             "file_count": manifest.file_count,
             "total_size": manifest.total_size,
             "entrypoint_sha256": manifest.sha256,
@@ -346,8 +371,10 @@ def test_published_attempt_with_lost_final_proof_fails_closed(
     install_host_integration_mocks(monkeypatch)
     monkeypatch.setattr(
         runtime_module,
-        "probe_agent_package_ready",
-        lambda *args, **kwargs: {"package_ready": False},
+        "probe_agent_package_ready_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {
+            "package_ready": False if vm_id == VM_ID and vm_name == VM_NAME else True
+        },
     )
 
     with pytest.raises(ManagedAgentProvisioningError, match="no longer has an exact final proof"):
@@ -363,14 +390,16 @@ def test_service_install_requires_package_ready_before_scm_mutation(
     install_vm_identity_mock(monkeypatch)
     monkeypatch.setattr(
         runtime_module,
-        "probe_agent_package_ready",
-        lambda *args, **kwargs: {"package_ready": False},
+        "probe_agent_package_ready_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {
+            "package_ready": False if vm_id == VM_ID and vm_name == VM_NAME else True
+        },
     )
 
     def forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("SCM installer must not run")
 
-    monkeypatch.setattr(runtime_module, "install_agent_service", forbidden)
+    monkeypatch.setattr(runtime_module, "install_agent_service_by_id", forbidden)
     with pytest.raises(ManagedAgentProvisioningError, match="requires exact package-ready proof"):
         runtime.install_service(credential())
 
@@ -383,9 +412,9 @@ def test_service_install_runs_only_after_exact_package_proof(
     install_vm_identity_mock(monkeypatch)
     monkeypatch.setattr(
         runtime_module,
-        "probe_agent_package_ready",
-        lambda *args, **kwargs: {
-            "package_ready": True,
+        "probe_agent_package_ready_by_id",
+        lambda vm_id, vm_name, *args, **kwargs: {
+            "package_ready": vm_id == VM_ID and vm_name == VM_NAME,
             "file_count": manifest.file_count,
             "total_size": manifest.total_size,
             "entrypoint_sha256": manifest.sha256,
@@ -393,10 +422,12 @@ def test_service_install_runs_only_after_exact_package_proof(
     )
     calls = {"count": 0}
 
-    def installed(*args: object, **kwargs: object) -> dict[str, object]:
+    def installed(vm_id: str, vm_name: str, *args: object, **kwargs: object) -> dict[str, object]:
+        assert vm_id == VM_ID
+        assert vm_name == VM_NAME
         calls["count"] += 1
         return {"ready": True}
 
-    monkeypatch.setattr(runtime_module, "install_agent_service", installed)
+    monkeypatch.setattr(runtime_module, "install_agent_service_by_id", installed)
     assert runtime.install_service(credential())["ready"] is True
     assert calls["count"] == 1
