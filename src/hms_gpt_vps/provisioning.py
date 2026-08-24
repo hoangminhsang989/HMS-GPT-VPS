@@ -26,6 +26,30 @@ class ProvisionObservation:
     pairing_ready: bool = False
     paired: bool = False
 
+    def validate(self) -> None:
+        for name in (
+            "network_ready",
+            "install_media_ready",
+            "vm_running",
+            "guest_booted",
+            "guest_bootstrap_ready",
+            "agent_device_enrolled",
+            "agent_package_ready",
+            "agent_service_ready",
+            "agent_healthy",
+            "bootstrap_retired",
+            "answer_media_detached",
+            "install_secrets_cleared",
+            "pairing_ready",
+            "paired",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"provision observation must be boolean: {name}")
+        if self.vm_id is not None and (
+            not isinstance(self.vm_id, str) or not self.vm_id.strip()
+        ):
+            raise ValueError("provision observation vm_id must be a non-empty string or null")
+
 
 @dataclass(frozen=True)
 class ProvisionContext:
@@ -66,7 +90,8 @@ class ProvisioningOrchestrator:
     Every reconcile-driven durable advance is a compare-and-swap against the
     exact state observed at the start of this call. Concurrent reconcilers may
     observe stale state, but a stale writer cannot regress or skip over a newer
-    checkpoint.
+    checkpoint. Host and observation evidence are type-exact before any state
+    decision, so truthy strings/numbers cannot satisfy provisioning gates.
     """
 
     def __init__(self, state_path: Path) -> None:
@@ -97,6 +122,12 @@ class ProvisioningOrchestrator:
         )
 
     def reconcile(self, context: ProvisionContext) -> TransitionResult:
+        if not isinstance(context.instance_id, str) or not context.instance_id.strip():
+            raise ValueError("provision context instance_id is required")
+        context.config.validate()
+        context.host.validate()
+        context.observation.validate()
+
         record = self.current(context.instance_id)
         observed = context.observation
 
