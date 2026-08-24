@@ -51,6 +51,7 @@ _HEALTH_PORT = 18765
 _BRIDGE_ORIGIN = "https://127.0.0.1:9"
 _EPOCH_FILENAME = "agent-connection-epoch.sqlite3"
 _MARKER_FILENAME = ".hms-ci-native-service-owned"
+_WORKSPACE_MARKER_FILENAME = ".hms-ci-native-workspace-owned"
 _MAX_HEALTH_BYTES = 32 * 1024
 
 
@@ -78,11 +79,36 @@ def _service_exists(service_name: str) -> bool:
     result = run_powershell_json(
         f"""
 $service = Get-Service -Name {name} -ErrorAction SilentlyContinue
-[pscustomobject]@{{ exists = [bool]($null -ne $service) }}
+$exists = $null -ne $service
+if ($null -ne $service) {{ $service.Dispose() }}
+[pscustomobject]@{{ exists = [bool]$exists }}
 """.strip(),
         timeout_seconds=30,
     )
     return bool(result.get("exists", False))
+
+
+def _service_diagnostics(service_name: str) -> dict[str, object]:
+    escaped_name = service_name.replace("'", "''")
+    return run_powershell_json(
+        f"""
+$service = Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction SilentlyContinue
+if ($null -eq $service) {{
+  [pscustomobject]@{{ exists = $false }}
+}} else {{
+  [pscustomobject]@{{
+    exists = $true
+    state = [string]$service.State
+    status = [string]$service.Status
+    process_id = [int]$service.ProcessId
+    exit_code = [int]$service.ExitCode
+    service_specific_exit_code = [int]$service.ServiceSpecificExitCode
+    start_name = [string]$service.StartName
+  }}
+}}
+""".strip(),
+        timeout_seconds=30,
+    )
 
 
 def _local_health_once(port: int) -> AgentHealthDocument:
@@ -152,9 +178,10 @@ def _require_health_unreachable(*, timeout_seconds: float = 5.0) -> None:
 
 def _probe_listener(service_name: str) -> dict[str, object]:
     name = ps_literal(service_name)
+    escaped_name = service_name.replace("'", "''")
     result = run_powershell_json(
         f"""
-$service = Get-CimInstance Win32_Service -Filter "Name='{service_name}'" -ErrorAction Stop
+$service = Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction Stop
 $pidValue = [int]$service.ProcessId
 if ($pidValue -le 0) {{ throw 'HMS Agent service has no live process id' }}
 $connections = @(
@@ -209,15 +236,20 @@ def _stop_service(service_name: str) -> None:
     result = run_powershell_json(
         f"""
 $service = Get-Service -Name {name} -ErrorAction Stop
-if ($service.Status -ne 'Stopped') {{
-  Stop-Service -Name {name} -ErrorAction Stop
-  $service.WaitForStatus(
-    [System.ServiceProcess.ServiceControllerStatus]::Stopped,
-    [TimeSpan]::FromSeconds(30)
-  )
+try {{
+  if ($service.Status -ne 'Stopped') {{
+    Stop-Service -Name {name} -ErrorAction Stop
+    $service.WaitForStatus(
+      [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+      [TimeSpan]::FromSeconds(30)
+    )
+  }}
+  $service.Refresh()
+  $stopped = $service.Status -eq 'Stopped'
+}} finally {{
+  $service.Dispose()
 }}
-$service.Refresh()
-[pscustomobject]@{{ stopped = [bool]($service.Status -eq 'Stopped') }}
+[pscustomobject]@{{ stopped = [bool]$stopped }}
 """.strip(),
         timeout_seconds=45,
     )
@@ -230,15 +262,20 @@ def _start_service(service_name: str) -> None:
     result = run_powershell_json(
         f"""
 $service = Get-Service -Name {name} -ErrorAction Stop
-if ($service.Status -ne 'Running') {{
-  Start-Service -Name {name} -ErrorAction Stop
-  $service.WaitForStatus(
-    [System.ServiceProcess.ServiceControllerStatus]::Running,
-    [TimeSpan]::FromSeconds(30)
-  )
+try {{
+  if ($service.Status -ne 'Running') {{
+    Start-Service -Name {name} -ErrorAction Stop
+    $service.WaitForStatus(
+      [System.ServiceProcess.ServiceControllerStatus]::Running,
+      [TimeSpan]::FromSeconds(30)
+    )
+  }}
+  $service.Refresh()
+  $running = $service.Status -eq 'Running'
+}} finally {{
+  $service.Dispose()
 }}
-$service.Refresh()
-[pscustomobject]@{{ running = [bool]($service.Status -eq 'Running') }}
+[pscustomobject]@{{ running = [bool]$running }}
 """.strip(),
         timeout_seconds=45,
     )
@@ -248,32 +285,45 @@ $service.Refresh()
 
 def _delete_service_if_present(service_name: str) -> None:
     name = ps_literal(service_name)
+    escaped_name = service_name.replace("'", "''")
     result = run_powershell_json(
         f"""
 $service = Get-Service -Name {name} -ErrorAction SilentlyContinue
 if ($null -ne $service) {{
-  if ($service.Status -ne 'Stopped') {{
-    Stop-Service -Name {name} -ErrorAction Stop
-    $service.WaitForStatus(
-      [System.ServiceProcess.ServiceControllerStatus]::Stopped,
-      [TimeSpan]::FromSeconds(30)
-    )
+  try {{
+    if ($service.Status -ne 'Stopped') {{
+      Stop-Service -Name {name} -ErrorAction Stop
+      $service.WaitForStatus(
+        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+        [TimeSpan]::FromSeconds(30)
+      )
+    }}
+  }} finally {{
+    $service.Dispose()
+    $service = $null
   }}
   & sc.exe delete {name} | Out-Null
   if ($LASTEXITCODE -ne 0) {{ throw 'sc.exe delete HMS Agent failed' }}
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
 }}
 $deadline = [DateTime]::UtcNow.AddSeconds(15)
 do {{
-  $remaining = Get-Service -Name {name} -ErrorAction SilentlyContinue
+  $remaining = Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction SilentlyContinue
   if ($null -eq $remaining) {{ break }}
   Start-Sleep -Milliseconds 200
 }} while ([DateTime]::UtcNow -lt $deadline)
-[pscustomobject]@{{ deleted = [bool]($null -eq (Get-Service -Name {name} -ErrorAction SilentlyContinue)) }}
+[pscustomobject]@{{ deleted = [bool]($null -eq (Get-CimInstance Win32_Service -Filter "Name='{escaped_name}'" -ErrorAction SilentlyContinue)) }}
 """.strip(),
         timeout_seconds=60,
     )
     if not bool(result.get("deleted", False)):
         raise RuntimeError("HMS Agent service cleanup did not complete")
+
+
+def _require_owned_marker(marker: Path, ownership_token: str, label: str) -> None:
+    if not marker.is_file() or marker.read_text(encoding="utf-8") != ownership_token:
+        raise PermissionError(f"refusing to remove unowned HMS {label} path")
 
 
 def _cleanup_owned_paths(
@@ -283,13 +333,14 @@ def _cleanup_owned_paths(
 ) -> None:
     _delete_service_if_present(service.service_name)
     runtime_root = Path(service.runtime_path)
-    marker = Path(service.binary_path).parent / _MARKER_FILENAME
+    runtime_marker = Path(service.binary_path).parent / _MARKER_FILENAME
     if runtime_root.exists():
-        if not marker.is_file() or marker.read_text(encoding="utf-8") != ownership_token:
-            raise PermissionError("refusing to remove unowned HMS native qualification paths")
+        _require_owned_marker(runtime_marker, ownership_token, "runtime")
         shutil.rmtree(runtime_root)
     workspace = Path(service.workspace_path)
+    workspace_marker = workspace / _WORKSPACE_MARKER_FILENAME
     if workspace.exists():
+        _require_owned_marker(workspace_marker, ownership_token, "workspace")
         shutil.rmtree(workspace)
 
 
@@ -302,6 +353,18 @@ def _write_result(path: Path, result: dict[str, object]) -> None:
         allow_nan=False,
     ) + "\n"
     path.write_text(data, encoding="utf-8")
+
+
+def _print_failure_evidence(service_name: str, exc: BaseException) -> None:
+    try:
+        service = _service_diagnostics(service_name)
+    except Exception as diagnostic_exc:
+        service = {"diagnostic_error": type(diagnostic_exc).__name__}
+    evidence = {
+        "qualification_failure": type(exc).__name__,
+        "service": service,
+    }
+    print(json.dumps(evidence, sort_keys=True, separators=(",", ":")), file=sys.stderr)
 
 
 def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
@@ -326,10 +389,12 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     agent_root = Path(service.binary_path).parent
     state_root = Path(service.state_path)
     agent_root.mkdir(parents=True)
-    marker = agent_root / _MARKER_FILENAME
-    marker.write_text(ownership_token, encoding="utf-8")
+    runtime_marker = agent_root / _MARKER_FILENAME
+    runtime_marker.write_text(ownership_token, encoding="utf-8")
     state_root.mkdir(parents=True)
     workspace_root.mkdir(parents=True)
+    workspace_marker = workspace_root / _WORKSPACE_MARKER_FILENAME
+    workspace_marker.write_text(ownership_token, encoding="utf-8")
 
     target_executable = Path(service.binary_path)
     shutil.copy2(source_executable, target_executable)
@@ -453,9 +518,22 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
             "full_bridge_command_flow_proven": False,
             "hyperv_guest_proven": False,
         }
-    finally:
-        _cleanup_owned_paths(service, ownership_token=ownership_token)
+    except BaseException as exc:
+        _print_failure_evidence(service.service_name, exc)
+        try:
+            _cleanup_owned_paths(service, ownership_token=ownership_token)
+        except Exception as cleanup_exc:
+            print(
+                json.dumps(
+                    {"cleanup_failure": type(cleanup_exc).__name__},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                file=sys.stderr,
+            )
+        raise
 
+    _cleanup_owned_paths(service, ownership_token=ownership_token)
     result["cleanup_verified"] = True
     _write_result(result_path, result)
     return result
