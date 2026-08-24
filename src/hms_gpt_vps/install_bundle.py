@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .powershell import ps_literal, run_powershell_json
 from .windows_provisioner import WindowsVMConfig
+
+
+_INSTALL_BUNDLE_RESULT_KEYS = frozenset(
+    {
+        "changed",
+        "windows_iso_ready",
+        "answer_iso_ready",
+        "windows_iso_path",
+        "answer_iso_path",
+    }
+)
+
+
+def _same_windows_path(left: str, right: str) -> bool:
+    return str(PureWindowsPath(left)).casefold() == str(PureWindowsPath(right)).casefold()
 
 
 @dataclass(frozen=True)
@@ -14,8 +29,22 @@ class InstallBundleObservation:
     windows_iso_path: str | None = None
     answer_iso_path: str | None = None
 
+    def validate(self) -> None:
+        for name in ("windows_iso_ready", "answer_iso_ready"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"install bundle observation must be boolean: {name}")
+        for name in ("windows_iso_path", "answer_iso_path"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"install bundle observation {name} must be a string or null")
+        if self.windows_iso_ready is not (self.windows_iso_path is not None):
+            raise ValueError("Windows ISO readiness/path evidence is inconsistent")
+        if self.answer_iso_ready is not (self.answer_iso_path is not None):
+            raise ValueError("answer ISO readiness/path evidence is inconsistent")
+
     @property
     def ready(self) -> bool:
+        self.validate()
         return self.windows_iso_ready and self.answer_iso_ready
 
 
@@ -88,11 +117,11 @@ if ($null -eq $windowsDvd -or $null -eq $answerDvd) {{
 Set-VMFirmware -VMName $vmName -FirstBootDevice $windowsDvd
 
 [pscustomobject]@{{
-  changed = $changed
-  windows_iso_ready = $true
-  answer_iso_ready = $true
-  windows_iso_path = $windowsDvd.Path
-  answer_iso_path = $answerDvd.Path
+  changed = [bool]$changed
+  windows_iso_ready = [bool]$true
+  answer_iso_ready = [bool]$true
+  windows_iso_path = [string]$windowsDvd.Path
+  answer_iso_path = [string]$answerDvd.Path
 }}
 """.strip()
 
@@ -106,13 +135,28 @@ def reconcile_install_bundle(
         build_reconcile_install_bundle_script(config, windows_iso, answer_iso),
         timeout_seconds=90,
     )
-    return InstallBundleObservation(
-        windows_iso_ready=bool(payload.get("windows_iso_ready", False)),
-        answer_iso_ready=bool(payload.get("answer_iso_ready", False)),
-        windows_iso_path=str(payload["windows_iso_path"])
-        if payload.get("windows_iso_path")
-        else None,
-        answer_iso_path=str(payload["answer_iso_path"])
-        if payload.get("answer_iso_path")
-        else None,
+    if set(payload) != _INSTALL_BUNDLE_RESULT_KEYS:
+        raise RuntimeError("install bundle reconcile result schema is invalid")
+    for key in ("changed", "windows_iso_ready", "answer_iso_ready"):
+        if not isinstance(payload[key], bool):
+            raise RuntimeError(f"install bundle reconcile {key} must be boolean")
+    for key in ("windows_iso_path", "answer_iso_path"):
+        value = payload[key]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"install bundle reconcile {key} must be a non-empty string")
+
+    if payload["windows_iso_ready"] is not True or payload["answer_iso_ready"] is not True:
+        raise RuntimeError("install bundle reconcile did not prove both media attachments")
+    if not _same_windows_path(payload["windows_iso_path"], str(windows_iso)):
+        raise RuntimeError("install bundle reconcile Windows ISO path differs from authority")
+    if not _same_windows_path(payload["answer_iso_path"], str(answer_iso)):
+        raise RuntimeError("install bundle reconcile answer ISO path differs from authority")
+
+    result = InstallBundleObservation(
+        windows_iso_ready=payload["windows_iso_ready"],
+        answer_iso_ready=payload["answer_iso_ready"],
+        windows_iso_path=payload["windows_iso_path"],
+        answer_iso_path=payload["answer_iso_path"],
     )
+    result.validate()
+    return result
