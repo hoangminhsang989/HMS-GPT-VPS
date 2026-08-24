@@ -238,16 +238,16 @@ def _stop_service(service_name: str) -> None:
 $service = Get-Service -Name {name} -ErrorAction Stop
 try {{
   if ($service.Status -ne 'Stopped') {{
-    Stop-Service -Name {name} -ErrorAction Stop
-    $service.WaitForStatus(
+    $null = Stop-Service -Name {name} -ErrorAction Stop -WarningAction SilentlyContinue
+    $null = $service.WaitForStatus(
       [System.ServiceProcess.ServiceControllerStatus]::Stopped,
       [TimeSpan]::FromSeconds(30)
     )
   }}
-  $service.Refresh()
+  $null = $service.Refresh()
   $stopped = $service.Status -eq 'Stopped'
 }} finally {{
-  $service.Dispose()
+  $null = $service.Dispose()
 }}
 [pscustomobject]@{{ stopped = [bool]$stopped }}
 """.strip(),
@@ -264,16 +264,16 @@ def _start_service(service_name: str) -> None:
 $service = Get-Service -Name {name} -ErrorAction Stop
 try {{
   if ($service.Status -ne 'Running') {{
-    Start-Service -Name {name} -ErrorAction Stop
-    $service.WaitForStatus(
+    $null = Start-Service -Name {name} -ErrorAction Stop -WarningAction SilentlyContinue
+    $null = $service.WaitForStatus(
       [System.ServiceProcess.ServiceControllerStatus]::Running,
       [TimeSpan]::FromSeconds(30)
     )
   }}
-  $service.Refresh()
+  $null = $service.Refresh()
   $running = $service.Status -eq 'Running'
 }} finally {{
-  $service.Dispose()
+  $null = $service.Dispose()
 }}
 [pscustomobject]@{{ running = [bool]$running }}
 """.strip(),
@@ -292,14 +292,14 @@ $service = Get-Service -Name {name} -ErrorAction SilentlyContinue
 if ($null -ne $service) {{
   try {{
     if ($service.Status -ne 'Stopped') {{
-      Stop-Service -Name {name} -ErrorAction Stop
-      $service.WaitForStatus(
+      $null = Stop-Service -Name {name} -ErrorAction Stop -WarningAction SilentlyContinue
+      $null = $service.WaitForStatus(
         [System.ServiceProcess.ServiceControllerStatus]::Stopped,
         [TimeSpan]::FromSeconds(30)
       )
     }}
   }} finally {{
-    $service.Dispose()
+    $null = $service.Dispose()
     $service = $null
   }}
   & sc.exe delete {name} | Out-Null
