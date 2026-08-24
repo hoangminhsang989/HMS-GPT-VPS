@@ -59,11 +59,29 @@ def test_provision_observation_rejects_truthy_non_boolean_fields(field: str) -> 
         observation.validate()
 
 
-def test_provision_observation_rejects_invalid_vm_id_shape() -> None:
+@pytest.mark.parametrize(
+    "vm_id",
+    [
+        "",
+        "vm-id",
+        "11111111-2222-3333-4444-55555555555Z",
+        "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+    ],
+)
+def test_provision_observation_rejects_invalid_vm_id_shape(vm_id: str) -> None:
     with pytest.raises(ValueError, match="vm_id"):
-        ProvisionObservation(vm_id="").validate()
+        ProvisionObservation(vm_id=vm_id).validate()
+
+
+def test_provision_observation_rejects_non_string_vm_id() -> None:
     with pytest.raises(ValueError, match="vm_id"):
         ProvisionObservation(vm_id=True).validate()  # type: ignore[arg-type]
+
+
+def test_provision_observation_accepts_canonical_vm_id() -> None:
+    ProvisionObservation(
+        vm_id="11111111-2222-3333-4444-555555555555"
+    ).validate()
 
 
 @pytest.mark.parametrize(
