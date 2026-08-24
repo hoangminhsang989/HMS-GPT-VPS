@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hms_gpt_vps.agent_device_credential_store import GUEST_PROTECTION_SCOPE
 from hms_gpt_vps.agent_health_contract import (
     DEFAULT_REQUIRED_CAPABILITIES,
     AgentHealthDocument,
@@ -22,9 +23,13 @@ from hms_gpt_vps.provisioning import ProvisionObservation
 
 VM_ID = "11111111-2222-3333-4444-555555555555"
 OTHER_VM_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+INSTANCE_ID = "hms-01"
+DEVICE_ID = "device-01"
 
 
 class FakeBaseProof:
+    instance_id = INSTANCE_ID
+    device_id = DEVICE_ID
     vm_id = VM_ID
     hyperv_guest_proven = True
     health_boot_id = "boot-01"
@@ -40,6 +45,8 @@ class FakeBaseProof:
     def to_dict(self) -> dict[str, object]:
         return {
             "qualification": "managed_hyperv_guest_agent",
+            "instance_id": self.instance_id,
+            "device_id": self.device_id,
             "hyperv_guest_proven": True,
             "full_bridge_command_flow_proven": False,
             "bootstrap_retired": False,
@@ -58,7 +65,7 @@ def health_document(*, boot_id: str = "boot-01") -> AgentHealthDocument:
     return AgentHealthDocument(
         schema_version=1,
         status="ok",
-        instance_id="hms-01",
+        instance_id=INSTANCE_ID,
         agent_version="0.1.0",
         workspace_root=r"C:\HMS-Workspace",
         capabilities=tuple(sorted(DEFAULT_REQUIRED_CAPABILITIES)),
@@ -92,7 +99,7 @@ def runtime(
     boot_id: str = "boot-01",
     evidence: dict[str, object] | None = None,
 ):  # type: ignore[no-untyped-def]
-    observed = list(vm_ids or [VM_ID, VM_ID, VM_ID])
+    observed = list(vm_ids or [VM_ID, VM_ID, VM_ID, VM_ID])
     last = observed[-1]
 
     def assert_vm_identity() -> str:
@@ -134,6 +141,10 @@ def credential() -> PowerShellDirectCredential:
     return PowerShellDirectCredential("hmsbootstrap", "temporary-secret")
 
 
+def expected_device():  # type: ignore[no-untyped-def]
+    return SimpleNamespace(instance_id=INSTANCE_ID, device_id=DEVICE_ID)
+
+
 def valid_strict_payload() -> dict[str, object]:
     return {
         "strict_publication_schema_version": (
@@ -141,6 +152,7 @@ def valid_strict_payload() -> dict[str, object]:
         ),
         "hyperv_guest_proven": True,
         "os_listener_proven": True,
+        "device_enrollment_reproven_at_publication": True,
         "full_bridge_command_flow_proven": False,
         "bootstrap_retired": False,
         "pairing_ready": False,
@@ -158,6 +170,16 @@ def install_base_mock(monkeypatch: pytest.MonkeyPatch) -> None:
         "qualify_managed_hyperv_agent",
         lambda *_args, **_kwargs: FakeBaseProof(),
     )
+    monkeypatch.setattr(
+        strict_module,
+        "probe_agent_device_enrollment_by_id",
+        lambda *_args, **_kwargs: {
+            "enrollment_ready": True,
+            "instance_id": INSTANCE_ID,
+            "device_id": DEVICE_ID,
+            "protection_scope": GUEST_PROTECTION_SCOPE,
+        },
+    )
 
 
 def listener(process_id: int = 4321) -> dict[str, object]:
@@ -172,7 +194,16 @@ def listener(process_id: int = 4321) -> dict[str, object]:
     }
 
 
-def test_strict_qualification_brackets_fresh_health_with_same_listener_pid(
+def qualify(runtime_value):  # type: ignore[no-untyped-def]
+    return qualify_managed_hyperv_agent_strict(
+        runtime_value,
+        SimpleNamespace(),  # type: ignore[arg-type]
+        credential(),
+        expected_device(),  # type: ignore[arg-type]
+    )
+
+
+def test_strict_qualification_brackets_fresh_health_and_reproves_enrollment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_base_mock(monkeypatch)
@@ -189,17 +220,13 @@ def test_strict_qualification_brackets_fresh_health_with_same_listener_pid(
         probe,
     )
 
-    payload = qualify_managed_hyperv_agent_strict(
-        runtime(),
-        SimpleNamespace(),  # type: ignore[arg-type]
-        credential(),
-        SimpleNamespace(),  # type: ignore[arg-type]
-    )
+    payload = qualify(runtime())
 
     assert calls == [(VM_ID, "HMS-GPT-VPS-01", 8765)] * 2
     assert payload["strict_publication_schema_version"] == 1
     assert payload["hyperv_guest_proven"] is True
     assert payload["os_listener_proven"] is True
+    assert payload["device_enrollment_reproven_at_publication"] is True
     assert payload["health_listener_process_id"] == 4321
     assert payload["health_listener_count"] == 1
     assert payload["health_listener_addresses"] == ["127.0.0.1"]
@@ -221,12 +248,7 @@ def test_strict_qualification_reproves_vm_id_before_listener(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="before strict"):
-        qualify_managed_hyperv_agent_strict(
-            runtime([OTHER_VM_ID]),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime([OTHER_VM_ID]))
 
 
 def test_strict_qualification_reproves_vm_id_during_health(
@@ -240,12 +262,7 @@ def test_strict_qualification_reproves_vm_id_during_health(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="health observation"):
-        qualify_managed_hyperv_agent_strict(
-            runtime([VM_ID, OTHER_VM_ID]),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime([VM_ID, OTHER_VM_ID]))
 
 
 def test_strict_qualification_reproves_vm_id_after_listener(
@@ -259,12 +276,21 @@ def test_strict_qualification_reproves_vm_id_after_listener(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="during strict listener"):
-        qualify_managed_hyperv_agent_strict(
-            runtime([VM_ID, VM_ID, OTHER_VM_ID]),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime([VM_ID, VM_ID, OTHER_VM_ID]))
+
+
+def test_strict_qualification_reproves_vm_id_after_enrollment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        lambda *_args, **_kwargs: listener(),
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="enrollment proof"):
+        qualify(runtime([VM_ID, VM_ID, VM_ID, OTHER_VM_ID]))
 
 
 def test_strict_qualification_rejects_service_pid_change(
@@ -279,12 +305,7 @@ def test_strict_qualification_rejects_service_pid_change(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="service process changed"):
-        qualify_managed_hyperv_agent_strict(
-            runtime(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime())
 
 
 def test_strict_qualification_rejects_service_boot_change(
@@ -298,12 +319,7 @@ def test_strict_qualification_rejects_service_boot_change(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="service incarnation"):
-        qualify_managed_hyperv_agent_strict(
-            runtime(boot_id="boot-02"),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime(boot_id="boot-02"))
 
 
 def test_strict_qualification_rejects_package_evidence_change(
@@ -317,12 +333,31 @@ def test_strict_qualification_rejects_package_evidence_change(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="package_file_count"):
-        qualify_managed_hyperv_agent_strict(
-            runtime(evidence=service_evidence(package_file_count=3)),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime(evidence=service_evidence(package_file_count=3)))
+
+
+def test_strict_qualification_rejects_publication_enrollment_identity_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        lambda *_args, **_kwargs: listener(),
+    )
+    monkeypatch.setattr(
+        strict_module,
+        "probe_agent_device_enrollment_by_id",
+        lambda *_args, **_kwargs: {
+            "enrollment_ready": True,
+            "instance_id": INSTANCE_ID,
+            "device_id": "wrong-device",
+            "protection_scope": GUEST_PROTECTION_SCOPE,
+        },
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="identity changed"):
+        qualify(runtime())
 
 
 def test_strict_qualification_refuses_incomplete_listener_proof(
@@ -339,12 +374,7 @@ def test_strict_qualification_refuses_incomplete_listener_proof(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="incomplete"):
-        qualify_managed_hyperv_agent_strict(
-            runtime(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime())
 
 
 def test_strict_qualification_refuses_listener_vm_id_mismatch(
@@ -361,12 +391,7 @@ def test_strict_qualification_refuses_listener_vm_id_mismatch(
     )
 
     with pytest.raises(StrictManagedHyperVAgentQualificationError, match="wrong VMId"):
-        qualify_managed_hyperv_agent_strict(
-            runtime(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-            credential(),
-            SimpleNamespace(),  # type: ignore[arg-type]
-        )
+        qualify(runtime())
 
 
 @pytest.mark.parametrize(
@@ -375,6 +400,7 @@ def test_strict_qualification_refuses_listener_vm_id_mismatch(
         ("strict_publication_schema_version", 2, "schema mismatch"),
         ("hyperv_guest_proven", False, "guest path"),
         ("os_listener_proven", False, "OS listener"),
+        ("device_enrollment_reproven_at_publication", False, "device enrollment"),
         ("full_bridge_command_flow_proven", True, "forbidden"),
         ("bootstrap_retired", True, "forbidden"),
         ("pairing_ready", True, "forbidden"),
