@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -57,6 +58,23 @@ def test_existing_proof_path_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must be absent"):
         runner._new_proof_path(str(proof))
+
+
+def test_production_proof_writer_is_create_only(tmp_path: Path) -> None:
+    runner = load_runner()
+    proof = tmp_path / "proof.json"
+    payload = {
+        "qualification": "managed_hyperv_guest_agent",
+        "hyperv_guest_proven": True,
+        "full_bridge_command_flow_proven": False,
+    }
+
+    runner._write_proof_create_only(proof, payload)
+    assert json.loads(proof.read_text(encoding="utf-8")) == payload
+
+    with pytest.raises(ValueError, match="must be absent"):
+        runner._write_proof_create_only(proof, {"replacement": True})
+    assert json.loads(proof.read_text(encoding="utf-8")) == payload
 
 
 def test_authority_file_rejects_symlinked_parent(tmp_path: Path) -> None:
