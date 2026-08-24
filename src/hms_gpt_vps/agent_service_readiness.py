@@ -68,7 +68,8 @@ $expectedHash = {expected_hash}
 $expectedRuntimeConfigHash = {expected_runtime_config_hash}
 $packageManifestPayload = {package_manifest_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
-$expectedCommand = '"' + $binaryPath + '" service'
+$expectedQuotedCommand = '"' + $binaryPath + '" service'
+$expectedUnquotedCommand = $binaryPath + ' service'
 
 {POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION}
 
@@ -81,7 +82,10 @@ $commandOk = $false
 if ($serviceExists) {{
   $cim = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
   $startNameOk = $cim.StartName -eq 'NT AUTHORITY\\LocalService'
-  $commandOk = $cim.PathName -eq $expectedCommand
+  $commandOk = [bool](
+    $cim.PathName -eq $expectedQuotedCommand -or
+    (($binaryPath -notmatch '\\s') -and $cim.PathName -eq $expectedUnquotedCommand)
+  )
 }}
 
 $agentRootLayoutOk = (
@@ -187,30 +191,6 @@ $serviceReady = [bool](
   $workspaceModify -and
   $stateModify
 )
-
-if (-not $serviceReady) {{
-  $failedChecks = @()
-  $readinessChecks = [ordered]@{{
-    service_exists = [bool]$serviceExists
-    service_running = [bool]$serviceRunning
-    local_service_account = [bool]$startNameOk
-    binary_command_ok = [bool]$commandOk
-    agent_root_layout_ok = [bool]$agentRootLayoutOk
-    package_tree_ok = [bool]$packageTreeOk
-    binary_sha256_ok = [bool]$binaryHashOk
-    runtime_config_exists = [bool]$runtimeConfigExists
-    runtime_config_sha256_ok = [bool]$runtimeConfigHashOk
-    service_sid_unrestricted = [bool]$sidTypeOk
-    agent_root_read_execute = [bool]$agentRootReadExecute
-    runtime_config_read = [bool]$runtimeConfigRead
-    workspace_modify = [bool]$workspaceModify
-    state_modify = [bool]$stateModify
-  }}
-  foreach ($entry in $readinessChecks.GetEnumerator()) {{
-    if (-not [bool]$entry.Value) {{ $failedChecks += [string]$entry.Key }}
-  }}
-  throw ('HMS Agent readiness false checks: ' + ($failedChecks -join ','))
-}}
 
 [pscustomobject]@{{
   service_ready = $serviceReady

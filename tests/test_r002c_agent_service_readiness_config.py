@@ -79,6 +79,21 @@ def test_service_readiness_requires_exact_package_runtime_config_hash_and_acl() 
     assert "$runtimeConfigRead" in service_ready_block
 
 
+def test_service_readiness_accepts_only_safe_scm_command_canonicalizations() -> None:
+    script = build_agent_service_readiness_script(
+        AgentServiceConfig(),
+        package_manifest=package_manifest(),
+        runtime_config=runtime_config(),
+    )
+
+    assert "$expectedQuotedCommand = '\"' + $binaryPath + '\" service'" in script
+    assert "$expectedUnquotedCommand = $binaryPath + ' service'" in script
+    assert "$cim.PathName -eq $expectedQuotedCommand" in script
+    assert "$binaryPath -notmatch '\\s'" in script
+    assert "$cim.PathName -eq $expectedUnquotedCommand" in script
+    assert "readiness false checks" not in script
+
+
 def test_service_readiness_rejects_runtime_acl_target_mismatch() -> None:
     bad = AgentServiceRuntimeConfig(
         schema_version=AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
