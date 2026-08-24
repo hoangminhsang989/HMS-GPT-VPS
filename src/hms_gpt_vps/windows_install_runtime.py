@@ -29,7 +29,7 @@ class WindowsInstallRuntimeConfig:
     answer_iso_sha256: str
 
     def validate(self) -> None:
-        if not self.instance_id.strip():
+        if not isinstance(self.instance_id, str) or not self.instance_id.strip():
             raise ValueError("instance_id is required")
         self.vm.validate()
         self.network.validate()
@@ -38,9 +38,9 @@ class WindowsInstallRuntimeConfig:
             raise ValueError("VM switch must match managed Hyper-V network switch")
         if self.answer_iso.suffix.lower() != ".iso":
             raise ValueError("answer media must be an ISO file")
-        if not self.answer_iso.exists():
+        if not self.answer_iso.is_file():
             raise FileNotFoundError(self.answer_iso)
-        if len(self.answer_iso_sha256) != 64:
+        if not isinstance(self.answer_iso_sha256, str) or len(self.answer_iso_sha256) != 64:
             raise ValueError("answer_iso_sha256 must contain 64 hex characters")
         try:
             int(self.answer_iso_sha256, 16)
@@ -114,9 +114,9 @@ class WindowsInstallRuntime:
                 expected_vm_id=self._expected_vm_id(),
             )
             vm_id_raw = result.get("vm_id")
-            if not vm_id_raw:
+            if not isinstance(vm_id_raw, str) or not vm_id_raw:
                 raise WindowsInstallPostconditionError("Hyper-V reconcile returned no VMId")
-            vm_id = str(vm_id_raw)
+            vm_id = vm_id_raw
             self.registry.upsert(
                 VMRecord(
                     instance_id=self.config.instance_id,
@@ -161,6 +161,8 @@ class WindowsInstallRuntime:
                 self.config.vm,
                 self.config.windows_image.source,
                 self.config.answer_iso,
+                expected_windows_sha256=self.config.windows_image.sha256,
+                expected_answer_sha256=self.config.answer_iso_sha256,
             )
             after = self.observe()
             if not after.hyperv.vm_running:
