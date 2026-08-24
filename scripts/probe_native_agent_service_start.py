@@ -82,15 +82,7 @@ def _print_scm_event_tail() -> None:
         "EventID=7024 or EventID=7031 or EventID=7034)]]"
     )
     completed = subprocess.run(
-        [
-            "wevtutil.exe",
-            "qe",
-            "System",
-            f"/q:{query}",
-            "/c:8",
-            "/rd:true",
-            "/f:text",
-        ],
+        ["wevtutil.exe", "qe", "System", f"/q:{query}", "/c:8", "/rd:true", "/f:text"],
         text=True,
         capture_output=True,
         check=False,
@@ -146,7 +138,7 @@ def _cleanup(service: AgentServiceConfig, runtime_token: str, workspace_token: s
         _wait_service_absent(service.service_name)
 
     runtime_root = Path(service.runtime_path)
-    runtime_marker = Path(service.binary_path).parent / RUNTIME_MARKER
+    runtime_marker = runtime_root / RUNTIME_MARKER
     if runtime_root.exists():
         if not runtime_marker.is_file() or runtime_marker.read_text(encoding="utf-8") != runtime_token:
             raise PermissionError("refusing to remove unowned start-probe runtime")
@@ -162,7 +154,7 @@ def _cleanup(service: AgentServiceConfig, runtime_token: str, workspace_token: s
 
 def main() -> int:
     _require_ci_admin()
-    package_dir = Path(sys.argv[1]).resolve(strict=True)
+    artifact_root = Path(sys.argv[1]).resolve(strict=True)
     service = AgentServiceConfig()
     service.validate()
 
@@ -171,22 +163,30 @@ def main() -> int:
     if Path(service.runtime_path).exists() or Path(service.workspace_path).exists():
         raise RuntimeError("managed HMS paths already exist before service-start probe")
 
-    executable = (package_dir / "hms-agent.exe").resolve(strict=True)
-    manifest = load_agent_package_manifest((package_dir / "hms-agent.manifest.json").resolve(strict=True))
-    verify_agent_package(executable, manifest)
-    require_windows_amd64_pe(executable)
+    source_package = (artifact_root / "hms-agent").resolve(strict=True)
+    manifest = load_agent_package_manifest(
+        (artifact_root / "hms-agent.manifest.json").resolve(strict=True)
+    )
+    verify_agent_package(source_package, manifest)
+    source_entrypoint = (source_package / manifest.entrypoint).resolve(strict=True)
+    require_windows_amd64_pe(source_entrypoint)
 
     runtime_token = secrets.token_hex(24)
     workspace_token = secrets.token_hex(24)
-    agent_root = Path(service.binary_path).parent
+    runtime_root = Path(service.runtime_path)
+    agent_root = Path(service.agent_root_path)
+    target_package = Path(service.package_path)
     state_root = Path(service.state_path)
     workspace_root = Path(service.workspace_path)
+    runtime_root.mkdir(parents=True)
+    (runtime_root / RUNTIME_MARKER).write_text(runtime_token, encoding="utf-8")
     agent_root.mkdir(parents=True)
     state_root.mkdir(parents=True)
     workspace_root.mkdir(parents=True)
-    (agent_root / RUNTIME_MARKER).write_text(runtime_token, encoding="utf-8")
     (workspace_root / WORKSPACE_MARKER).write_text(workspace_token, encoding="utf-8")
-    shutil.copy2(executable, Path(service.binary_path))
+    shutil.copytree(source_package, target_package)
+    verify_agent_package(target_package, manifest)
+    require_windows_amd64_pe(Path(service.binary_path))
 
     GuestAgentDeviceCredentialStore(guest_device_credential_path(state_root)).save_create_only(
         AgentDeviceCredential(
@@ -218,7 +218,7 @@ def main() -> int:
             install = run_powershell_json(
                 build_agent_service_install_script(
                     service,
-                    expected_sha256=manifest.sha256,
+                    package_manifest=manifest,
                     runtime_config=runtime,
                 ),
                 timeout_seconds=180,
@@ -228,6 +228,10 @@ def main() -> int:
             raise
 
         ready = bool(install.get("ready", False))
+        if int(install.get("package_file_count", 0)) != manifest.file_count:
+            raise RuntimeError("installer package file-count proof mismatch")
+        if int(install.get("package_total_size", 0)) != manifest.total_size:
+            raise RuntimeError("installer package size proof mismatch")
         print(
             json.dumps(
                 {
@@ -235,6 +239,9 @@ def main() -> int:
                     "installer_status": str(install.get("status", "")),
                     "installer_start_name": str(install.get("start_name", "")),
                     "installer_sid_type": str(install.get("service_sid_type", "")),
+                    "package_schema": 2,
+                    "package_file_count": manifest.file_count,
+                    "package_total_size": manifest.total_size,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
