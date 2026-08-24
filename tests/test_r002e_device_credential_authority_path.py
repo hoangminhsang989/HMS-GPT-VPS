@@ -11,6 +11,7 @@ from hms_gpt_vps.agent_device_credential_store import (
     BridgeAgentDeviceCredentialStore,
 )
 from hms_gpt_vps.agent_transport_protocol import AgentDeviceCredential
+from hms_gpt_vps import agent_device_credential_store as credential_store_module
 
 
 CREDENTIAL = AgentDeviceCredential(
@@ -87,6 +88,43 @@ def test_bridge_credential_store_refuses_write_through_redirected_parent(
     ):
         store.save_create_only(CREDENTIAL)
     assert not (redirected / "device.dpapi").exists()
+
+
+def test_bridge_credential_store_rejects_target_substitution_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "device.dpapi"
+    store = BridgeAgentDeviceCredentialStore(
+        path,
+        protector=_protect,
+        unprotector=_unprotect,
+    )
+    store.save_create_only(CREDENTIAL)
+    original_bytes = path.read_bytes()
+    displaced = tmp_path / "device-opened.dpapi"
+    original_open = credential_store_module.os.open
+    mutated = False
+
+    def racing_open(target, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal mutated
+        fd = original_open(target, flags, *args, **kwargs)
+        if not mutated:
+            mutated = True
+            Path(target).replace(displaced)
+            Path(target).write_bytes(original_bytes)
+        return fd
+
+    monkeypatch.setattr(credential_store_module.os, "open", racing_open)
+
+    with pytest.raises(
+        AgentDeviceCredentialIntegrityError,
+        match="authority changed during open",
+    ):
+        store.load(expected_instance_id="hms-01")
+
+    assert path.exists()
+    assert displaced.exists()
 
 
 def test_device_credential_schema_rejects_boolean_true_as_version_one(
