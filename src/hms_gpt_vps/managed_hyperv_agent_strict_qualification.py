@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from .agent_device_credential_store import GUEST_PROTECTION_SCOPE
+from .agent_device_enrollment import AgentDeviceEnrollmentConfig
 from .agent_health_contract import AgentHealthDocument
 from .agent_transport_protocol import AgentDeviceCredential
 from .managed_guest_listener_probe import probe_managed_agent_health_listener_by_id
 from .managed_hyperv_agent_qualification import qualify_managed_hyperv_agent
+from .managed_vm_id_operations import probe_agent_device_enrollment_by_id
 from .powershell_direct import PowerShellDirectCredential
 from .provisioning import ProvisionContext
 
@@ -35,6 +38,10 @@ def validate_strict_managed_hyperv_proof_payload(
     if payload.get("os_listener_proven") is not True:
         raise StrictManagedHyperVAgentQualificationError(
             "strict managed Hyper-V proof did not prove the OS listener"
+        )
+    if payload.get("device_enrollment_reproven_at_publication") is not True:
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict managed Hyper-V proof did not re-prove device enrollment"
         )
     for key in (
         "full_bridge_command_flow_proven",
@@ -168,6 +175,43 @@ def _require_listener_matches(
         )
 
 
+def _reprove_device_enrollment(
+    vm_id: str,
+    agent_runtime: Any,
+    credential: PowerShellDirectCredential,
+    expected_device_credential: AgentDeviceCredential,
+    base_proof: Any,
+) -> None:
+    config = AgentDeviceEnrollmentConfig(
+        instance_id=expected_device_credential.instance_id,
+        guest_state_path=agent_runtime.config.service.state_path,
+        service_name=agent_runtime.config.service.service_name,
+    )
+    evidence = probe_agent_device_enrollment_by_id(
+        vm_id,
+        agent_runtime.config.vm_name,
+        credential,
+        config,
+        expected_device_credential,
+    )
+    if evidence.get("enrollment_ready") is not True:
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication device enrollment is not ready"
+        )
+    if evidence.get("instance_id") != base_proof.instance_id:
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication device enrollment instance changed"
+        )
+    if evidence.get("device_id") != base_proof.device_id:
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication device enrollment identity changed"
+        )
+    if evidence.get("protection_scope") != GUEST_PROTECTION_SCOPE:
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication device enrollment is not LocalMachine-DPAPI protected"
+        )
+
+
 def qualify_managed_hyperv_agent_strict(
     reconcile_runtime: Any,
     context: ProvisionContext,
@@ -176,14 +220,13 @@ def qualify_managed_hyperv_agent_strict(
     *,
     max_reconcile_steps: int = 8,
 ) -> dict[str, object]:
-    """Build the publishable R002E proof with a freshness-bound OS listener gate.
+    """Build the publishable R002E proof with freshness-bound guest evidence.
 
     The base qualification pins package/SCM/health/enrollment evidence. The final
     publication gate brackets one fresh full Agent observation between two
     VMId-bound guest OS listener probes and requires the same live service PID,
-    VMId and health boot id throughout. This prevents publication from combining
-    health/package evidence from one service incarnation with socket evidence
-    from another.
+    VMId and health boot id throughout. It then re-proves the exact Bridge-bound
+    LocalMachine-DPAPI device credential before publication.
     """
 
     base_proof = qualify_managed_hyperv_agent(
@@ -241,6 +284,18 @@ def qualify_managed_hyperv_agent_strict(
         raise StrictManagedHyperVAgentQualificationError(
             "managed Hyper-V VMId changed during strict listener proof"
         )
+    _reprove_device_enrollment(
+        post_listener_vm_id,
+        agent_runtime,
+        credential,
+        expected_device_credential,
+        base_proof,
+    )
+    final_vm_id = agent_runtime._assert_vm_identity()
+    if final_vm_id != base_proof.vm_id:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V VMId changed during strict enrollment proof"
+        )
 
     payload = base_proof.to_dict()
     payload.update(
@@ -249,6 +304,7 @@ def qualify_managed_hyperv_agent_strict(
                 STRICT_MANAGED_HYPERV_PUBLICATION_SCHEMA_VERSION
             ),
             "os_listener_proven": True,
+            "device_enrollment_reproven_at_publication": True,
             "health_listener_process_id": listener_after["process_id"],
             "health_listener_count": listener_after["listener_count"],
             "health_listener_addresses": listener_after["local_addresses"],
