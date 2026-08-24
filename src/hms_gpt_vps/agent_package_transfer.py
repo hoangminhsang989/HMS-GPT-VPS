@@ -12,12 +12,18 @@ from .agent_package import (
     load_agent_package_manifest,
     verify_agent_package,
 )
+from .agent_package_manifest_artifact import (
+    AGENT_PACKAGE_MANIFEST_FILENAME,
+    canonical_agent_package_manifest_bytes,
+    canonical_agent_package_manifest_sha256,
+    canonical_agent_package_manifest_size,
+    managed_agent_package_manifest_path,
+)
 from .agent_package_powershell import POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION
 from .agent_service_install import AgentServiceConfig
 from .powershell import ps_literal, run_powershell_json
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
 from .powershell_sha256 import POWERSHELL_SHA256_FUNCTION
-from .windows_image import sha256_file
 
 
 _TRANSFER_ID_HEX_LENGTH = 32
@@ -25,7 +31,6 @@ _OWNERSHIP_TOKEN_HEX_LENGTH = 48
 _MAX_HOST_COPY_SCRIPT_BYTES = 24 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _STAGING_MARKER_NAME = ".hms-agent-package-transfer-owned"
-_MANIFEST_FILENAME = "hms-agent.manifest.json"
 
 
 def _validate_lower_hex(value: str, *, length: int, label: str) -> str:
@@ -110,7 +115,7 @@ class AgentPackageGuestLayout:
 
     @property
     def staging_manifest_path(self) -> str:
-        return str(PureWindowsPath(self.transfer_root) / _MANIFEST_FILENAME)
+        return str(PureWindowsPath(self.transfer_root) / AGENT_PACKAGE_MANIFEST_FILENAME)
 
     @property
     def ownership_marker_path(self) -> str:
@@ -118,7 +123,7 @@ class AgentPackageGuestLayout:
 
     @property
     def final_manifest_path(self) -> str:
-        return str(PureWindowsPath(self.agent_root) / _MANIFEST_FILENAME)
+        return managed_agent_package_manifest_path(self.agent_root)
 
 
 @dataclass(frozen=True)
@@ -165,8 +170,8 @@ class AgentPackageTransferPlan:
         )
         self.manifest.validate()
 
-        # Important: verify before resolving the root so a root symlink/reparse
-        # point cannot be canonicalized away before the package trust gate.
+        # Verify before resolving the root so a root symlink/reparse point cannot
+        # be canonicalized away before the package trust gate.
         verify_agent_package(self.source_root, self.manifest)
 
         if not self.manifest_source.is_file():
@@ -176,6 +181,8 @@ class AgentPackageTransferPlan:
         published = load_agent_package_manifest(self.manifest_source)
         if published != self.manifest:
             raise ValueError("Agent package manifest source differs from expected manifest")
+        if self.manifest_source.read_bytes() != canonical_agent_package_manifest_bytes(self.manifest):
+            raise ValueError("Agent package manifest source is not the canonical manifest artifact")
 
         source_root = self.source_root.resolve(strict=True)
         manifest_path = self.manifest_source.resolve(strict=True)
@@ -189,12 +196,12 @@ class AgentPackageTransferPlan:
     @property
     def manifest_sha256(self) -> str:
         self.validate()
-        return sha256_file(self.manifest_source).lower()
+        return canonical_agent_package_manifest_sha256(self.manifest)
 
     @property
     def manifest_size(self) -> int:
         self.validate()
-        return self.manifest_source.stat().st_size
+        return canonical_agent_package_manifest_size(self.manifest)
 
 
 def _copy_entries_payload(plan: AgentPackageTransferPlan) -> str:
@@ -367,6 +374,7 @@ try {{
 def build_publish_agent_package_script(plan: AgentPackageTransferPlan) -> str:
     """Verify staged bytes, publish only into an absent/exact final root, then reverify."""
     plan.validate()
+    runtime_root = ps_literal(plan.layout.runtime_root)
     transfer_root = ps_literal(plan.layout.transfer_root)
     staging_package = ps_literal(plan.layout.staging_package_root)
     staging_manifest = ps_literal(plan.layout.staging_manifest_path)
@@ -379,6 +387,7 @@ def build_publish_agent_package_script(plan: AgentPackageTransferPlan) -> str:
 
     return f"""
 $ErrorActionPreference = 'Stop'
+$runtimeRoot = {runtime_root}
 $transferRoot = {transfer_root}
 $stagingPackage = {staging_package}
 $stagingManifest = {staging_manifest}
@@ -425,16 +434,19 @@ if ((Get-HmsSha256 $stagingManifest) -ne $expectedManifestHash) {{
 $manifestPayload = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($stagingManifest))
 $stagedProof = Test-HmsAgentPackageTree $stagingPackage $manifestPayload
 
-if (-not (Test-Path -LiteralPath $agentRoot)) {{
-  [System.IO.Directory]::CreateDirectory($agentRoot) | Out-Null
+if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {{
+  throw 'HMS managed runtime root disappeared before package publication'
 }}
-$agentItem = Get-Item -LiteralPath $agentRoot -Force -ErrorAction Stop
-if (-not $agentItem.PSIsContainer) {{ throw 'HMS Agent root is not a directory' }}
-if (($agentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
-  throw 'HMS Agent root must not be a reparse point'
+$runtimeItem = Get-Item -LiteralPath $runtimeRoot -Force -ErrorAction Stop
+if (($runtimeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
+  throw 'HMS managed runtime root must not be a reparse point during package publication'
 }}
 
+$finalManifestExists = Test-Path -LiteralPath $finalManifest
 $finalManifestAlreadyPresent = Test-Path -LiteralPath $finalManifest -PathType Leaf
+if ($finalManifestExists -and -not $finalManifestAlreadyPresent) {{
+  throw 'Existing HMS Agent manifest target is not a file'
+}}
 if ($finalManifestAlreadyPresent) {{
   $finalManifestItem = Get-Item -LiteralPath $finalManifest -Force -ErrorAction Stop
   if (($finalManifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
@@ -443,6 +455,16 @@ if ($finalManifestAlreadyPresent) {{
   if ([int64]$finalManifestItem.Length -ne $expectedManifestSize -or (Get-HmsSha256 $finalManifest) -ne $expectedManifestHash) {{
     throw 'Existing HMS Agent manifest conflicts with staged package'
   }}
+}}
+
+$agentRootExists = Test-Path -LiteralPath $agentRoot
+if (-not $agentRootExists) {{
+  [System.IO.Directory]::CreateDirectory($agentRoot) | Out-Null
+}}
+$agentItem = Get-Item -LiteralPath $agentRoot -Force -ErrorAction Stop
+if (-not $agentItem.PSIsContainer) {{ throw 'HMS Agent root is not a directory' }}
+if (($agentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
+  throw 'HMS Agent root must not be a reparse point'
 }}
 
 $alreadyPublished = Test-Path -LiteralPath $finalPackage -PathType Container
@@ -457,13 +479,20 @@ if ($alreadyPublished) {{
 }}
 
 if (-not $finalManifestAlreadyPresent) {{
+  if (Test-Path -LiteralPath $finalManifest) {{
+    throw 'HMS Agent final manifest target changed during package publication'
+  }}
   Move-Item -LiteralPath $stagingManifest -Destination $finalManifest -ErrorAction Stop
 }}
 if (-not (Test-Path -LiteralPath $finalManifest -PathType Leaf)) {{
   throw 'HMS Agent final manifest publication failed'
 }}
-if ((Get-HmsSha256 $finalManifest) -ne $expectedManifestHash) {{
-  throw 'HMS Agent final manifest SHA-256 mismatch after publication'
+$finalManifestItem = Get-Item -LiteralPath $finalManifest -Force -ErrorAction Stop
+if (($finalManifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
+  throw 'HMS Agent final manifest became a reparse point after publication'
+}}
+if ([int64]$finalManifestItem.Length -ne $expectedManifestSize -or (Get-HmsSha256 $finalManifest) -ne $expectedManifestHash) {{
+  throw 'HMS Agent final manifest identity mismatch after publication'
 }}
 $finalProof = Test-HmsAgentPackageTree $finalPackage $manifestPayload
 if ([int]$finalProof.file_count -ne [int]$stagedProof.file_count -or [int64]$finalProof.total_size -ne [int64]$stagedProof.total_size -or [string]$finalProof.entrypoint_sha256 -ne [string]$stagedProof.entrypoint_sha256) {{
@@ -485,6 +514,7 @@ if (Test-Path -LiteralPath $transferRoot -PathType Container) {{
   file_count = [int]$finalProof.file_count
   total_size = [int64]$finalProof.total_size
   entrypoint_sha256 = [string]$finalProof.entrypoint_sha256
+  manifest_sha256 = $expectedManifestHash
   final_package_root = $finalPackage
   final_manifest_path = $finalManifest
   staging_removed = [bool](-not (Test-Path -LiteralPath $transferRoot))
@@ -535,6 +565,8 @@ def transfer_agent_package_to_guest(
         raise RuntimeError("HMS Agent final package size postcondition failed")
     if str(published.get("entrypoint_sha256", "")).lower() != plan.manifest.sha256.lower():
         raise RuntimeError("HMS Agent final package entrypoint postcondition failed")
+    if str(published.get("manifest_sha256", "")).lower() != plan.manifest_sha256:
+        raise RuntimeError("HMS Agent final manifest postcondition failed")
     if not bool(published.get("staging_removed", False)):
         raise RuntimeError("HMS Agent package staging cleanup postcondition failed")
 
@@ -547,6 +579,7 @@ def transfer_agent_package_to_guest(
         "file_count": plan.manifest.file_count,
         "total_size": plan.manifest.total_size,
         "entrypoint_sha256": plan.manifest.sha256.lower(),
+        "manifest_sha256": plan.manifest_sha256,
         "final_package_root": plan.layout.final_package_root,
         "final_manifest_path": plan.layout.final_manifest_path,
         "staging_removed": True,
