@@ -7,14 +7,29 @@ from .powershell import ps_literal, run_powershell_json
 from .windows_provisioner import WindowsVMConfig
 
 
+_INSTALL_BUNDLE_KEYS = frozenset(
+    {
+        "windows_iso_ready",
+        "answer_iso_ready",
+        "first_boot_is_windows_iso",
+    }
+)
+
+
 @dataclass(frozen=True)
 class InstallBundleState:
     windows_iso_ready: bool
     answer_iso_ready: bool
     first_boot_is_windows_iso: bool
 
+    def validate(self) -> None:
+        for name in _INSTALL_BUNDLE_KEYS:
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"install bundle readiness must be boolean: {name}")
+
     @property
     def ready(self) -> bool:
+        self.validate()
         return (
             self.windows_iso_ready
             and self.answer_iso_ready
@@ -69,8 +84,16 @@ def observe_install_bundle(
         build_observe_install_bundle_script(config, windows_iso, answer_iso),
         timeout_seconds=60,
     )
-    return InstallBundleState(
-        windows_iso_ready=bool(payload.get("windows_iso_ready", False)),
-        answer_iso_ready=bool(payload.get("answer_iso_ready", False)),
-        first_boot_is_windows_iso=bool(payload.get("first_boot_is_windows_iso", False)),
+    if set(payload) != _INSTALL_BUNDLE_KEYS:
+        raise RuntimeError("install bundle observation result schema is invalid")
+    for key in _INSTALL_BUNDLE_KEYS:
+        if not isinstance(payload[key], bool):
+            raise RuntimeError(f"install bundle observation {key} must be boolean")
+
+    result = InstallBundleState(
+        windows_iso_ready=payload["windows_iso_ready"],
+        answer_iso_ready=payload["answer_iso_ready"],
+        first_boot_is_windows_iso=payload["first_boot_is_windows_iso"],
     )
+    result.validate()
+    return result
