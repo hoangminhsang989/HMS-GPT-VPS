@@ -62,18 +62,39 @@ class ProvisioningOrchestrator:
     action, then persists BOOTSTRAP_RETIRED after the guest script verifies its
     own postconditions. If the process crashes in that narrow window, automatic
     credential reuse is prohibited and recovery waits for an external proof.
+
+    Every reconcile-driven durable advance is a compare-and-swap against the
+    exact state observed at the start of this call. Concurrent reconcilers may
+    observe stale state, but a stale writer cannot regress or skip over a newer
+    checkpoint.
     """
 
     def __init__(self, state_path: Path) -> None:
         self.store = ProvisionStateStore(state_path)
 
     def current(self, instance_id: str) -> ProvisionRecord:
-        record = self.store.load()
-        if record is None:
-            return self.store.transition(instance_id=instance_id, state=ProvisionState.IDLE)
-        if record.instance_id != instance_id:
-            raise ValueError("state file belongs to another instance")
-        return record
+        return self.store.initialize(instance_id=instance_id)
+
+    def _advance(
+        self,
+        record: ProvisionRecord,
+        *,
+        instance_id: str,
+        state: ProvisionState,
+        reason: str | None = None,
+        resume_state: ProvisionState | None = None,
+        last_error: str | None = None,
+        increment_attempt: bool = False,
+    ) -> ProvisionRecord:
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=record.state,
+            state=state,
+            reason=reason,
+            resume_state=resume_state,
+            last_error=last_error,
+            increment_attempt=increment_attempt,
+        )
 
     def reconcile(self, context: ProvisionContext) -> TransitionResult:
         record = self.current(context.instance_id)
@@ -83,7 +104,8 @@ class ProvisioningOrchestrator:
             return TransitionResult(record=record, action="NOOP")
 
         if record.state is ProvisionState.IDLE:
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.PREFLIGHT,
                 increment_attempt=True,
@@ -92,21 +114,24 @@ class ProvisioningOrchestrator:
 
         if record.state is ProvisionState.PREFLIGHT:
             if not context.host.is_windows:
-                failed = self.store.transition(
+                failed = self._advance(
+                    record,
                     instance_id=context.instance_id,
                     state=ProvisionState.FAILED,
                     last_error="Windows host required",
                 )
                 return TransitionResult(failed, "BLOCK_UNSUPPORTED_HOST")
             if not context.host.virtualization_firmware_enabled or not context.host.hyperv_available:
-                failed = self.store.transition(
+                failed = self._advance(
+                    record,
                     instance_id=context.instance_id,
                     state=ProvisionState.FAILED,
                     last_error="Hyper-V or firmware virtualization unavailable",
                 )
                 return TransitionResult(failed, "BLOCK_HYPERV_UNAVAILABLE")
             if not context.host.hyperv_enabled:
-                pending = self.store.transition(
+                pending = self._advance(
+                    record,
                     instance_id=context.instance_id,
                     state=ProvisionState.NEED_ELEVATION,
                     reason="enable_hyperv",
@@ -118,7 +143,8 @@ class ProvisioningOrchestrator:
                     requires_operator_approval=True,
                 )
             if context.host.restart_required:
-                pending = self.store.transition(
+                pending = self._advance(
+                    record,
                     instance_id=context.instance_id,
                     state=ProvisionState.REBOOT_PENDING,
                     reason="hyperv_restart_required",
@@ -126,7 +152,8 @@ class ProvisioningOrchestrator:
                 )
                 return TransitionResult(pending, "REQUEST_REBOOT", requires_reboot=True)
             if context.image is None:
-                waiting = self.store.transition(
+                waiting = self._advance(
+                    record,
                     instance_id=context.instance_id,
                     state=ProvisionState.PREFLIGHT,
                     reason="windows_image_required",
@@ -135,13 +162,15 @@ class ProvisioningOrchestrator:
             try:
                 context.image.validate()
             except (FileNotFoundError, ValueError) as exc:
-                failed = self.store.transition(
+                failed = self._advance(
+                    record,
                     instance_id=context.instance_id,
                     state=ProvisionState.FAILED,
                     last_error=f"Windows image validation failed: {exc}",
                 )
                 return TransitionResult(failed, "BLOCK_INVALID_WINDOWS_IMAGE")
-            ready = self.store.transition(
+            ready = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.IMAGE_READY,
                 reason=None,
@@ -161,7 +190,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.IMAGE_READY:
             if not observed.network_ready:
                 return TransitionResult(record, "ENSURE_INTERNAL_NAT_NETWORK")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.NETWORK_READY,
             )
@@ -170,7 +200,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.NETWORK_READY:
             if observed.vm_id is None:
                 return TransitionResult(record, "ENSURE_VM")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.VM_CREATED,
             )
@@ -179,7 +210,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.VM_CREATED:
             if not observed.install_media_ready:
                 return TransitionResult(record, "ATTACH_INSTALL_MEDIA")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.INSTALL_MEDIA_READY,
             )
@@ -188,7 +220,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.INSTALL_MEDIA_READY:
             if not observed.vm_running:
                 return TransitionResult(record, "START_UNATTENDED_INSTALL")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.OS_INSTALLING,
             )
@@ -197,7 +230,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.OS_INSTALLING:
             if not observed.guest_booted:
                 return TransitionResult(record, "WAIT_FOR_GUEST_HEARTBEAT")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.GUEST_BOOTED,
             )
@@ -206,7 +240,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.GUEST_BOOTED:
             if not observed.guest_bootstrap_ready:
                 return TransitionResult(record, "BOOTSTRAP_GUEST_WITH_POWERSHELL_DIRECT")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.GUEST_BOOTSTRAP,
             )
@@ -215,7 +250,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.GUEST_BOOTSTRAP:
             if not observed.agent_device_enrolled:
                 return TransitionResult(record, "ENROLL_AGENT_DEVICE")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.AGENT_INSTALLING,
                 reason="agent_device_enrollment_verified",
@@ -227,7 +263,8 @@ class ProvisioningOrchestrator:
                 return TransitionResult(record, "STAGE_HMS_AGENT_PACKAGE")
             if not observed.agent_service_ready:
                 return TransitionResult(record, "INSTALL_HMS_AGENT")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.AGENT_SERVICE_READY,
             )
@@ -236,7 +273,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.AGENT_SERVICE_READY:
             if not observed.agent_healthy:
                 return TransitionResult(record, "WAIT_FOR_AGENT_APPLICATION_HEALTH")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.AGENT_HEALTHY,
             )
@@ -248,9 +286,9 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.BOOTSTRAP_RETIRING:
             if not observed.bootstrap_retired:
                 return TransitionResult(record, "WAIT_FOR_BOOTSTRAP_RETIREMENT_PROOF")
-            next_record = self.store.transition_checked(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
-                expected_state=ProvisionState.BOOTSTRAP_RETIRING,
                 state=ProvisionState.BOOTSTRAP_RETIRED,
             )
             return TransitionResult(next_record, "BOOTSTRAP_RETIREMENT_VERIFIED")
@@ -258,9 +296,9 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.BOOTSTRAP_RETIRED:
             if not observed.answer_media_detached:
                 return TransitionResult(record, "DETACH_ANSWER_MEDIA")
-            next_record = self.store.transition_checked(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
-                expected_state=ProvisionState.BOOTSTRAP_RETIRED,
                 state=ProvisionState.ANSWER_MEDIA_DETACHED,
             )
             return TransitionResult(next_record, "ANSWER_MEDIA_DETACH_VERIFIED")
@@ -268,9 +306,9 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.ANSWER_MEDIA_DETACHED:
             if not observed.install_secrets_cleared:
                 return TransitionResult(record, "CLEAR_INSTALL_SECRETS")
-            next_record = self.store.transition_checked(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
-                expected_state=ProvisionState.ANSWER_MEDIA_DETACHED,
                 state=ProvisionState.INSTALL_SECRETS_CLEARED,
             )
             return TransitionResult(next_record, "INSTALL_SECRETS_CLEAR_VERIFIED")
@@ -278,7 +316,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.INSTALL_SECRETS_CLEARED:
             if not observed.pairing_ready:
                 return TransitionResult(record, "CREATE_ONE_TIME_PAIRING")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.PAIRING_PENDING,
             )
@@ -287,7 +326,8 @@ class ProvisioningOrchestrator:
         if record.state is ProvisionState.PAIRING_PENDING:
             if not observed.paired:
                 return TransitionResult(record, "WAIT_FOR_PAIRING")
-            next_record = self.store.transition(
+            next_record = self._advance(
+                record,
                 instance_id=context.instance_id,
                 state=ProvisionState.READY,
             )
