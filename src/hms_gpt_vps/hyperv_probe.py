@@ -8,6 +8,16 @@ from dataclasses import dataclass
 from .windows_provisioner import HyperVHostState
 
 
+_HYPERV_HOST_PROBE_KEYS = frozenset(
+    {
+        "hyperv_available",
+        "hyperv_enabled",
+        "virtualization_firmware_enabled",
+        "restart_required",
+    }
+)
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     state: HyperVHostState
@@ -23,7 +33,10 @@ def _run_powershell(script: str) -> dict[str, object]:
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "PowerShell probe failed")
-    data = json.loads(completed.stdout)
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Hyper-V probe returned invalid JSON") from exc
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected Hyper-V probe payload")
     return data
@@ -33,6 +46,7 @@ def probe_hyperv_host() -> ProbeResult:
     """Read Hyper-V readiness without changing host state."""
     if platform.system() != "Windows":
         state = HyperVHostState(False, False, False, False, False)
+        state.validate()
         return ProbeResult(state=state, raw={"platform": platform.system()})
 
     script = r'''
@@ -40,18 +54,25 @@ $feature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All
 $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
 $pending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
 [pscustomobject]@{
-  hyperv_available = ($null -ne $feature)
-  hyperv_enabled = ($null -ne $feature -and $feature.State -eq 'Enabled')
+  hyperv_available = [bool]($null -ne $feature)
+  hyperv_enabled = [bool]($null -ne $feature -and $feature.State -eq 'Enabled')
   virtualization_firmware_enabled = [bool]$cpu.VirtualizationFirmwareEnabled
   restart_required = [bool]$pending
 } | ConvertTo-Json -Compress
 '''
     raw = _run_powershell(script)
+    if set(raw) != _HYPERV_HOST_PROBE_KEYS:
+        raise RuntimeError("Hyper-V probe result schema is invalid")
+    for key in _HYPERV_HOST_PROBE_KEYS:
+        if not isinstance(raw[key], bool):
+            raise RuntimeError(f"Hyper-V probe {key} must be boolean")
+
     state = HyperVHostState(
         is_windows=True,
-        hyperv_available=bool(raw.get("hyperv_available")),
-        hyperv_enabled=bool(raw.get("hyperv_enabled")),
-        virtualization_firmware_enabled=bool(raw.get("virtualization_firmware_enabled")),
-        restart_required=bool(raw.get("restart_required")),
+        hyperv_available=raw["hyperv_available"],
+        hyperv_enabled=raw["hyperv_enabled"],
+        virtualization_firmware_enabled=raw["virtualization_firmware_enabled"],
+        restart_required=raw["restart_required"],
     )
+    state.validate()
     return ProbeResult(state=state, raw=raw)
