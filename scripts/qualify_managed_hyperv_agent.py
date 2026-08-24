@@ -80,7 +80,7 @@ def _new_proof_path(raw: str) -> Path:
 
 
 def _write_proof_create_only(path: Path, payload: dict[str, object]) -> None:
-    """Publish exactly one proof without ever replacing an existing path."""
+    """Publish exactly one proof without replacing or deleting an unowned path."""
 
     target = _new_proof_path(str(path))
     data = (
@@ -95,9 +95,11 @@ def _write_proof_create_only(path: Path, payload: dict[str, object]) -> None:
     ).encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd: int | None = None
+    created = False
     published = False
     try:
         fd = os.open(target, flags, 0o600)
+        created = True
         with os.fdopen(fd, "wb", closefd=True) as handle:
             fd = None
             handle.write(data)
@@ -107,7 +109,10 @@ def _write_proof_create_only(path: Path, payload: dict[str, object]) -> None:
     finally:
         if fd is not None:
             os.close(fd)
-        if not published:
+        # Destructive cleanup is allowed only for a target this invocation
+        # successfully created with O_EXCL. If another actor won the race, the
+        # open raises before `created` becomes true and their path is untouched.
+        if created and not published:
             target.unlink(missing_ok=True)
 
 
