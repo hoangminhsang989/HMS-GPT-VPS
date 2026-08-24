@@ -76,7 +76,7 @@ def finalization_config(tmp_path: Path, payload: bytes = b"answer-media") -> tup
 def test_orchestrator_separates_service_readiness_from_application_health(tmp_path: Path) -> None:
     state_path = tmp_path / "provision.json"
     store = ProvisionStateStore(state_path)
-    store.transition(instance_id="hms-01", state=ProvisionState.GUEST_BOOTSTRAP)
+    store.transition(instance_id="hms-01", state=ProvisionState.AGENT_INSTALLING)
     orchestrator = ProvisioningOrchestrator(state_path)
 
     result = orchestrator.reconcile(
