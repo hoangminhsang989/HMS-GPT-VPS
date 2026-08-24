@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,21 @@ def test_transfer_plan_rejects_manifest_inside_exact_package_tree(tmp_path: Path
         )
 
 
+def test_transfer_plan_rejects_semantically_equal_noncanonical_manifest(tmp_path: Path) -> None:
+    package, manifest_path, manifest = make_package(tmp_path)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical manifest artifact"):
+        AgentPackageTransferPlan.create(
+            package,
+            manifest_path,
+            manifest,
+            transfer_id=TRANSFER_ID,
+            ownership_token=OWNERSHIP_TOKEN,
+        )
+
+
 def test_prepare_script_never_deletes_and_creates_exact_ownership_marker(tmp_path: Path) -> None:
     plan = make_plan(tmp_path)
     script = build_prepare_agent_package_staging_script(plan)
@@ -123,15 +139,19 @@ def test_copy_script_uses_one_bounded_guest_service_interface_window(tmp_path: P
     assert plan.layout.final_package_root not in script
 
 
-def test_publish_script_verifies_staging_before_any_final_package_move(tmp_path: Path) -> None:
+def test_publish_script_verifies_all_conflicts_before_final_package_move(tmp_path: Path) -> None:
     plan = make_plan(tmp_path)
     script = build_publish_agent_package_script(plan)
 
     staged_verify = script.index("$stagedProof = Test-HmsAgentPackageTree")
+    runtime_recheck = script.index("HMS managed runtime root disappeared before package publication")
+    manifest_type_conflict = script.index("Existing HMS Agent manifest target is not a file")
+    manifest_identity_conflict = script.index("Existing HMS Agent manifest conflicts with staged package")
     final_move = script.index("Move-Item -LiteralPath $stagingPackage")
-    assert staged_verify < final_move
-    assert "Existing HMS Agent manifest conflicts with staged package" in script
-    assert script.index("Existing HMS Agent manifest conflicts") < final_move
+    assert staged_verify < runtime_recheck < final_move
+    assert manifest_type_conflict < final_move
+    assert manifest_identity_conflict < final_move
+    assert "$finalManifestExists = Test-Path -LiteralPath $finalManifest" in script
     assert "$alreadyPublished = Test-Path -LiteralPath $finalPackage -PathType Container" in script
     assert "$finalProof = Test-HmsAgentPackageTree $finalPackage $manifestPayload" in script
     assert "Existing HMS Agent package target is not a directory" in script
@@ -142,9 +162,7 @@ def test_publish_script_verifies_staging_before_any_final_package_move(tmp_path:
 
 
 def test_publish_guest_script_fits_powershell_direct_bootstrap_limit(tmp_path: Path) -> None:
-    # The manifest is copied as a separate staged file and read inside the guest;
-    # it is deliberately not embedded into this script, keeping the script under
-    # the existing 16 KiB PowerShell Direct bootstrap cap even as package contents grow.
+    # Manifest bytes are read inside the guest instead of embedded into this script.
     script = build_publish_agent_package_script(make_plan(tmp_path))
     assert len(script.encode("utf-8")) <= 16 * 1024
 
