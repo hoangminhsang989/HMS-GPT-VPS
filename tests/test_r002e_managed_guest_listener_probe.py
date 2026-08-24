@@ -19,6 +19,16 @@ def credential() -> PowerShellDirectCredential:
     return PowerShellDirectCredential("hmsbootstrap", "temporary-secret")
 
 
+def valid_listener_result() -> dict[str, object]:
+    return {
+        "service_name": "HMSAgent",
+        "process_id": 4321,
+        "health_port": 8765,
+        "listener_count": 1,
+        "local_addresses": ["127.0.0.1"],
+    }
+
+
 def test_listener_probe_is_vm_id_bound_and_uses_os_socket_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -31,13 +41,7 @@ def test_listener_probe_is_vm_id_bound_and_uses_os_socket_state(
             script=script,
             timeout_seconds=timeout_seconds,
         )
-        return {
-            "service_name": "HMSAgent",
-            "process_id": 4321,
-            "health_port": 8765,
-            "listener_count": 1,
-            "local_addresses": ["127.0.0.1"],
-        }
+        return valid_listener_result()
 
     monkeypatch.setattr(listener_module, "run_vm_powershell_json_by_id", run)
     proof = probe_managed_agent_health_listener_by_id(
@@ -81,16 +85,13 @@ def test_listener_probe_rejects_nonexclusive_socket_evidence(
     addresses: list[str],
     match: str,
 ) -> None:
+    result = valid_listener_result()
+    result["listener_count"] = listener_count
+    result["local_addresses"] = addresses
     monkeypatch.setattr(
         listener_module,
         "run_vm_powershell_json_by_id",
-        lambda *_args, **_kwargs: {
-            "service_name": "HMSAgent",
-            "process_id": 4321,
-            "health_port": 8765,
-            "listener_count": listener_count,
-            "local_addresses": addresses,
-        },
+        lambda *_args, **_kwargs: result,
     )
 
     with pytest.raises(ManagedGuestListenerProofError, match=match):
@@ -103,19 +104,57 @@ def test_listener_probe_rejects_nonexclusive_socket_evidence(
         )
 
 
-def test_listener_probe_rejects_invalid_service_pid(
+@pytest.mark.parametrize("addresses", ["127.0.0.1", [127001], [True], None])
+def test_listener_probe_rejects_coerced_address_shapes(
     monkeypatch: pytest.MonkeyPatch,
+    addresses: object,
 ) -> None:
+    result = valid_listener_result()
+    result["local_addresses"] = addresses
     monkeypatch.setattr(
         listener_module,
         "run_vm_powershell_json_by_id",
-        lambda *_args, **_kwargs: {
-            "service_name": "HMSAgent",
-            "process_id": 0,
-            "health_port": 8765,
-            "listener_count": 1,
-            "local_addresses": ["127.0.0.1"],
-        },
+        lambda *_args, **_kwargs: result,
+    )
+
+    with pytest.raises(ManagedGuestListenerProofError, match="invalid shape"):
+        probe_managed_agent_health_listener_by_id(
+            VM_ID,
+            VM_NAME,
+            credential(),
+            AgentServiceConfig(),
+            8765,
+        )
+
+
+def test_listener_probe_rejects_unknown_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = valid_listener_result()
+    result["unexpected"] = True
+    monkeypatch.setattr(
+        listener_module,
+        "run_vm_powershell_json_by_id",
+        lambda *_args, **_kwargs: result,
+    )
+
+    with pytest.raises(ManagedGuestListenerProofError, match="fields do not match schema"):
+        probe_managed_agent_health_listener_by_id(
+            VM_ID,
+            VM_NAME,
+            credential(),
+            AgentServiceConfig(),
+            8765,
+        )
+
+
+def test_listener_probe_rejects_invalid_service_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = valid_listener_result()
+    result["process_id"] = 0
+    monkeypatch.setattr(
+        listener_module,
+        "run_vm_powershell_json_by_id",
+        lambda *_args, **_kwargs: result,
     )
 
     with pytest.raises(ManagedGuestListenerProofError, match="process id"):
@@ -131,16 +170,12 @@ def test_listener_probe_rejects_invalid_service_pid(
 def test_listener_probe_rejects_boolean_health_port_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    result = valid_listener_result()
+    result["health_port"] = True
     monkeypatch.setattr(
         listener_module,
         "run_vm_powershell_json_by_id",
-        lambda *_args, **_kwargs: {
-            "service_name": "HMSAgent",
-            "process_id": 4321,
-            "health_port": True,
-            "listener_count": 1,
-            "local_addresses": ["127.0.0.1"],
-        },
+        lambda *_args, **_kwargs: result,
     )
 
     with pytest.raises(ManagedGuestListenerProofError, match="wrong health port"):
