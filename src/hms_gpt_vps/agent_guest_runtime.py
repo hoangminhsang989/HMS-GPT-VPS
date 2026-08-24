@@ -38,15 +38,53 @@ _AGENT_IDEMPOTENCY_FILENAME = "agent-idempotency.sqlite3"
 _AGENT_AUDIT_FILENAME = "agent-audit.jsonl"
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _require_trusted_tool(
+    raw: str,
+    *,
+    name: str,
+    mutable_roots: tuple[Path, ...],
+) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{name} is required")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise ValueError(f"{name} must be an absolute path")
+    if candidate.is_symlink():
+        raise PermissionError(f"{name} must not be a symbolic link")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{name} does not exist: {candidate}") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{name} is not a regular file: {resolved}")
+
+    for mutable_root in mutable_roots:
+        resolved_root = mutable_root.resolve(strict=True)
+        if _is_within(resolved, resolved_root):
+            raise PermissionError(
+                f"{name} must not be located inside Agent-writable managed roots"
+            )
+    return str(resolved)
+
+
 @dataclass(frozen=True)
 class AgentGuestRuntimeConfig:
     instance_id: str
     project_id: str
     bridge_origin: str
+    python_executable: str
+    git_executable: str
     workspace_root: Path = DEFAULT_AGENT_WORKSPACE
     state_root: Path = DEFAULT_AGENT_STATE
     health_port: int = 8765
-    python_executable: str = "python"
     agent_version: str = __version__
 
     def validate(self) -> None:
@@ -54,8 +92,14 @@ class AgentGuestRuntimeConfig:
             raise ValueError("instance_id is required")
         if not self.project_id.strip():
             raise ValueError("project_id is required")
-        if not self.python_executable.strip():
+        if not isinstance(self.python_executable, str) or not self.python_executable.strip():
             raise ValueError("python_executable is required")
+        if not Path(self.python_executable).is_absolute():
+            raise ValueError("python_executable must be an absolute path")
+        if not isinstance(self.git_executable, str) or not self.git_executable.strip():
+            raise ValueError("git_executable is required")
+        if not Path(self.git_executable).is_absolute():
+            raise ValueError("git_executable must be an absolute path")
         if not self.agent_version.strip():
             raise ValueError("agent_version is required")
         AgentHttpsClientConfig(self.bridge_origin).validate()
@@ -71,6 +115,21 @@ class AgentGuestRuntimeConfig:
             raise FileNotFoundError(
                 f"Agent state root does not exist: {self.state_root}"
             )
+
+        mutable_roots = (
+            self.workspace_root.resolve(strict=True),
+            self.state_root.resolve(strict=True),
+        )
+        _require_trusted_tool(
+            self.python_executable,
+            name="python_executable",
+            mutable_roots=mutable_roots,
+        )
+        _require_trusted_tool(
+            self.git_executable,
+            name="git_executable",
+            mutable_roots=mutable_roots,
+        )
 
 
 @dataclass(frozen=True)
@@ -126,7 +185,22 @@ class AgentGuestRuntime:
             instance_id=config.instance_id,
             workspace=workspace,
             audit_log=AuditLog(config.state_root / _AGENT_AUDIT_FILENAME),
-            python_executable=config.python_executable,
+            python_executable=_require_trusted_tool(
+                config.python_executable,
+                name="python_executable",
+                mutable_roots=(
+                    config.workspace_root.resolve(strict=True),
+                    config.state_root.resolve(strict=True),
+                ),
+            ),
+            git_executable=_require_trusted_tool(
+                config.git_executable,
+                name="git_executable",
+                mutable_roots=(
+                    config.workspace_root.resolve(strict=True),
+                    config.state_root.resolve(strict=True),
+                ),
+            ),
         )
         executor = AgentPolicyCommandExecutor(action_runtime)
 
