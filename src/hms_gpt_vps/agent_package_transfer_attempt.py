@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import uuid
 from .install_artifacts import TextSecretStore
 
 
-AGENT_PACKAGE_TRANSFER_ATTEMPT_SCHEMA_VERSION = 1
+AGENT_PACKAGE_TRANSFER_ATTEMPT_SCHEMA_VERSION = 2
 _TRANSFER_ID_HEX_LENGTH = 32
 _OWNERSHIP_TOKEN_HEX_LENGTH = 48
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
@@ -39,6 +40,11 @@ def _require_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} is required")
     return value
+
+
+def _ownership_token_sha256(token: str) -> str:
+    _require_hex(token, _OWNERSHIP_TOKEN_HEX_LENGTH, "ownership_token")
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
 def _path_chain_has_redirect(path: Path) -> bool:
@@ -104,6 +110,7 @@ class AgentPackageTransferAttempt:
             "transfer_id": self.transfer_id,
             "phase": self.phase.value,
             "guest_service_interface_was_enabled": self.guest_service_interface_was_enabled,
+            "ownership_token_sha256": _ownership_token_sha256(self.ownership_token),
         }
 
 
@@ -111,16 +118,18 @@ class AgentPackageTransferAttemptStore:
     """Crash-safe transfer metadata with destructive authority outside JSON.
 
     The ownership token that permits deletion of an interrupted guest staging
-    root is stored only through the injected protected secret store. The durable
-    JSON also captures the pre-transfer Hyper-V Guest Service Interface state so
-    a retry can restore the exact host baseline after a process interruption.
-    Missing/mismatching halves fail closed instead of generating replacement
-    authority for an existing transfer id.
+    root is stored only through the injected protected secret store. Metadata
+    contains only its SHA-256 so the two durable halves are cryptographically
+    bound without exposing the random 192-bit token. The JSON also captures the
+    pre-transfer Hyper-V Guest Service Interface state so a retry can restore
+    the exact host baseline after a process interruption. Missing/mismatching
+    halves fail closed instead of generating replacement authority for an
+    existing transfer id.
 
     Production callers also bind ``secret_path``. Both lexical authority paths
-    are then revalidated before every read/write/delete so a runtime directory
-    that is replaced by a symlink/junction after factory construction cannot
-    redirect transfer metadata or the destructive ownership token.
+    are revalidated before every read/write/delete so a runtime directory that
+    is replaced by a symlink/junction after factory construction cannot redirect
+    transfer metadata or the destructive ownership token.
     """
 
     def __init__(
@@ -141,7 +150,9 @@ class AgentPackageTransferAttemptStore:
             if self.secret_path == self.metadata_path:
                 raise ValueError("transfer metadata and ownership token paths must differ")
             if self.secret_path.parent != self.metadata_path.parent:
-                raise ValueError("transfer metadata and ownership token must share one authority directory")
+                raise ValueError(
+                    "transfer metadata and ownership token must share one authority directory"
+                )
 
     def _assert_safe_metadata_path(self) -> None:
         if _path_chain_has_redirect(self.metadata_path):
@@ -228,6 +239,7 @@ class AgentPackageTransferAttemptStore:
             "transfer_id",
             "phase",
             "guest_service_interface_was_enabled",
+            "ownership_token_sha256",
         }
         if set(raw) != required:
             raise ValueError("Agent package transfer attempt metadata fields are invalid")
@@ -239,18 +251,27 @@ class AgentPackageTransferAttemptStore:
         transfer_id = raw["transfer_id"]
         phase_raw = raw["phase"]
         baseline = raw["guest_service_interface_was_enabled"]
+        token_sha256 = raw["ownership_token_sha256"]
         if not isinstance(manifest_sha256, str) or not isinstance(transfer_id, str):
             raise ValueError("Agent package transfer hash/id metadata types are invalid")
         if not isinstance(phase_raw, str):
             raise ValueError("Agent package transfer phase metadata type is invalid")
         if baseline is not None and not isinstance(baseline, bool):
             raise ValueError("Guest Service Interface baseline metadata type is invalid")
+        if not isinstance(token_sha256, str):
+            raise ValueError("Agent package transfer token binding metadata type is invalid")
+        _require_hex(token_sha256, 64, "ownership_token_sha256")
+
         self._assert_safe_secret_path()
         try:
             token = self.secret_store.load_text()
         except FileNotFoundError as exc:
             raise ValueError("Agent package transfer ownership token is missing") from exc
         self._assert_safe_authority_paths()
+        actual_token_sha256 = _ownership_token_sha256(token)
+        if not secrets.compare_digest(actual_token_sha256, token_sha256):
+            raise ValueError("Agent package transfer ownership token does not match metadata")
+
         try:
             phase = AgentPackageTransferPhase(phase_raw)
         except ValueError as exc:
