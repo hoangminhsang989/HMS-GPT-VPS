@@ -7,6 +7,7 @@ import pytest
 
 from hms_gpt_vps.agent_package import (
     AGENT_PACKAGE_MANIFEST_SCHEMA_VERSION,
+    AGENT_PACKAGE_PLATFORM,
     WINDOWS_AMD64_MACHINE,
     AgentPackageManifest,
     build_agent_package_manifest,
@@ -28,10 +29,18 @@ def write_fake_pe(path: Path, *, machine: int = WINDOWS_AMD64_MACHINE) -> None:
     path.write_bytes(bytes(image))
 
 
-def test_manifest_round_trip_is_strict_and_reverifies_artifact(tmp_path: Path) -> None:
-    artifact = tmp_path / "hms-agent.exe"
-    artifact.write_bytes(b"manifest-round-trip")
-    manifest = build_agent_package_manifest(artifact, version="0.1.0")
+def make_package(tmp_path: Path) -> Path:
+    root = tmp_path / "hms-agent"
+    (root / "_internal").mkdir(parents=True)
+    write_fake_pe(root / "hms-agent.exe")
+    (root / "_internal" / "python313.dll").write_bytes(b"python-runtime")
+    (root / "_internal" / "module.pyd").write_bytes(b"extension-module")
+    return root
+
+
+def test_manifest_round_trip_is_strict_and_reverifies_complete_tree(tmp_path: Path) -> None:
+    package = make_package(tmp_path)
+    manifest = build_agent_package_manifest(package, version="0.1.0")
     target = tmp_path / "hms-agent.manifest.json"
 
     write_agent_package_manifest(target, manifest)
@@ -39,18 +48,24 @@ def test_manifest_round_trip_is_strict_and_reverifies_artifact(tmp_path: Path) -
 
     assert published == manifest
     assert published.to_dict()["schema_version"] == AGENT_PACKAGE_MANIFEST_SCHEMA_VERSION
-    verify_agent_package(artifact, published)
+    assert published.platform == AGENT_PACKAGE_PLATFORM
+    assert published.entrypoint == "hms-agent.exe"
+    assert published.file_count == 3
+    verify_agent_package(package, published)
     raw = json.loads(target.read_text(encoding="utf-8"))
-    assert set(raw) == {"schema_version", "filename", "version", "size", "sha256"}
+    assert set(raw) == {
+        "schema_version",
+        "platform",
+        "version",
+        "entrypoint",
+        "file_count",
+        "total_size",
+        "files",
+    }
 
 
-def test_manifest_parser_rejects_unknown_or_wrong_schema_fields() -> None:
-    manifest = AgentPackageManifest(
-        filename="hms-agent.exe",
-        version="0.1.0",
-        size=1,
-        sha256="a" * 64,
-    ).to_dict()
+def test_manifest_parser_rejects_unknown_or_wrong_schema_fields(tmp_path: Path) -> None:
+    manifest = build_agent_package_manifest(make_package(tmp_path), version="0.1.0").to_dict()
 
     unknown = dict(manifest)
     unknown["unexpected"] = True
@@ -61,6 +76,38 @@ def test_manifest_parser_rejects_unknown_or_wrong_schema_fields() -> None:
     wrong_schema["schema_version"] = 999
     with pytest.raises(ValueError, match="unsupported"):
         AgentPackageManifest.from_mapping(wrong_schema)
+
+
+def test_complete_tree_verifier_rejects_missing_extra_modified_and_case_changes(tmp_path: Path) -> None:
+    package = make_package(tmp_path)
+    manifest = build_agent_package_manifest(package, version="0.1.0")
+
+    extra = package / "unexpected.bin"
+    extra.write_bytes(b"unexpected")
+    with pytest.raises(ValueError, match="extra="):
+        verify_agent_package(package, manifest)
+    extra.unlink()
+
+    module = package / "_internal" / "module.pyd"
+    original = module.read_bytes()
+    module.write_bytes(b"modified-module")
+    with pytest.raises(ValueError, match="SHA-256 mismatch|size mismatch"):
+        verify_agent_package(package, manifest)
+    module.write_bytes(original)
+
+    module.unlink()
+    with pytest.raises(ValueError, match="missing="):
+        verify_agent_package(package, manifest)
+
+
+def test_manifest_rejects_links_and_case_collisions(tmp_path: Path) -> None:
+    package = make_package(tmp_path)
+    try:
+        (package / "link.bin").symlink_to(package / "_internal" / "module.pyd")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unavailable on this host")
+    with pytest.raises(ValueError, match="links or reparse points"):
+        build_agent_package_manifest(package, version="0.1.0")
 
 
 def test_windows_amd64_pe_gate_accepts_x64_and_rejects_wrong_machine(tmp_path: Path) -> None:
