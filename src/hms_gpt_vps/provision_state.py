@@ -11,6 +11,11 @@ from typing import Any
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _MAX_PROVISION_STATE_BYTES = 64 * 1024
+_PROVISION_REQUIRED_FIELDS = frozenset({"schema_version", "instance_id", "state"})
+_PROVISION_OPTIONAL_FIELDS = frozenset(
+    {"attempt", "reason", "resume_state", "last_error"}
+)
+_PROVISION_FIELDS = _PROVISION_REQUIRED_FIELDS | _PROVISION_OPTIONAL_FIELDS
 
 
 class ProvisionState(str, Enum):
@@ -37,6 +42,14 @@ class ProvisionState(str, Enum):
     FAILED = "failed"
 
 
+def _optional_text(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"provision state {label} must be a string or null")
+    return value
+
+
 @dataclass(frozen=True)
 class ProvisionRecord:
     schema_version: int
@@ -55,11 +68,42 @@ class ProvisionRecord:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ProvisionRecord":
-        data = dict(payload)
-        data["state"] = ProvisionState(data["state"])
-        if data.get("resume_state") is not None:
-            data["resume_state"] = ProvisionState(data["resume_state"])
-        return cls(**data)
+        keys = frozenset(payload.keys())
+        if not _PROVISION_REQUIRED_FIELDS.issubset(keys) or not keys.issubset(
+            _PROVISION_FIELDS
+        ):
+            raise ValueError("provision state fields are invalid")
+        schema_version = payload["schema_version"]
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise ValueError("provision state schema_version must be an integer")
+        instance_id = payload["instance_id"]
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            raise ValueError("provision state instance_id is invalid")
+        state_raw = payload["state"]
+        if not isinstance(state_raw, str):
+            raise ValueError("provision state state must be a string")
+        attempt = payload.get("attempt", 0)
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 0:
+            raise ValueError("provision state attempt is invalid")
+        reason = _optional_text(payload.get("reason"), "reason")
+        last_error = _optional_text(payload.get("last_error"), "last_error")
+        resume_raw = payload.get("resume_state")
+        if resume_raw is not None and not isinstance(resume_raw, str):
+            raise ValueError("provision state resume_state must be a string or null")
+        try:
+            state = ProvisionState(state_raw)
+            resume_state = ProvisionState(resume_raw) if resume_raw is not None else None
+        except ValueError as exc:
+            raise ValueError("provision state enum value is invalid") from exc
+        return cls(
+            schema_version=schema_version,
+            instance_id=instance_id,
+            state=state,
+            attempt=attempt,
+            reason=reason,
+            resume_state=resume_state,
+            last_error=last_error,
+        )
 
 
 def _path_chain_has_redirect(path: Path) -> bool:
@@ -83,6 +127,10 @@ def _path_chain_has_redirect(path: Path) -> bool:
     return False
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
 class ProvisionStateStore:
     SCHEMA_VERSION = 1
 
@@ -94,6 +142,8 @@ class ProvisionStateStore:
     def _assert_safe_authority_path(self) -> None:
         if _path_chain_has_redirect(self.path):
             raise ValueError("provision state authority path traverses a link or reparse point")
+        if self.path.parent.exists() and not self.path.parent.is_dir():
+            raise ValueError("provision state parent authority is not a directory")
         if self.path.exists() and not self.path.is_file():
             raise ValueError("provision state authority path is not a regular file")
 
@@ -101,28 +151,59 @@ class ProvisionStateStore:
         self._assert_safe_authority_path()
         if not self.path.exists():
             return None
-        size = self.path.stat().st_size
-        if size <= 0 or size > _MAX_PROVISION_STATE_BYTES:
-            raise ValueError("provision state size is outside supported bounds")
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        fd: int | None = None
+        try:
+            fd = os.open(self.path, flags)
+            opened_stat = os.fstat(fd)
+            if opened_stat.st_size <= 0 or opened_stat.st_size > _MAX_PROVISION_STATE_BYTES:
+                raise ValueError("provision state size is outside supported bounds")
+            self._assert_safe_authority_path()
+            current_stat = self.path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise ValueError("provision state authority changed during open")
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                fd = None
+                raw_bytes = handle.read(_MAX_PROVISION_STATE_BYTES + 1)
+            self._assert_safe_authority_path()
+            current_stat = self.path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise ValueError("provision state authority changed during read")
+            if len(raw_bytes) != opened_stat.st_size:
+                raise ValueError("provision state changed during read")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+        try:
+            raw = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("provision state is not valid UTF-8 JSON") from exc
         if not isinstance(raw, dict):
             raise ValueError("provision state must be a JSON object")
         record = ProvisionRecord.from_dict(raw)
         if record.schema_version != self.SCHEMA_VERSION:
             raise ValueError(f"unsupported provision state schema: {record.schema_version}")
-        if not isinstance(record.instance_id, str) or not record.instance_id.strip():
-            raise ValueError("provision state instance_id is invalid")
-        if not isinstance(record.attempt, int) or isinstance(record.attempt, bool) or record.attempt < 0:
-            raise ValueError("provision state attempt is invalid")
         return record
 
     def save(self, record: ProvisionRecord) -> None:
-        if record.schema_version != self.SCHEMA_VERSION:
+        if (
+            not isinstance(record.schema_version, int)
+            or isinstance(record.schema_version, bool)
+            or record.schema_version != self.SCHEMA_VERSION
+        ):
             raise ValueError("record schema does not match store schema")
         if not isinstance(record.instance_id, str) or not record.instance_id.strip():
             raise ValueError("record instance_id is invalid")
+        if not isinstance(record.state, ProvisionState):
+            raise ValueError("record state is invalid")
         if not isinstance(record.attempt, int) or isinstance(record.attempt, bool) or record.attempt < 0:
             raise ValueError("record attempt is invalid")
+        _optional_text(record.reason, "reason")
+        _optional_text(record.last_error, "last_error")
+        if record.resume_state is not None and not isinstance(record.resume_state, ProvisionState):
+            raise ValueError("record resume_state is invalid")
 
         # Gate existing ancestors before creating anything, then verify again
         # after mkdir so an existing redirect is never silently traversed.
@@ -137,6 +218,7 @@ class ProvisionStateStore:
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
+            allow_nan=False,
         ) + "\n"
         encoded = payload.encode("utf-8")
         if len(encoded) > _MAX_PROVISION_STATE_BYTES:
@@ -159,7 +241,7 @@ class ProvisionStateStore:
             temp_path.replace(self.path)
             self._assert_safe_authority_path()
         finally:
-            if temp_path is not None:
+            if temp_path is not None and not _path_chain_has_redirect(temp_path):
                 temp_path.unlink(missing_ok=True)
 
     def transition(
