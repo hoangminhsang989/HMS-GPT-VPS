@@ -4,6 +4,11 @@ import base64
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
 
+from .agent_package import AgentPackageManifest
+from .agent_package_powershell import (
+    POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION,
+    package_manifest_ps_literal,
+)
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
@@ -14,10 +19,10 @@ from .powershell_sha256 import POWERSHELL_SHA256_FUNCTION
 class AgentServiceConfig:
     service_name: str = "HMSAgent"
     display_name: str = "HMS GPT VPS Agent"
-    binary_path: str = r"C:\ProgramData\HMS-GPT-VPS\Agent\hms-agent.exe"
-    runtime_config_path: str = (
-        r"C:\ProgramData\HMS-GPT-VPS\Agent\agent-runtime.json"
-    )
+    agent_root_path: str = r"C:\ProgramData\HMS-GPT-VPS\Agent"
+    package_path: str = r"C:\ProgramData\HMS-GPT-VPS\Agent\package"
+    binary_path: str = r"C:\ProgramData\HMS-GPT-VPS\Agent\package\hms-agent.exe"
+    runtime_config_path: str = r"C:\ProgramData\HMS-GPT-VPS\Agent\agent-runtime.json"
     workspace_path: str = r"C:\HMS-Workspace"
     runtime_path: str = r"C:\ProgramData\HMS-GPT-VPS"
     state_path: str = r"C:\ProgramData\HMS-GPT-VPS\State"
@@ -32,6 +37,8 @@ class AgentServiceConfig:
         ):
             raise ValueError("service_name contains unsupported characters")
         for name, value in (
+            ("agent_root_path", self.agent_root_path),
+            ("package_path", self.package_path),
             ("binary_path", self.binary_path),
             ("runtime_config_path", self.runtime_config_path),
             ("workspace_path", self.workspace_path),
@@ -43,13 +50,22 @@ class AgentServiceConfig:
             if not PureWindowsPath(value).is_absolute():
                 raise ValueError(f"{name} must be an absolute Windows path")
 
-        binary_parent = str(PureWindowsPath(self.binary_path).parent).casefold()
-        config_parent = str(PureWindowsPath(self.runtime_config_path).parent).casefold()
-        if config_parent != binary_parent:
-            raise ValueError("runtime_config_path must be inside the protected Agent root")
-        if PureWindowsPath(self.runtime_config_path).name.casefold() == PureWindowsPath(
-            self.binary_path
-        ).name.casefold():
+        agent_root = PureWindowsPath(self.agent_root_path)
+        package_root = PureWindowsPath(self.package_path)
+        binary = PureWindowsPath(self.binary_path)
+        runtime_config = PureWindowsPath(self.runtime_config_path)
+        runtime_root = PureWindowsPath(self.runtime_path)
+        if str(package_root.parent).casefold() != str(agent_root).casefold():
+            raise ValueError("package_path must be a direct child of protected Agent root")
+        if str(binary.parent).casefold() != str(package_root).casefold():
+            raise ValueError("binary_path must be the entrypoint inside package_path")
+        if binary.name.casefold() != "hms-agent.exe":
+            raise ValueError("binary_path must end with hms-agent.exe")
+        if str(runtime_config.parent).casefold() != str(agent_root).casefold():
+            raise ValueError("runtime_config_path must be inside protected Agent root")
+        if str(agent_root.parent).casefold() != str(runtime_root).casefold():
+            raise ValueError("protected Agent root must be inside runtime_path")
+        if runtime_config.name.casefold() == binary.name.casefold():
             raise ValueError("runtime config must not replace the Agent executable")
 
 
@@ -71,24 +87,18 @@ def _validate_runtime_config_alignment(
 def build_agent_service_install_script(
     config: AgentServiceConfig,
     *,
-    expected_sha256: str,
+    package_manifest: AgentPackageManifest,
     runtime_config: AgentServiceRuntimeConfig,
 ) -> str:
-    """Install/reconcile HMS Agent plus its protected non-secret runtime config.
+    """Install/reconcile an exact onedir Agent tree and protected runtime config.
 
-    Binary and canonical runtime-config hashes are verified inside the guest.
-    Config replacement happens before Agent-root ACL reconciliation and before
-    service start. When an already-running service needs a changed config it is
-    stopped first, then restarted after the exact new config is verified.
+    The complete package tree is verified before any SCM mutation. Runtime
+    config publication and ACL reconciliation happen only after the package has
+    matched its immutable manifest exactly.
     """
     config.validate()
+    package_manifest.validate()
     _validate_runtime_config_alignment(config, runtime_config)
-    if len(expected_sha256) != 64:
-        raise ValueError("expected_sha256 must contain 64 hex characters")
-    try:
-        int(expected_sha256, 16)
-    except ValueError as exc:
-        raise ValueError("expected_sha256 must be hexadecimal") from exc
 
     runtime_bytes = runtime_config.to_bytes()
     runtime_config_b64 = base64.b64encode(runtime_bytes).decode("ascii")
@@ -96,19 +106,24 @@ def build_agent_service_install_script(
 
     service_name = ps_literal(config.service_name)
     display_name = ps_literal(config.display_name)
+    agent_root = ps_literal(config.agent_root_path)
+    package_root = ps_literal(config.package_path)
     binary_path = ps_literal(config.binary_path)
     runtime_config_path = ps_literal(config.runtime_config_path)
     workspace = ps_literal(config.workspace_path)
     runtime = ps_literal(config.runtime_path)
     state = ps_literal(config.state_path)
-    expected_hash = ps_literal(expected_sha256.lower())
+    expected_hash = ps_literal(package_manifest.sha256.lower())
     expected_config_hash = ps_literal(runtime_config_hash)
     runtime_config_payload = ps_literal(runtime_config_b64)
+    package_manifest_payload = package_manifest_ps_literal(package_manifest)
 
     return f"""
 $ErrorActionPreference = 'Stop'
 $serviceName = {service_name}
 $displayName = {display_name}
+$agentRoot = {agent_root}
+$packageRoot = {package_root}
 $binaryPath = {binary_path}
 $runtimeConfigPath = {runtime_config_path}
 $workspace = {workspace}
@@ -117,27 +132,31 @@ $statePath = {state}
 $expectedHash = {expected_hash}
 $expectedRuntimeConfigHash = {expected_config_hash}
 $runtimeConfigPayload = {runtime_config_payload}
+$packageManifestPayload = {package_manifest_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 
-{POWERSHELL_SHA256_FUNCTION}
+{POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION}
 
-if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {{
-  throw 'HMS Agent executable is missing inside guest'
+if ((Split-Path -Parent $packageRoot) -ne $agentRoot) {{
+  throw 'HMS Agent package root escaped the protected Agent root'
 }}
-$actualHash = Get-HmsSha256 $binaryPath
+if ((Split-Path -Parent $binaryPath) -ne $packageRoot) {{
+  throw 'HMS Agent executable escaped the package root'
+}}
+if ((Split-Path -Parent $runtimeConfigPath) -ne $agentRoot) {{
+  throw 'HMS Agent runtime config escaped the protected Agent root'
+}}
+
+$packageProof = Test-HmsAgentPackageTree $packageRoot $packageManifestPayload
+$actualHash = [string]$packageProof.entrypoint_sha256
 if ($actualHash -ne $expectedHash) {{
-  throw 'HMS Agent executable SHA-256 mismatch inside guest'
+  throw 'HMS Agent entrypoint SHA-256 mismatch inside guest'
 }}
 
-foreach ($path in @($workspace, $runtime, $statePath)) {{
+foreach ($path in @($workspace, $runtime, $statePath, $agentRoot, $packageRoot)) {{
   if (-not (Test-Path -LiteralPath $path)) {{
     New-Item -ItemType Directory -Path $path -Force | Out-Null
   }}
-}}
-
-$agentRoot = Split-Path -Parent $binaryPath
-if ((Split-Path -Parent $runtimeConfigPath) -ne $agentRoot) {{
-  throw 'HMS Agent runtime config escaped the protected Agent root'
 }}
 
 $configChanged = $true
@@ -213,12 +232,12 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Failed to configure HMS Agent failure recover
 & sc.exe failureflag $serviceName '1' | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw 'Failed to enable HMS Agent non-crash failure recovery' }}
 
-foreach ($path in @($agentRoot, $workspace, $statePath)) {{
+foreach ($path in @($agentRoot, $packageRoot, $workspace, $statePath)) {{
   if (-not (Test-Path -LiteralPath $path)) {{ throw "Required HMS path missing: $path" }}
 }}
 
 & icacls.exe $agentRoot '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)RX" | Out-Null
-if ($LASTEXITCODE -ne 0) {{ throw 'Failed to protect HMS Agent binary/config directory ACL' }}
+if ($LASTEXITCODE -ne 0) {{ throw 'Failed to protect HMS Agent package/config directory ACL' }}
 
 foreach ($path in @($workspace, $statePath)) {{
   & icacls.exe $path '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)M" | Out-Null
@@ -228,6 +247,11 @@ foreach ($path in @($workspace, $statePath)) {{
 $sidInfo = (& sc.exe qsidtype $serviceName 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0 -or $sidInfo -notmatch 'UNRESTRICTED') {{
   throw 'HMS Agent per-service SID verification failed'
+}}
+
+$packageProof = Test-HmsAgentPackageTree $packageRoot $packageManifestPayload
+if ([string]$packageProof.entrypoint_sha256 -ne $expectedHash) {{
+  throw 'HMS Agent package changed after ACL reconciliation'
 }}
 
 $service = Get-Service -Name $serviceName -ErrorAction Stop
@@ -243,8 +267,12 @@ $wmi = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction 
   status = $service.Status.ToString()
   start_mode = $wmi.StartMode
   start_name = $wmi.StartName
+  agent_root = $agentRoot
+  package_root = $packageRoot
+  package_file_count = [int]$packageProof.file_count
+  package_total_size = [int64]$packageProof.total_size
   binary_path = $binaryPath
-  binary_sha256 = $actualHash
+  binary_sha256 = [string]$packageProof.entrypoint_sha256
   runtime_config_path = $runtimeConfigPath
   runtime_config_sha256 = $actualRuntimeConfigHash
   runtime_config_changed = [bool]$configChanged
@@ -260,7 +288,7 @@ def install_agent_service(
     credential: PowerShellDirectCredential,
     config: AgentServiceConfig,
     *,
-    expected_sha256: str,
+    package_manifest: AgentPackageManifest,
     runtime_config: AgentServiceRuntimeConfig,
     timeout_seconds: int = 180,
 ) -> dict[str, object]:
@@ -269,7 +297,7 @@ def install_agent_service(
         credential,
         build_agent_service_install_script(
             config,
-            expected_sha256=expected_sha256,
+            package_manifest=package_manifest,
             runtime_config=runtime_config,
         ),
         timeout_seconds=timeout_seconds,
@@ -278,4 +306,10 @@ def install_agent_service(
         raise RuntimeError("HMS Agent service postcondition failed")
     if str(result.get("runtime_config_sha256", "")).lower() != runtime_config.sha256():
         raise RuntimeError("HMS Agent runtime config postcondition failed")
+    if int(result.get("package_file_count", 0)) != package_manifest.file_count:
+        raise RuntimeError("HMS Agent package file-count postcondition failed")
+    if int(result.get("package_total_size", 0)) != package_manifest.total_size:
+        raise RuntimeError("HMS Agent package size postcondition failed")
+    if str(result.get("binary_sha256", "")).lower() != package_manifest.sha256.lower():
+        raise RuntimeError("HMS Agent entrypoint postcondition failed")
     return result
