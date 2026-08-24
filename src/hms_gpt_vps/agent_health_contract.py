@@ -108,9 +108,16 @@ def parse_agent_health(
         "privilege",
         "boot_id",
     }
-    missing = sorted(required_fields.difference(payload.keys()))
-    if missing:
-        raise ValueError(f"agent health document is missing fields: {', '.join(missing)}")
+    keys = set(payload.keys())
+    if keys != required_fields:
+        missing = sorted(required_fields - keys)
+        unknown = sorted(keys - required_fields)
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if unknown:
+            details.append("unknown=" + ",".join(str(value) for value in unknown))
+        raise ValueError("agent health document fields are invalid: " + "; ".join(details))
 
     schema_version = payload["schema_version"]
     if not isinstance(schema_version, int) or isinstance(schema_version, bool):

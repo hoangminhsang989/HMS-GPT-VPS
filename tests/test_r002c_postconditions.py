@@ -10,6 +10,9 @@ from hms_gpt_vps.windows_image import WindowsImage
 from hms_gpt_vps.windows_provisioner import HyperVHostState, WindowsVMConfig
 
 
+VM_ID = "11111111-2222-3333-4444-555555555555"
+
+
 def ready_host() -> HyperVHostState:
     return HyperVHostState(
         is_windows=True,
@@ -93,7 +96,7 @@ def test_vm_advances_only_after_stable_vm_identity_is_observed(tmp_path: Path) -
         image=context.image,
         observation=ProvisionObservation(
             network_ready=True,
-            vm_id="11111111-2222-3333-4444-555555555555",
+            vm_id=VM_ID,
         ),
     )
     result = orchestrator.reconcile(context_vm)
@@ -116,7 +119,7 @@ def test_install_media_mutation_does_not_advance_before_readback(tmp_path: Path)
         config=context.config,
         host=context.host,
         image=context.image,
-        observation=ProvisionObservation(network_ready=True, vm_id="vm-id"),
+        observation=ProvisionObservation(network_ready=True, vm_id=VM_ID),
     )
     orchestrator.reconcile(vm)
     result = orchestrator.reconcile(vm)

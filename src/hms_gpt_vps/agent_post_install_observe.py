@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .agent_health_contract import AgentHealthDocument
 from .agent_health_probe import probe_agent_application_health_for_runtime
+from .agent_package import AgentPackageManifest
 from .agent_service_install import AgentServiceConfig
 from .agent_service_readiness import probe_agent_service_readiness
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
@@ -14,7 +15,7 @@ from .provisioning import ProvisionObservation
 @dataclass(frozen=True)
 class AgentPostInstallObservationConfig:
     vm_name: str
-    expected_agent_sha256: str
+    package_manifest: AgentPackageManifest
     expected_agent_version: str
     service: AgentServiceConfig
     runtime: AgentServiceRuntimeConfig
@@ -22,16 +23,15 @@ class AgentPostInstallObservationConfig:
     def validate(self) -> None:
         if not self.vm_name.strip():
             raise ValueError("vm_name is required")
-        if len(self.expected_agent_sha256) != 64:
-            raise ValueError("expected_agent_sha256 must contain 64 hex characters")
-        try:
-            int(self.expected_agent_sha256, 16)
-        except ValueError as exc:
-            raise ValueError("expected_agent_sha256 must be hexadecimal") from exc
+        self.package_manifest.validate()
         if not self.expected_agent_version.strip():
             raise ValueError("expected_agent_version is required")
+        if self.expected_agent_version != self.package_manifest.version:
+            raise ValueError("expected_agent_version must match approved package manifest")
         self.service.validate()
         self.runtime.validate()
+        if self.runtime.instance_id.strip() == "":
+            raise ValueError("runtime instance_id is required")
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,10 @@ class AgentPostInstallObservation:
 
     @property
     def service_ready(self) -> bool:
-        return bool(self.service_evidence.get("service_ready", False))
+        # Readiness is security evidence. Never coerce strings/numbers such as
+        # "false"/1 into a positive proof; only a native JSON boolean true may
+        # cross the SCM-readiness boundary.
+        return self.service_evidence.get("service_ready") is True
 
     @property
     def agent_healthy(self) -> bool:
@@ -71,10 +74,10 @@ class AgentPostInstallObserver:
             self.config.vm_name,
             credential,
             self.config.service,
-            expected_sha256=self.config.expected_agent_sha256,
+            package_manifest=self.config.package_manifest,
             runtime_config=self.config.runtime,
         )
-        if not bool(service_evidence.get("service_ready", False)):
+        if service_evidence.get("service_ready") is not True:
             return AgentPostInstallObservation(
                 service_evidence=service_evidence,
                 health=None,

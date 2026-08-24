@@ -11,6 +11,7 @@ from hms_gpt_vps.agent_health_contract import (
     parse_agent_health,
 )
 from hms_gpt_vps.agent_health_probe import probe_agent_application_health_for_runtime
+from hms_gpt_vps.agent_package import AgentPackageFile, AgentPackageManifest
 from hms_gpt_vps.agent_post_install_observe import (
     AgentPostInstallObservationConfig,
     AgentPostInstallObserver,
@@ -38,6 +39,23 @@ def runtime_config(*, health_port: int = 8765) -> AgentServiceRuntimeConfig:
     )
 
 
+def package_manifest() -> AgentPackageManifest:
+    return AgentPackageManifest(
+        platform="windows-x64",
+        version="0.1.0",
+        entrypoint="hms-agent.exe",
+        file_count=1,
+        total_size=1,
+        files=(
+            AgentPackageFile(
+                path="hms-agent.exe",
+                size=1,
+                sha256="a" * 64,
+            ),
+        ),
+    )
+
+
 def health_document():
     return parse_agent_health(
         {
@@ -57,10 +75,11 @@ def health_document():
 
 
 def observer_config() -> AgentPostInstallObservationConfig:
+    manifest = package_manifest()
     return AgentPostInstallObservationConfig(
         vm_name="HMS-GPT-VPS-01",
-        expected_agent_sha256="a" * 64,
-        expected_agent_version="0.1.0",
+        package_manifest=manifest,
+        expected_agent_version=manifest.version,
         service=AgentServiceConfig(),
         runtime=runtime_config(),
     )
@@ -104,6 +123,34 @@ def test_observer_does_not_probe_application_when_service_boundary_is_not_ready(
     provision = observed.to_provision_observation()
     assert provision.agent_service_ready is False
     assert provision.agent_healthy is False
+
+
+def test_observer_rejects_truthy_non_boolean_service_readiness(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_service(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("service")
+        return {"service_ready": "false"}
+
+    def fake_health(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("health")
+        raise AssertionError("malformed readiness must not cross the health gate")
+
+    monkeypatch.setattr(
+        "hms_gpt_vps.agent_post_install_observe.probe_agent_service_readiness",
+        fake_service,
+    )
+    monkeypatch.setattr(
+        "hms_gpt_vps.agent_post_install_observe.probe_agent_application_health_for_runtime",
+        fake_health,
+    )
+
+    observed = AgentPostInstallObserver(observer_config()).observe(credential())
+
+    assert calls == ["service"]
+    assert observed.service_ready is False
+    assert observed.agent_healthy is False
+    assert observed.health_error == "service_not_ready"
 
 
 def test_observer_sets_agent_healthy_only_after_both_verified_layers(monkeypatch) -> None:

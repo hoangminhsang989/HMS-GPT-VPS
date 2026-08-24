@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Mapping
+
+from .authority_lock import exclusive_authority_lock
+from .managed_agent_provisioning_runtime import ManagedAgentProvisioningRuntime
+from .powershell_direct import PowerShellDirectCredential
+from .provision_state import ProvisionState
+from .provisioning import (
+    ProvisionContext,
+    ProvisionObservation,
+    ProvisioningOrchestrator,
+    TransitionResult,
+)
+
+
+_LATE_GUEST_STATES = frozenset(
+    {
+        ProvisionState.AGENT_INSTALLING,
+        ProvisionState.AGENT_SERVICE_READY,
+    }
+)
+_MUTATION_ACTIONS = frozenset(
+    {
+        "STAGE_HMS_AGENT_PACKAGE",
+        "INSTALL_HMS_AGENT",
+    }
+)
+_NONMUTATING_ACTIONS = frozenset(
+    {
+        "AGENT_SERVICE_VERIFIED",
+        "WAIT_FOR_AGENT_APPLICATION_HEALTH",
+        "AGENT_APPLICATION_HEALTH_VERIFIED",
+    }
+)
+
+
+class ManagedAgentReconcileError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ManagedAgentReconcileResult:
+    transition: TransitionResult
+    mutation_result: Mapping[str, object] | None
+
+    @property
+    def action(self) -> str:
+        return self.transition.action
+
+    @property
+    def state(self) -> ProvisionState:
+        return self.transition.record.state
+
+
+class ManagedAgentReconcileRuntime:
+    """Bounded one-step wiring for late managed guest Agent provisioning.
+
+    Each call performs one fresh read-only Agent observation, lets the durable
+    provisioning orchestrator decide the next action, and dispatches at most one
+    approved late-guest mutation. Mutation actions intentionally do not advance
+    durable provisioning state in the same call; a later call must re-observe
+    the postcondition before the orchestrator may advance.
+
+    The complete observe -> decide -> optional mutation sequence is serialized
+    across host processes using an OS-backed authority lock. A crashed holder
+    releases ownership automatically; a contender cannot overlap a package/SCM
+    mutation using a stale pre-mutation observation.
+    """
+
+    def __init__(
+        self,
+        orchestrator: ProvisioningOrchestrator,
+        agent_runtime: ManagedAgentProvisioningRuntime,
+    ) -> None:
+        self.orchestrator = orchestrator
+        self.agent_runtime = agent_runtime
+        if agent_runtime.config.instance_id.strip() == "":
+            raise ValueError("managed Agent runtime instance_id is required")
+        state_path = orchestrator.store.path
+        self.reconcile_lock_path = state_path.with_name(
+            state_path.name + ".late-agent-reconcile.lock"
+        )
+
+    def _current_late_state(self, instance_id: str) -> ProvisionState:
+        # Late reconcile must never create/initialize provisioning state as a
+        # side effect of a misplaced call. Missing state is an explicit error.
+        record = self.orchestrator.store.load()
+        if record is None:
+            raise ManagedAgentReconcileError(
+                "late Agent reconcile requires an existing provisioning checkpoint"
+            )
+        if record.instance_id != instance_id:
+            raise ManagedAgentReconcileError(
+                "provision state instance does not match reconcile context"
+            )
+        if record.instance_id != self.agent_runtime.config.instance_id:
+            raise ManagedAgentReconcileError(
+                "provision state instance does not match managed Agent runtime"
+            )
+        if record.state not in _LATE_GUEST_STATES:
+            raise ManagedAgentReconcileError(
+                f"late Agent reconcile is not allowed from state {record.state.value}"
+            )
+        return record.state
+
+    @staticmethod
+    def _validate_agent_observation(agent: ProvisionObservation) -> None:
+        for name in (
+            "agent_package_ready",
+            "agent_service_ready",
+            "agent_healthy",
+        ):
+            if not isinstance(getattr(agent, name, None), bool):
+                raise ManagedAgentReconcileError(
+                    f"Agent observation returned malformed boolean evidence: {name}"
+                )
+        if agent.agent_service_ready is True and agent.agent_package_ready is not True:
+            raise ManagedAgentReconcileError(
+                "Agent observation cannot prove service readiness without package readiness"
+            )
+        if agent.agent_healthy is True and agent.agent_service_ready is not True:
+            raise ManagedAgentReconcileError(
+                "Agent observation cannot prove health without service readiness"
+            )
+
+    @staticmethod
+    def _merge_agent_observation(
+        base: ProvisionObservation,
+        agent: ProvisionObservation,
+    ) -> ProvisionObservation:
+        """Preserve unrelated host observations while replacing Agent facts."""
+        ManagedAgentReconcileRuntime._validate_agent_observation(agent)
+        return replace(
+            base,
+            agent_package_ready=agent.agent_package_ready,
+            agent_service_ready=agent.agent_service_ready,
+            agent_healthy=agent.agent_healthy,
+        )
+
+    def _reconcile_once_locked(
+        self,
+        context: ProvisionContext,
+        credential: PowerShellDirectCredential,
+    ) -> ManagedAgentReconcileResult:
+        self._current_late_state(context.instance_id)
+
+        agent_observation = self.agent_runtime.provision_observation(credential)
+        self._validate_agent_observation(agent_observation)
+        observed_context = replace(
+            context,
+            observation=self._merge_agent_observation(
+                context.observation,
+                agent_observation,
+            ),
+        )
+        transition = self.orchestrator.reconcile(observed_context)
+
+        if transition.action in _MUTATION_ACTIONS:
+            # The orchestrator must not advance durable state merely because a
+            # mutation was attempted. Re-observation on a later call is the gate.
+            if transition.record.state is not ProvisionState.AGENT_INSTALLING:
+                raise ManagedAgentReconcileError(
+                    "late Agent mutation action escaped AGENT_INSTALLING checkpoint"
+                )
+            result = self.agent_runtime.apply(transition.action, credential)
+            if not isinstance(result, dict):
+                raise ManagedAgentReconcileError(
+                    "managed Agent mutation result must be an object"
+                )
+            return ManagedAgentReconcileResult(transition, result)
+
+        if transition.action in _NONMUTATING_ACTIONS:
+            return ManagedAgentReconcileResult(transition, None)
+
+        raise ManagedAgentReconcileError(
+            f"unexpected action in late Agent reconcile boundary: {transition.action}"
+        )
+
+    def reconcile_once(
+        self,
+        context: ProvisionContext,
+        credential: PowerShellDirectCredential,
+    ) -> ManagedAgentReconcileResult:
+        credential.validate()
+        if context.instance_id != self.agent_runtime.config.instance_id:
+            raise ManagedAgentReconcileError(
+                "provision context instance does not match managed Agent runtime"
+            )
+        with exclusive_authority_lock(self.reconcile_lock_path):
+            return self._reconcile_once_locked(context, credential)

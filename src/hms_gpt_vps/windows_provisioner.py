@@ -25,8 +25,20 @@ class HyperVHostState:
     virtualization_firmware_enabled: bool
     restart_required: bool = False
 
+    def validate(self) -> None:
+        for name in (
+            "is_windows",
+            "hyperv_available",
+            "hyperv_enabled",
+            "virtualization_firmware_enabled",
+            "restart_required",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"Hyper-V host evidence must be boolean: {name}")
+
     @property
     def ready(self) -> bool:
+        self.validate()
         return (
             self.is_windows
             and self.hyperv_available
@@ -75,6 +87,7 @@ class ProvisionPlan:
 
 def build_provision_plan(host: HyperVHostState, config: WindowsVMConfig) -> ProvisionPlan:
     """Build a deterministic plan without mutating the Windows host."""
+    host.validate()
     config.validate()
 
     if not host.is_windows:
