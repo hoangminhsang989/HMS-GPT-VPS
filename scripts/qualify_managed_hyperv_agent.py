@@ -28,29 +28,57 @@ from hms_gpt_vps.windows_provisioner import HyperVHostState, WindowsVMConfig
 
 BOOTSTRAP_USERNAME_ENV = "HMS_MANAGED_GUEST_BOOTSTRAP_USERNAME"
 BOOTSTRAP_PASSWORD_ENV = "HMS_MANAGED_GUEST_BOOTSTRAP_PASSWORD"
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+
+
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = path.expanduser().absolute()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
 
 
 def _absolute_existing_file(raw: str, label: str) -> Path:
     path = Path(raw).expanduser().absolute()
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be an existing non-symlink file")
+    if _path_chain_has_redirect(path) or not path.is_file():
+        raise ValueError(
+            f"{label} must be an existing file whose path chain has no link/reparse redirect"
+        )
     return path
 
 
 def _absolute_existing_dir(raw: str, label: str) -> Path:
     path = Path(raw).expanduser().absolute()
-    if path.is_symlink() or not path.is_dir():
-        raise ValueError(f"{label} must be an existing non-symlink directory")
+    if _path_chain_has_redirect(path) or not path.is_dir():
+        raise ValueError(
+            f"{label} must be an existing directory whose path chain has no link/reparse redirect"
+        )
     return path
 
 
 def _new_proof_path(raw: str) -> Path:
     path = Path(raw).expanduser().absolute()
-    if path.exists() or path.is_symlink():
-        raise ValueError("qualification proof path must not already exist")
+    if path.exists() or _path_chain_has_redirect(path):
+        raise ValueError(
+            "qualification proof path must be absent and must not traverse a link/reparse point"
+        )
     parent = path.parent
-    if not parent.is_dir() or parent.is_symlink():
-        raise ValueError("qualification proof parent must be an existing non-symlink directory")
+    if not parent.is_dir():
+        raise ValueError("qualification proof parent must be an existing directory")
     return path
 
 
@@ -171,5 +199,8 @@ if __name__ == "__main__":
     except Exception as exc:
         # Keep stdout clean for a successful proof JSON. Failure diagnostics must
         # not echo bootstrap/device secret values or child environments.
-        print(f"managed Hyper-V Agent qualification failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"managed Hyper-V Agent qualification failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
