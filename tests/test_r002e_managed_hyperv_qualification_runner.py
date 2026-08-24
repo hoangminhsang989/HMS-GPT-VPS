@@ -77,6 +77,26 @@ def test_production_proof_writer_is_create_only(tmp_path: Path) -> None:
     assert json.loads(proof.read_text(encoding="utf-8")) == payload
 
 
+def test_proof_create_race_never_deletes_unowned_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = load_runner()
+    proof = tmp_path / "proof.json"
+    original_new_proof_path = runner._new_proof_path
+
+    def race(raw: str) -> Path:
+        target = original_new_proof_path(raw)
+        target.write_text("unowned-race-winner", encoding="utf-8")
+        return target
+
+    monkeypatch.setattr(runner, "_new_proof_path", race)
+    with pytest.raises(FileExistsError):
+        runner._write_proof_create_only(proof, {"replacement": True})
+
+    assert proof.read_text(encoding="utf-8") == "unowned-race-winner"
+
+
 def test_authority_file_rejects_symlinked_parent(tmp_path: Path) -> None:
     runner = load_runner()
     real = tmp_path / "real"
