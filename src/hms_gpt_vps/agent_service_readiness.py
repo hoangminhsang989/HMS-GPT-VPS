@@ -143,15 +143,15 @@ function Test-HmsAclRight([string]$Path, [string[]]$AcceptedRights) {{
     throw "icacls.exe failed while reading HMS ACL: $Path"
   }}
 
-  $identities = @(
-    $servicePrincipal,
-    [string]$serviceSid.Value,
-    ('*' + [string]$serviceSid.Value)
+  $identityPrefixes = @(
+    ($servicePrincipal + ':'),
+    ([string]$serviceSid.Value + ':'),
+    ('*' + [string]$serviceSid.Value + ':')
   )
   foreach ($line in ($aclOutput -split "`r?`n")) {{
     $identityMatched = $false
-    foreach ($identity in $identities) {{
-      if ($line.IndexOf($identity, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {{
+    foreach ($identityPrefix in $identityPrefixes) {{
+      if ($line.IndexOf($identityPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {{
         $identityMatched = $true
         break
       }}
