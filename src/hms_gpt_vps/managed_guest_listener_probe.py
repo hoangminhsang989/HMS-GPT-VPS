@@ -79,12 +79,20 @@ $connections = @(
             "managed guest listener proof returned an invalid service process id"
         )
     observed_port = result.get("health_port")
-    if observed_port != health_port:
+    if (
+        not isinstance(observed_port, int)
+        or isinstance(observed_port, bool)
+        or observed_port != health_port
+    ):
         raise ManagedGuestListenerProofError(
             "managed guest listener proof returned the wrong health port"
         )
     listener_count = result.get("listener_count")
-    if listener_count != 1:
+    if (
+        not isinstance(listener_count, int)
+        or isinstance(listener_count, bool)
+        or listener_count != 1
+    ):
         raise ManagedGuestListenerProofError(
             "managed guest Agent health must have exactly one listening socket"
         )
