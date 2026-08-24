@@ -156,6 +156,19 @@ def test_agent_service_restarts_only_when_runtime_config_changed() -> None:
     assert "runtime_config_changed" in script
 
 
+def test_agent_service_reconcile_accepts_only_safe_scm_command_canonicalizations() -> None:
+    script = install_script("f")
+
+    assert "$expectedQuotedCommand = '\"' + $binaryPath + '\" service'" in script
+    assert "$expectedUnquotedCommand = $binaryPath + ' service'" in script
+    assert "'binPath=' $expectedQuotedCommand" in script
+    assert "$wmi.PathName -eq $expectedQuotedCommand" in script
+    assert "$binaryPath -notmatch '\\s'" in script
+    assert "$wmi.PathName -eq $expectedUnquotedCommand" in script
+    assert "if (-not $commandOk)" in script
+    assert "$wmi.PathName -ne $quotedBinary" not in script
+
+
 def test_agent_service_rejects_runtime_config_outside_protected_agent_root() -> None:
     service = AgentServiceConfig(
         runtime_config_path=r"C:\ProgramData\HMS-GPT-VPS\State\agent-runtime.json"
