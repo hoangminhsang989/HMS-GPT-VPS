@@ -27,12 +27,12 @@ class FakeInspector:
         return self._snapshot
 
 
-def good_snapshot() -> AgentWindowsTokenSnapshot:
+def good_snapshot(*, elevated: bool = False) -> AgentWindowsTokenSnapshot:
     return AgentWindowsTokenSnapshot(
         user_sid=LOCAL_SERVICE_SID,
         service_sid_present=True,
         administrators_sid_present=False,
-        elevated=False,
+        elevated=elevated,
     )
 
 
@@ -42,6 +42,13 @@ def test_valid_native_snapshot_is_the_only_source_of_runtime_identity() -> None:
     identity = probe_agent_service_identity(inspector=inspector)
 
     assert inspector.calls == 1
+    assert identity.service_identity == AGENT_SERVICE_ACCOUNT
+    assert identity.privilege == "non-admin"
+
+
+def test_service_account_token_elevation_flag_is_telemetry_not_admin_membership() -> None:
+    identity = validate_agent_service_token(good_snapshot(elevated=True))
+
     assert identity.service_identity == AGENT_SERVICE_ACCOUNT
     assert identity.privilege == "non-admin"
 
@@ -80,14 +87,14 @@ def test_valid_native_snapshot_is_the_only_source_of_runtime_identity() -> None:
             AgentWindowsTokenSnapshot(
                 user_sid=LOCAL_SERVICE_SID,
                 service_sid_present=True,
-                administrators_sid_present=False,
+                administrators_sid_present=True,
                 elevated=True,
             ),
-            "elevated",
+            "Administrators",
         ),
     ],
 )
-def test_identity_proof_fails_closed_when_any_token_fact_is_wrong(
+def test_identity_proof_fails_closed_when_any_principal_fact_is_wrong(
     snapshot: AgentWindowsTokenSnapshot,
     message: str,
 ) -> None:
