@@ -19,6 +19,11 @@ from hms_gpt_vps.agent_package import (
     require_windows_amd64_pe,
     verify_agent_package,
 )
+from hms_gpt_vps.agent_package_manifest_artifact import (
+    canonical_agent_package_manifest_bytes,
+    canonical_agent_package_manifest_sha256,
+    managed_agent_package_manifest_path,
+)
 from hms_gpt_vps.agent_service_install import (
     AgentServiceConfig,
     build_agent_service_install_script,
@@ -164,9 +169,11 @@ def main() -> int:
         raise RuntimeError("managed HMS paths already exist before service-start probe")
 
     source_package = artifact_root / "hms-agent"
-    manifest = load_agent_package_manifest(
-        (artifact_root / "hms-agent.manifest.json").resolve(strict=True)
-    )
+    source_manifest = (artifact_root / "hms-agent.manifest.json").resolve(strict=True)
+    manifest = load_agent_package_manifest(source_manifest)
+    canonical_manifest = canonical_agent_package_manifest_bytes(manifest)
+    if source_manifest.read_bytes() != canonical_manifest:
+        raise ValueError("downloaded Agent package manifest is not canonical")
     verify_agent_package(source_package, manifest)
     source_entrypoint = source_package / manifest.entrypoint
     require_windows_amd64_pe(source_entrypoint)
@@ -176,11 +183,13 @@ def main() -> int:
     runtime_root = Path(service.runtime_path)
     agent_root = Path(service.agent_root_path)
     target_package = Path(service.package_path)
+    target_manifest = Path(managed_agent_package_manifest_path(service.agent_root_path))
     state_root = Path(service.state_path)
     workspace_root = Path(service.workspace_path)
     runtime_root.mkdir(parents=True)
     (runtime_root / RUNTIME_MARKER).write_text(runtime_token, encoding="utf-8")
     agent_root.mkdir(parents=True)
+    target_manifest.write_bytes(canonical_manifest)
     state_root.mkdir(parents=True)
     workspace_root.mkdir(parents=True)
     (workspace_root / WORKSPACE_MARKER).write_text(workspace_token, encoding="utf-8")
@@ -228,6 +237,8 @@ def main() -> int:
             raise
 
         ready = bool(install.get("ready", False))
+        if str(install.get("package_manifest_sha256", "")).lower() != canonical_agent_package_manifest_sha256(manifest):
+            raise RuntimeError("installer package-manifest proof mismatch")
         if int(install.get("package_file_count", 0)) != manifest.file_count:
             raise RuntimeError("installer package file-count proof mismatch")
         if int(install.get("package_total_size", 0)) != manifest.total_size:
@@ -240,6 +251,7 @@ def main() -> int:
                     "installer_start_name": str(install.get("start_name", "")),
                     "installer_sid_type": str(install.get("service_sid_type", "")),
                     "package_schema": 2,
+                    "package_manifest_sha256": canonical_agent_package_manifest_sha256(manifest),
                     "package_file_count": manifest.file_count,
                     "package_total_size": manifest.total_size,
                 },

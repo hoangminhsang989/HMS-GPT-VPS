@@ -28,6 +28,10 @@ from hms_gpt_vps.agent_package import (
     require_windows_amd64_pe,
     verify_agent_package,
 )
+from hms_gpt_vps.agent_package_manifest_artifact import (
+    canonical_agent_package_manifest_bytes,
+    managed_agent_package_manifest_path,
+)
 from hms_gpt_vps.agent_service_install import (
     AgentServiceConfig,
     build_agent_service_install_script,
@@ -380,6 +384,9 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     source_package = package_dir / "hms-agent"
     source_manifest_path = (package_dir / "hms-agent.manifest.json").resolve(strict=True)
     manifest: AgentPackageManifest = load_agent_package_manifest(source_manifest_path)
+    canonical_manifest = canonical_agent_package_manifest_bytes(manifest)
+    if source_manifest_path.read_bytes() != canonical_manifest:
+        raise ValueError("native qualification source manifest is not canonical")
     verify_agent_package(source_package, manifest)
     require_windows_amd64_pe(source_package / manifest.entrypoint)
 
@@ -393,6 +400,7 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     ownership_token = secrets.token_hex(24)
     agent_root = Path(service.agent_root_path)
     target_package = Path(service.package_path)
+    target_manifest = Path(managed_agent_package_manifest_path(service.agent_root_path))
     state_root = Path(service.state_path)
     runtime_root.mkdir(parents=True)
     (runtime_root / _MARKER_FILENAME).write_text(ownership_token, encoding="utf-8")
@@ -402,6 +410,11 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     (workspace_root / _WORKSPACE_MARKER_FILENAME).write_text(ownership_token, encoding="utf-8")
 
     shutil.copytree(source_package, target_package)
+    target_manifest.write_bytes(canonical_manifest)
+    if target_manifest.read_bytes() != canonical_manifest:
+        raise RuntimeError("native qualification canonical manifest publication failed")
+    if load_agent_package_manifest(target_manifest) != manifest:
+        raise RuntimeError("native qualification published manifest identity mismatch")
     verify_agent_package(target_package, manifest)
     require_windows_amd64_pe(Path(service.binary_path))
 
@@ -481,6 +494,8 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
         )
 
         verify_agent_package(target_package, manifest)
+        if target_manifest.read_bytes() != canonical_manifest:
+            raise RuntimeError("canonical Agent manifest changed during native qualification")
         result = {
             "schema_version": 1,
             "qualification": "native_windows_scm_packaged_agent",
