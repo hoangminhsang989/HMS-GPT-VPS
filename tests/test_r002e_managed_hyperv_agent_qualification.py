@@ -53,7 +53,9 @@ def device_credential() -> AgentDeviceCredential:
 
 @pytest.fixture(autouse=True)
 def exact_enrollment_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    def probe(_vm_name, _bootstrap, config, expected):  # type: ignore[no-untyped-def]
+    def probe(vm_id, vm_name, _bootstrap, config, expected):  # type: ignore[no-untyped-def]
+        assert vm_id == VM_ID
+        assert vm_name == "HMS-GPT-VPS-01"
         assert config.instance_id == "hms-01"
         assert config.guest_state_path == r"C:\ProgramData\HMS-GPT-VPS\State"
         assert config.service_name == "HMSAgent"
@@ -67,7 +69,7 @@ def exact_enrollment_probe(monkeypatch: pytest.MonkeyPatch) -> None:
             "credential_path": r"C:\ProgramData\HMS-GPT-VPS\State\agent-device-credential.dpapi",
         }
 
-    monkeypatch.setattr(qualification_module, "probe_agent_device_enrollment", probe)
+    monkeypatch.setattr(qualification_module, "probe_agent_device_enrollment_by_id", probe)
 
 
 def make_package(tmp_path: Path):  # type: ignore[no-untyped-def]
@@ -364,7 +366,7 @@ def test_wrong_enrollment_identity_blocks_hyperv_proof(
     runtime = FakeReconcileRuntime(orchestrator, agent)
     monkeypatch.setattr(
         qualification_module,
-        "probe_agent_device_enrollment",
+        "probe_agent_device_enrollment_by_id",
         lambda *_args, **_kwargs: {
             "enrollment_ready": True,
             "instance_id": "hms-01",
