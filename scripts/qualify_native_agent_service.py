@@ -326,14 +326,10 @@ def _require_owned_marker(marker: Path, ownership_token: str, label: str) -> Non
         raise PermissionError(f"refusing to remove unowned HMS {label} path")
 
 
-def _cleanup_owned_paths(
-    service: AgentServiceConfig,
-    *,
-    ownership_token: str,
-) -> None:
+def _cleanup_owned_paths(service: AgentServiceConfig, *, ownership_token: str) -> None:
     _delete_service_if_present(service.service_name)
     runtime_root = Path(service.runtime_path)
-    runtime_marker = Path(service.binary_path).parent / _MARKER_FILENAME
+    runtime_marker = runtime_root / _MARKER_FILENAME
     if runtime_root.exists():
         _require_owned_marker(runtime_marker, ownership_token, "runtime")
         shutil.rmtree(runtime_root)
@@ -360,11 +356,20 @@ def _print_failure_evidence(service_name: str, exc: BaseException) -> None:
         service = _service_diagnostics(service_name)
     except Exception as diagnostic_exc:
         service = {"diagnostic_error": type(diagnostic_exc).__name__}
-    evidence = {
-        "qualification_failure": type(exc).__name__,
-        "service": service,
-    }
+    evidence = {"qualification_failure": type(exc).__name__, "service": service}
     print(json.dumps(evidence, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+
+
+def _package_proof_summary(manifest: AgentPackageManifest) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "platform": manifest.platform,
+        "version": manifest.version,
+        "entrypoint": manifest.entrypoint,
+        "file_count": manifest.file_count,
+        "total_size": manifest.total_size,
+        "entrypoint_sha256": manifest.sha256,
+    }
 
 
 def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
@@ -372,11 +377,11 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     service = AgentServiceConfig()
     service.validate()
 
-    source_executable = (package_dir / "hms-agent.exe").resolve(strict=True)
+    source_package = (package_dir / "hms-agent").resolve(strict=True)
     source_manifest_path = (package_dir / "hms-agent.manifest.json").resolve(strict=True)
     manifest: AgentPackageManifest = load_agent_package_manifest(source_manifest_path)
-    verify_agent_package(source_executable, manifest)
-    require_windows_amd64_pe(source_executable)
+    verify_agent_package(source_package, manifest)
+    require_windows_amd64_pe(source_package / manifest.entrypoint)
 
     runtime_root = Path(service.runtime_path)
     workspace_root = Path(service.workspace_path)
@@ -386,20 +391,19 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
         raise RuntimeError("managed HMS qualification paths already exist on runner")
 
     ownership_token = secrets.token_hex(24)
-    agent_root = Path(service.binary_path).parent
+    agent_root = Path(service.agent_root_path)
+    target_package = Path(service.package_path)
     state_root = Path(service.state_path)
+    runtime_root.mkdir(parents=True)
+    (runtime_root / _MARKER_FILENAME).write_text(ownership_token, encoding="utf-8")
     agent_root.mkdir(parents=True)
-    runtime_marker = agent_root / _MARKER_FILENAME
-    runtime_marker.write_text(ownership_token, encoding="utf-8")
     state_root.mkdir(parents=True)
     workspace_root.mkdir(parents=True)
-    workspace_marker = workspace_root / _WORKSPACE_MARKER_FILENAME
-    workspace_marker.write_text(ownership_token, encoding="utf-8")
+    (workspace_root / _WORKSPACE_MARKER_FILENAME).write_text(ownership_token, encoding="utf-8")
 
-    target_executable = Path(service.binary_path)
-    shutil.copy2(source_executable, target_executable)
-    verify_agent_package(target_executable, manifest)
-    require_windows_amd64_pe(target_executable)
+    shutil.copytree(source_package, target_package)
+    verify_agent_package(target_package, manifest)
+    require_windows_amd64_pe(Path(service.binary_path))
 
     credential = AgentDeviceCredential(
         instance_id=_INSTANCE_ID,
@@ -428,24 +432,30 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
         install_result = run_powershell_json(
             build_agent_service_install_script(
                 service,
-                expected_sha256=manifest.sha256,
+                package_manifest=manifest,
                 runtime_config=runtime,
             ),
             timeout_seconds=180,
         )
         if not bool(install_result.get("ready", False)):
             raise RuntimeError("native HMS Agent installer did not prove service Running")
+        if int(install_result.get("package_file_count", 0)) != manifest.file_count:
+            raise RuntimeError("native installer package file-count proof mismatch")
+        if int(install_result.get("package_total_size", 0)) != manifest.total_size:
+            raise RuntimeError("native installer package size proof mismatch")
 
         readiness = run_powershell_json(
             build_agent_service_readiness_script(
                 service,
-                expected_sha256=manifest.sha256,
+                package_manifest=manifest,
                 runtime_config=runtime,
             ),
             timeout_seconds=90,
         )
         if not bool(readiness.get("service_ready", False)):
             raise RuntimeError("native HMS Agent service readiness contract failed")
+        if not bool(readiness.get("package_tree_ok", False)):
+            raise RuntimeError("native readiness did not prove exact package tree")
 
         first_health = _wait_for_health(manifest.version)
         first_listener = _probe_listener(service.service_name)
@@ -470,14 +480,17 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
             timeout_seconds=10.0,
         )
 
+        verify_agent_package(target_package, manifest)
         result = {
             "schema_version": 1,
             "qualification": "native_windows_scm_packaged_agent",
-            "package": manifest.to_dict(),
+            "package": _package_proof_summary(manifest),
             "install": {
                 "ready": bool(install_result.get("ready", False)),
                 "start_name": str(install_result.get("start_name", "")),
                 "service_sid_type": str(install_result.get("service_sid_type", "")),
+                "package_file_count": int(install_result.get("package_file_count", 0)),
+                "package_total_size": int(install_result.get("package_total_size", 0)),
                 "binary_sha256": str(install_result.get("binary_sha256", "")),
                 "runtime_config_sha256": str(
                     install_result.get("runtime_config_sha256", "")
@@ -485,12 +498,13 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
             },
             "readiness": {
                 "service_ready": bool(readiness.get("service_ready", False)),
-                "local_service_account": bool(
-                    readiness.get("local_service_account", False)
-                ),
+                "local_service_account": bool(readiness.get("local_service_account", False)),
                 "service_sid_unrestricted": bool(
                     readiness.get("service_sid_unrestricted", False)
                 ),
+                "package_tree_ok": bool(readiness.get("package_tree_ok", False)),
+                "package_file_count": int(readiness.get("package_file_count", 0)),
+                "package_total_size": int(readiness.get("package_total_size", 0)),
                 "runtime_config_sha256_ok": bool(
                     readiness.get("runtime_config_sha256_ok", False)
                 ),
