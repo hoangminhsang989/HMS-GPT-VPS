@@ -111,7 +111,6 @@ class ManagedAgentProvisioningRuntime:
         self.config = config
         self.transfer_attempt_store = transfer_attempt_store
         self.registry = InstanceRegistry(config.registry_path)
-        self._assert_vm_identity()
 
     def _expected_vm_id(self) -> str:
         record = self.registry.get(self.config.instance_id)
