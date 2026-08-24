@@ -9,8 +9,69 @@ from .agent_package_manifest_artifact import (
 from .agent_package_powershell import POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION
 from .agent_package_transfer import AgentPackageTransferPlan
 from .agent_service_install import AgentServiceConfig
-from .powershell import ps_literal
+from .powershell import ps_literal, run_powershell_json
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
+
+
+_GUEST_SERVICE_INTERFACE_NAME = "Guest Service Interface"
+
+
+def probe_guest_service_interface_enabled(vm_name: str) -> bool:
+    """Read the host-side Hyper-V copy service baseline without mutation."""
+    if not vm_name.strip():
+        raise ValueError("VM name is required")
+    result = run_powershell_json(
+        f"""
+$service = Get-VMIntegrationService -VMName {ps_literal(vm_name)} -Name {ps_literal(_GUEST_SERVICE_INTERFACE_NAME)} -ErrorAction Stop
+[pscustomobject]@{{ enabled = [bool]$service.Enabled }}
+""".strip(),
+        timeout_seconds=30,
+    )
+    enabled = result.get("enabled")
+    if not isinstance(enabled, bool):
+        raise RuntimeError("Guest Service Interface baseline evidence is invalid")
+    return enabled
+
+
+def restore_guest_service_interface_state(
+    vm_name: str,
+    expected_enabled: bool,
+) -> dict[str, object]:
+    """Restore and read back the exact pre-transfer Hyper-V integration state."""
+    if not vm_name.strip():
+        raise ValueError("VM name is required")
+    if not isinstance(expected_enabled, bool):
+        raise TypeError("expected Guest Service Interface state must be boolean")
+    expected = "$true" if expected_enabled else "$false"
+    result = run_powershell_json(
+        f"""
+$vmName = {ps_literal(vm_name)}
+$integrationName = {ps_literal(_GUEST_SERVICE_INTERFACE_NAME)}
+$expectedEnabled = {expected}
+$service = Get-VMIntegrationService -VMName $vmName -Name $integrationName -ErrorAction Stop
+$changed = $false
+if ([bool]$service.Enabled -ne $expectedEnabled) {{
+  if ($expectedEnabled) {{
+    Enable-VMIntegrationService -VMName $vmName -Name $integrationName -ErrorAction Stop | Out-Null
+  }} else {{
+    Disable-VMIntegrationService -VMName $vmName -Name $integrationName -ErrorAction Stop | Out-Null
+  }}
+  $changed = $true
+}}
+$verified = Get-VMIntegrationService -VMName $vmName -Name $integrationName -ErrorAction Stop
+[pscustomobject]@{{
+  restored = [bool]([bool]$verified.Enabled -eq $expectedEnabled)
+  enabled = [bool]$verified.Enabled
+  changed = [bool]$changed
+}}
+""".strip(),
+        timeout_seconds=30,
+    )
+    if not bool(result.get("restored", False)):
+        raise RuntimeError("Guest Service Interface baseline restoration failed")
+    if result.get("enabled") is not expected_enabled:
+        raise RuntimeError("Guest Service Interface readback differs from persisted baseline")
+    return result
 
 
 def build_reset_owned_agent_package_staging_script(
