@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 from dataclasses import dataclass
 from typing import Sequence
@@ -21,6 +22,21 @@ class CommandResult:
     stderr: str
 
 
+def _require_trusted_executable(raw: str) -> str:
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise ExecutionDenied("trusted executable must be an absolute path")
+    if candidate.is_symlink():
+        raise ExecutionDenied("trusted executable must not be a symbolic link")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ExecutionDenied("trusted executable does not exist") from exc
+    if not resolved.is_file():
+        raise ExecutionDenied("trusted executable is not a regular file")
+    return str(resolved)
+
+
 def run_command(
     workspace: Workspace,
     argv: Sequence[str],
@@ -30,10 +46,12 @@ def run_command(
     timeout_seconds: float = 60.0,
     destructive: bool = False,
     explicitly_approved: bool = False,
+    require_trusted_executable: bool = False,
 ) -> CommandResult:
-    if not argv or not argv[0].strip():
+    if not argv or not isinstance(argv[0], str) or not argv[0].strip():
         raise ValueError("argv must contain an executable")
 
+    argv_list = list(argv)
     decision = evaluate(
         PolicyRequest(
             capability=capability,
@@ -47,13 +65,26 @@ def run_command(
             action=capability,
             project_id=workspace.project_id,
             outcome=decision.value,
-            argv=list(argv),
+            argv=argv_list,
         )
         raise ExecutionDenied(f"execution blocked by policy: {decision.value}")
 
+    if require_trusted_executable:
+        try:
+            argv_list[0] = _require_trusted_executable(argv_list[0])
+        except ExecutionDenied:
+            audit_log.append(
+                action=capability,
+                project_id=workspace.project_id,
+                outcome="deny",
+                argv=argv_list,
+                error="untrusted_executable",
+            )
+            raise
+
     try:
         completed = subprocess.run(
-            list(argv),
+            argv_list,
             cwd=workspace.root,
             shell=False,
             check=False,
@@ -66,7 +97,7 @@ def run_command(
             action=capability,
             project_id=workspace.project_id,
             outcome="error",
-            argv=list(argv),
+            argv=argv_list,
             error=type(exc).__name__,
         )
         raise
@@ -75,11 +106,11 @@ def run_command(
         action=capability,
         project_id=workspace.project_id,
         outcome="ok" if completed.returncode == 0 else "failed",
-        argv=list(argv),
+        argv=argv_list,
         returncode=completed.returncode,
     )
     return CommandResult(
-        argv=tuple(argv),
+        argv=tuple(argv_list),
         returncode=completed.returncode,
         stdout=completed.stdout,
         stderr=completed.stderr,
