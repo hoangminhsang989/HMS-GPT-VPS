@@ -106,3 +106,39 @@ jobs:
             dist/package/hms-agent.manifest.json
           if-no-files-found: error
           retention-days: 14
+
+  windows-native-service:
+    runs-on: windows-latest
+    needs: windows-package
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install qualification source runtime
+        shell: pwsh
+        run: python -m pip install -e .
+      - name: Download exact attested Agent package
+        uses: actions/download-artifact@v4
+        with:
+          name: hms-agent-windows-x64
+          path: package
+      - name: Qualify packaged Agent under Windows SCM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .\scripts\qualify_native_agent_service.py .\package .\native-service-proof.json
+          if ($LASTEXITCODE -ne 0) { throw 'Native packaged Agent SCM qualification failed' }
+          $proof = Get-Content -LiteralPath .\native-service-proof.json -Raw | ConvertFrom-Json
+          if ($proof.qualification -ne 'native_windows_scm_packaged_agent') { throw 'Native proof type mismatch' }
+          if (-not [bool]$proof.cleanup_verified) { throw 'Native qualification cleanup was not verified' }
+          if ([bool]$proof.hyperv_guest_proven) { throw 'Native host smoke must not claim Hyper-V guest proof' }
+          if ([bool]$proof.full_bridge_command_flow_proven) { throw 'Native host smoke must not claim Bridge command-flow proof' }
+      - name: Upload native SCM proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: hms-agent-native-scm-proof
+          path: native-service-proof.json
+          if-no-files-found: error
+          retention-days: 14
