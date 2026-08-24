@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-from scripts import qualify_native_agent_service as qualification
+import importlib.util
+from pathlib import Path
+
+
+def _load_qualification_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "qualify_native_agent_service.py"
+    spec = importlib.util.spec_from_file_location("hms_r002c_native_qualification", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load native qualification script for regression test")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_native_service_control_suppresses_warning_streams_and_success_output(
     monkeypatch,
 ) -> None:
+    qualification = _load_qualification_module()
     scripts: list[str] = []
 
     def fake_run_powershell_json(
