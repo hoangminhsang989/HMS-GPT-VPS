@@ -85,7 +85,9 @@ def test_authority_lock_rejects_target_substitution_after_open(
     assert displaced.exists()
 
 
-def test_windows_mutex_namespace_is_case_insensitive_and_path_opaque(tmp_path: Path) -> None:
+def test_windows_mutex_namespace_is_cross_session_case_insensitive_and_path_opaque(
+    tmp_path: Path,
+) -> None:
     path = (tmp_path / "State.Lock").absolute()
     same_windows_path_case_variant = Path(str(path).upper())
 
@@ -93,7 +95,7 @@ def test_windows_mutex_namespace_is_case_insensitive_and_path_opaque(tmp_path: P
     second = _windows_mutex_name(same_windows_path_case_variant)
 
     assert first == second
-    assert first.startswith("Local\\HMS-GPT-VPS-Authority-")
+    assert first.startswith("Global\\HMS-GPT-VPS-Authority-")
     assert len(first.rsplit("-", 1)[-1]) == 64
     assert str(path).casefold() not in first.casefold()
 
@@ -103,6 +105,7 @@ def test_windows_authority_path_uses_kernel_mutex_not_crt_file_lock() -> None:
     assert "CreateMutexW" in source
     assert "WaitForSingleObject" in source
     assert "WAIT_ABANDONED" in source
+    assert "Global\\\\HMS-GPT-VPS-Authority-" in source
     assert "msvcrt.locking" not in source
 
 
