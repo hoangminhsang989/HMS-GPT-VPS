@@ -32,7 +32,16 @@ SERVICE_ACCEPT_SHUTDOWN = 0x00000004
 NO_ERROR = 0
 ERROR_CALL_NOT_IMPLEMENTED = 120
 ERROR_SERVICE_SPECIFIC_ERROR = 1066
-_SERVICE_FAILURE_RUNTIME = 1
+
+# These codes intentionally disclose only the startup/runtime phase, never an
+# exception string, credential, endpoint response, path contents or other
+# sensitive state. They make native SCM qualification actionable while keeping
+# the production service fail-closed and non-verbose.
+SERVICE_FAILURE_IDENTITY = 10
+SERVICE_FAILURE_CONFIG = 20
+SERVICE_FAILURE_RUNTIME_CONSTRUCTION = 30
+SERVICE_FAILURE_RUNTIME_EXECUTION = 40
+SERVICE_FAILURE_HOST_LIFECYCLE = 90
 
 _CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 _SERVICE_MAIN_FUNCTION = _CALLBACK_FACTORY(None, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR))
@@ -178,6 +187,7 @@ class AgentWindowsServiceHost:
         return ERROR_CALL_NOT_IMPLEMENTED
 
     def _service_main(self) -> None:
+        failure_code = SERVICE_FAILURE_HOST_LIFECYCLE
         try:
             self._status_handle = self.backend.register_control_handler(
                 self.service_name,
@@ -194,11 +204,17 @@ class AgentWindowsServiceHost:
             # Security ordering is deliberate: token proof precedes config and
             # credential access. The default runtime factory loads the device
             # credential only after both identity and config have passed.
+            failure_code = SERVICE_FAILURE_IDENTITY
             identity = self.identity_probe()
+
+            failure_code = SERVICE_FAILURE_CONFIG
             service_config = self.config_loader()
             guest_config = service_config.to_guest_runtime_config()
+
+            failure_code = SERVICE_FAILURE_RUNTIME_CONSTRUCTION
             runtime = self.runtime_factory(guest_config, identity)
 
+            failure_code = SERVICE_FAILURE_HOST_LIFECYCLE
             if self.stop.is_set():
                 self._report(
                     AgentServiceStatus(
@@ -216,8 +232,10 @@ class AgentWindowsServiceHost:
                         ),
                     )
                 )
+                failure_code = SERVICE_FAILURE_RUNTIME_EXECUTION
                 runtime.run(self.stop)
 
+            failure_code = SERVICE_FAILURE_HOST_LIFECYCLE
             self._report(AgentServiceStatus(current_state=SERVICE_STOPPED))
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -228,7 +246,7 @@ class AgentWindowsServiceHost:
                         AgentServiceStatus(
                             current_state=SERVICE_STOPPED,
                             win32_exit_code=ERROR_SERVICE_SPECIFIC_ERROR,
-                            service_specific_exit_code=_SERVICE_FAILURE_RUNTIME,
+                            service_specific_exit_code=failure_code,
                         )
                     )
                 except Exception:
