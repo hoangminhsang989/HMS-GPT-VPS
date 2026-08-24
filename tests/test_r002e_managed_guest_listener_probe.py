@@ -69,13 +69,15 @@ def test_listener_probe_is_vm_id_bound_and_uses_os_socket_state(
     ("listener_count", "addresses", "match"),
     [
         (2, ["127.0.0.1", "127.0.0.1"], "exactly one"),
+        (True, ["127.0.0.1"], "exactly one"),
+        ("1", ["127.0.0.1"], "exactly one"),
         (1, ["0.0.0.0"], "exclusively"),
         (1, ["::"], "exclusively"),
     ],
 )
 def test_listener_probe_rejects_nonexclusive_socket_evidence(
     monkeypatch: pytest.MonkeyPatch,
-    listener_count: int,
+    listener_count: object,
     addresses: list[str],
     match: str,
 ) -> None:
@@ -117,6 +119,31 @@ def test_listener_probe_rejects_invalid_service_pid(
     )
 
     with pytest.raises(ManagedGuestListenerProofError, match="process id"):
+        probe_managed_agent_health_listener_by_id(
+            VM_ID,
+            VM_NAME,
+            credential(),
+            AgentServiceConfig(),
+            8765,
+        )
+
+
+def test_listener_probe_rejects_boolean_health_port_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        listener_module,
+        "run_vm_powershell_json_by_id",
+        lambda *_args, **_kwargs: {
+            "service_name": "HMSAgent",
+            "process_id": 4321,
+            "health_port": True,
+            "listener_count": 1,
+            "local_addresses": ["127.0.0.1"],
+        },
+    )
+
+    with pytest.raises(ManagedGuestListenerProofError, match="wrong health port"):
         probe_managed_agent_health_listener_by_id(
             VM_ID,
             VM_NAME,
