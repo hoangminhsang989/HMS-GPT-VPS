@@ -1,22 +1,42 @@
 from __future__ import annotations
 
+from pathlib import PureWindowsPath
+
 from .agent_service_install import AgentServiceConfig
+from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
+
+
+def _same_windows_path(left: str, right: str) -> bool:
+    return str(PureWindowsPath(left)).casefold() == str(PureWindowsPath(right)).casefold()
+
+
+def _validate_runtime_alignment(
+    service: AgentServiceConfig,
+    runtime: AgentServiceRuntimeConfig,
+) -> None:
+    runtime.validate()
+    if not _same_windows_path(runtime.workspace_root, service.workspace_path):
+        raise ValueError("runtime config workspace_root conflicts with service ACL target")
+    if not _same_windows_path(runtime.state_root, service.state_path):
+        raise ValueError("runtime config state_root conflicts with service ACL target")
 
 
 def build_agent_service_readiness_script(
     config: AgentServiceConfig,
     *,
     expected_sha256: str,
+    runtime_config: AgentServiceRuntimeConfig,
 ) -> str:
     """Build a read-only guest probe for the Windows service bootstrap boundary.
 
-    This proves SCM configuration, binary integrity, per-service SID and the
-    minimum filesystem ACL contract. It deliberately does not claim application
-    protocol health; `/healthz` belongs to the Agent implementation itself.
+    This proves SCM configuration, binary integrity, the exact protected runtime
+    config, per-service SID and the minimum filesystem ACL contract. It still
+    leaves application protocol health to the separate `/healthz` gate.
     """
     config.validate()
+    _validate_runtime_alignment(config, runtime_config)
     if len(expected_sha256) != 64:
         raise ValueError("expected_sha256 must contain 64 hex characters")
     try:
@@ -26,17 +46,21 @@ def build_agent_service_readiness_script(
 
     service_name = ps_literal(config.service_name)
     binary_path = ps_literal(config.binary_path)
+    runtime_config_path = ps_literal(config.runtime_config_path)
     workspace = ps_literal(config.workspace_path)
     state_path = ps_literal(config.state_path)
     expected_hash = ps_literal(expected_sha256.lower())
+    expected_runtime_config_hash = ps_literal(runtime_config.sha256())
 
     return f"""
 $ErrorActionPreference = 'Stop'
 $serviceName = {service_name}
 $binaryPath = {binary_path}
+$runtimeConfigPath = {runtime_config_path}
 $workspace = {workspace}
 $statePath = {state_path}
 $expectedHash = {expected_hash}
+$expectedRuntimeConfigHash = {expected_runtime_config_hash}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 $expectedCommand = '"' + $binaryPath + '" service'
 
@@ -58,6 +82,14 @@ $actualHash = $null
 if ($binaryExists) {{
   $actualHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
   $binaryHashOk = $actualHash -eq $expectedHash
+}}
+
+$runtimeConfigExists = Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf
+$runtimeConfigHashOk = $false
+$actualRuntimeConfigHash = $null
+if ($runtimeConfigExists) {{
+  $actualRuntimeConfigHash = (Get-FileHash -LiteralPath $runtimeConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+  $runtimeConfigHashOk = $actualRuntimeConfigHash -eq $expectedRuntimeConfigHash
 }}
 
 $sidTypeOk = $false
@@ -91,7 +123,9 @@ function Test-HmsAclRight([string]$Path, [System.Security.AccessControl.FileSyst
 }}
 
 $agentRoot = Split-Path -Parent $binaryPath
+$runtimeConfigInAgentRoot = (Split-Path -Parent $runtimeConfigPath) -eq $agentRoot
 $agentRootReadExecute = Test-HmsAclRight $agentRoot ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+$runtimeConfigRead = Test-HmsAclRight $runtimeConfigPath ([System.Security.AccessControl.FileSystemRights]::Read)
 $workspaceModify = Test-HmsAclRight $workspace ([System.Security.AccessControl.FileSystemRights]::Modify)
 $stateModify = Test-HmsAclRight $statePath ([System.Security.AccessControl.FileSystemRights]::Modify)
 
@@ -102,8 +136,12 @@ $serviceReady = [bool](
   $commandOk -and
   $binaryExists -and
   $binaryHashOk -and
+  $runtimeConfigExists -and
+  $runtimeConfigHashOk -and
+  $runtimeConfigInAgentRoot -and
   $sidTypeOk -and
   $agentRootReadExecute -and
+  $runtimeConfigRead -and
   $workspaceModify -and
   $stateModify
 )
@@ -118,6 +156,11 @@ $serviceReady = [bool](
   binary_exists = [bool]$binaryExists
   binary_sha256_ok = [bool]$binaryHashOk
   binary_sha256 = $actualHash
+  runtime_config_exists = [bool]$runtimeConfigExists
+  runtime_config_sha256_ok = [bool]$runtimeConfigHashOk
+  runtime_config_sha256 = $actualRuntimeConfigHash
+  runtime_config_in_agent_root = [bool]$runtimeConfigInAgentRoot
+  runtime_config_read = [bool]$runtimeConfigRead
   service_sid_unrestricted = [bool]$sidTypeOk
   agent_root_read_execute = [bool]$agentRootReadExecute
   workspace_modify = [bool]$workspaceModify
@@ -132,12 +175,17 @@ def probe_agent_service_readiness(
     config: AgentServiceConfig,
     *,
     expected_sha256: str,
+    runtime_config: AgentServiceRuntimeConfig,
     timeout_seconds: int = 90,
 ) -> dict[str, object]:
     return run_vm_powershell_json(
         vm_name,
         credential,
-        build_agent_service_readiness_script(config, expected_sha256=expected_sha256),
+        build_agent_service_readiness_script(
+            config,
+            expected_sha256=expected_sha256,
+            runtime_config=runtime_config,
+        ),
         timeout_seconds=timeout_seconds,
     )
 
