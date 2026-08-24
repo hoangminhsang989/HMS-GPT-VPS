@@ -81,6 +81,10 @@ def _path_chain_has_redirect(path: Path) -> bool:
     return False
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
 def guest_device_credential_path(state_path: Path) -> Path:
     return state_path.expanduser().absolute() / GUEST_DEVICE_CREDENTIAL_FILENAME
 
@@ -268,24 +272,42 @@ class _ProtectedAgentDeviceCredentialStore:
         expected_device_id: str | None = None,
     ) -> AgentDeviceCredential:
         self._assert_safe_authority_path()
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        fd: int | None = None
         try:
-            stat = self.path.stat()
-        except FileNotFoundError:
-            raise
-        if stat.st_size <= len(AGENT_DEVICE_CREDENTIAL_FILE_MAGIC):
-            raise AgentDeviceCredentialIntegrityError(
-                "protected Agent device credential file is incomplete"
-            )
-        if stat.st_size > MAX_PROTECTED_DEVICE_CREDENTIAL_BYTES:
-            raise AgentDeviceCredentialIntegrityError(
-                "protected Agent device credential exceeds maximum size"
-            )
-        raw = self.path.read_bytes()
-        self._assert_safe_authority_path()
-        if len(raw) != stat.st_size:
-            raise AgentDeviceCredentialIntegrityError(
-                "protected Agent device credential changed during read"
-            )
+            fd = os.open(self.path, flags)
+            opened_stat = os.fstat(fd)
+            if opened_stat.st_size <= len(AGENT_DEVICE_CREDENTIAL_FILE_MAGIC):
+                raise AgentDeviceCredentialIntegrityError(
+                    "protected Agent device credential file is incomplete"
+                )
+            if opened_stat.st_size > MAX_PROTECTED_DEVICE_CREDENTIAL_BYTES:
+                raise AgentDeviceCredentialIntegrityError(
+                    "protected Agent device credential exceeds maximum size"
+                )
+            self._assert_safe_authority_path()
+            current_stat = self.path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise AgentDeviceCredentialIntegrityError(
+                    "Agent device credential authority changed during open"
+                )
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                fd = None
+                raw = handle.read(MAX_PROTECTED_DEVICE_CREDENTIAL_BYTES + 1)
+            self._assert_safe_authority_path()
+            current_stat = self.path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise AgentDeviceCredentialIntegrityError(
+                    "Agent device credential authority changed during read"
+                )
+            if len(raw) != opened_stat.st_size:
+                raise AgentDeviceCredentialIntegrityError(
+                    "protected Agent device credential changed during read"
+                )
+        finally:
+            if fd is not None:
+                os.close(fd)
+
         credential = self._decode_file(
             raw,
             expected_instance_id=expected_instance_id,
