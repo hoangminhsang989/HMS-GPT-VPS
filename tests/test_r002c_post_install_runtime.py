@@ -80,7 +80,12 @@ def test_orchestrator_separates_service_readiness_from_application_health(tmp_pa
     orchestrator = ProvisioningOrchestrator(state_path)
 
     result = orchestrator.reconcile(
-        context(ProvisionObservation(agent_service_ready=True))
+        context(
+            ProvisionObservation(
+                agent_package_ready=True,
+                agent_service_ready=True,
+            )
+        )
     )
     assert result.record.state is ProvisionState.AGENT_SERVICE_READY
     assert result.action == "AGENT_SERVICE_VERIFIED"
