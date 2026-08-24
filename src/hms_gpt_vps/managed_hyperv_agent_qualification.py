@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
 from .agent_device_credential_store import GUEST_PROTECTION_SCOPE
 from .agent_device_enrollment import AgentDeviceEnrollmentConfig
-from .agent_health_contract import AgentHealthDocument
-from .agent_package import load_agent_package_manifest, verify_agent_package
+from .agent_health_contract import AgentHealthDocument, DEFAULT_REQUIRED_CAPABILITIES
+from .agent_package import (
+    AGENT_PACKAGE_MANIFEST_SCHEMA_VERSION,
+    load_agent_package_manifest,
+    verify_agent_package,
+)
 from .agent_package_manifest_artifact import (
     canonical_agent_package_manifest_bytes,
     canonical_agent_package_manifest_sha256,
@@ -25,10 +30,72 @@ from .provisioning import ProvisionContext
 MANAGED_HYPERV_AGENT_QUALIFICATION_SCHEMA_VERSION = 1
 MANAGED_HYPERV_AGENT_QUALIFICATION_NAME = "managed_hyperv_guest_agent"
 _DEFAULT_MAX_RECONCILE_STEPS = 8
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 
 class ManagedHyperVAgentQualificationError(RuntimeError):
     pass
+
+
+def _validate_lower_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or value != value.lower():
+        raise ValueError(f"{label} SHA-256 is invalid")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ValueError(f"{label} SHA-256 is invalid") from exc
+    return value
+
+
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = path.expanduser().absolute()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
+
+
+def _load_host_package_authority(agent_runtime: Any):  # type: ignore[no-untyped-def]
+    package_root = Path(agent_runtime.config.package_source_root).expanduser().absolute()
+    manifest_path = Path(agent_runtime.config.package_manifest_path).expanduser().absolute()
+    if _path_chain_has_redirect(package_root) or _path_chain_has_redirect(manifest_path):
+        raise ManagedHyperVAgentQualificationError(
+            "qualification host package authority path traverses a link or reparse point"
+        )
+    if not package_root.is_dir() or not manifest_path.is_file():
+        raise ManagedHyperVAgentQualificationError(
+            "qualification host package authority disappeared"
+        )
+
+    manifest = load_agent_package_manifest(manifest_path)
+    canonical = canonical_agent_package_manifest_bytes(manifest)
+    if manifest_path.read_bytes() != canonical:
+        raise ManagedHyperVAgentQualificationError(
+            "qualification package manifest is not canonical"
+        )
+    if _path_chain_has_redirect(package_root) or _path_chain_has_redirect(manifest_path):
+        raise ManagedHyperVAgentQualificationError(
+            "qualification host package authority changed during manifest validation"
+        )
+    verify_agent_package(package_root, manifest)
+    if _path_chain_has_redirect(package_root) or _path_chain_has_redirect(manifest_path):
+        raise ManagedHyperVAgentQualificationError(
+            "qualification host package authority changed during package verification"
+        )
+    return manifest, canonical
 
 
 @dataclass(frozen=True)
@@ -69,40 +136,83 @@ class ManagedHyperVAgentQualificationProof:
     pairing_ready: bool
 
     def validate(self) -> None:
-        if self.schema_version != MANAGED_HYPERV_AGENT_QUALIFICATION_SCHEMA_VERSION:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != MANAGED_HYPERV_AGENT_QUALIFICATION_SCHEMA_VERSION
+        ):
             raise ValueError("managed Hyper-V qualification proof schema mismatch")
         if self.qualification != MANAGED_HYPERV_AGENT_QUALIFICATION_NAME:
             raise ValueError("managed Hyper-V qualification proof type mismatch")
-        if not self.instance_id.strip() or not self.vm_name.strip() or not self.vm_id.strip():
-            raise ValueError("managed Hyper-V qualification identity fields are required")
-        if not self.device_id.strip() or not self.device_enrollment_ready:
+        for label, value in (
+            ("instance_id", self.instance_id),
+            ("vm_name", self.vm_name),
+            ("vm_id", self.vm_id),
+            ("device_id", self.device_id),
+            ("package_version", self.package_version),
+            ("health_boot_id", self.health_boot_id),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"managed Hyper-V qualification {label} is required")
+        if self.device_enrollment_ready is not True:
             raise ValueError("managed Hyper-V qualification device enrollment is incomplete")
         if self.device_protection_scope != GUEST_PROTECTION_SCOPE:
             raise ValueError("managed Hyper-V qualification device credential is not LocalMachine")
         if self.final_state != ProvisionState.AGENT_HEALTHY.value:
             raise ValueError("managed Hyper-V qualification must finish at AGENT_HEALTHY")
-        if not self.hyperv_guest_proven:
+        if self.hyperv_guest_proven is not True:
             raise ValueError("managed Hyper-V qualification must explicitly prove the guest path")
-        if self.full_bridge_command_flow_proven:
+        if self.full_bridge_command_flow_proven is not False:
             raise ValueError("R002E proof must not claim full Bridge command flow")
-        if self.bootstrap_retired:
+        if self.bootstrap_retired is not False:
             raise ValueError("R002E proof must not claim bootstrap retirement")
-        if self.pairing_ready:
+        if self.pairing_ready is not False:
             raise ValueError("R002E proof must not claim pairing readiness")
-        if not all(
-            (
-                self.package_tree_ok,
-                self.package_manifest_sha256_ok,
-                self.local_service_account,
-                self.service_sid_unrestricted,
-                self.runtime_config_sha256_ok,
-                self.service_ready,
-            )
+        for key, value in (
+            ("package_tree_ok", self.package_tree_ok),
+            ("package_manifest_sha256_ok", self.package_manifest_sha256_ok),
+            ("local_service_account", self.local_service_account),
+            ("service_sid_unrestricted", self.service_sid_unrestricted),
+            ("runtime_config_sha256_ok", self.runtime_config_sha256_ok),
+            ("service_ready", self.service_ready),
         ):
-            raise ValueError("managed Hyper-V SCM/package readiness proof is incomplete")
+            if value is not True:
+                raise ValueError(
+                    f"managed Hyper-V SCM/package readiness proof is incomplete: {key}"
+                )
+        if (
+            not isinstance(self.package_schema_version, int)
+            or isinstance(self.package_schema_version, bool)
+            or self.package_schema_version != AGENT_PACKAGE_MANIFEST_SCHEMA_VERSION
+        ):
+            raise ValueError("managed Hyper-V package schema proof is invalid")
+        if (
+            not isinstance(self.package_file_count, int)
+            or isinstance(self.package_file_count, bool)
+            or self.package_file_count <= 0
+        ):
+            raise ValueError("managed Hyper-V package file-count proof is invalid")
+        if (
+            not isinstance(self.package_total_size, int)
+            or isinstance(self.package_total_size, bool)
+            or self.package_total_size <= 0
+        ):
+            raise ValueError("managed Hyper-V package size proof is invalid")
+        _validate_lower_sha256(
+            self.package_entrypoint_sha256,
+            "managed Hyper-V package entrypoint",
+        )
+        _validate_lower_sha256(
+            self.package_manifest_sha256,
+            "managed Hyper-V package manifest",
+        )
         if self.health_status != "ok":
             raise ValueError("managed Hyper-V Agent application health is not ok")
-        if self.health_service_identity.casefold() != r"NT SERVICE\HMSAgent".casefold():
+        if (
+            not isinstance(self.health_service_identity, str)
+            or self.health_service_identity.casefold()
+            != r"NT SERVICE\HMSAgent".casefold()
+        ):
             raise ValueError("managed Hyper-V health service identity is not HMSAgent")
         if self.health_listener_scope != "loopback-only":
             raise ValueError("managed Hyper-V Agent health listener is not loopback-only")
@@ -110,12 +220,14 @@ class ManagedHyperVAgentQualificationProof:
             raise ValueError("managed Hyper-V Agent health privilege is not non-admin")
         if self.health_agent_version != self.package_version:
             raise ValueError("managed Hyper-V health/package version mismatch")
-        if self.package_file_count <= 0 or self.package_total_size <= 0:
-            raise ValueError("managed Hyper-V package proof is empty")
-        if len(self.package_entrypoint_sha256) != 64:
-            raise ValueError("managed Hyper-V package entrypoint SHA-256 is invalid")
-        if len(self.package_manifest_sha256) != 64:
-            raise ValueError("managed Hyper-V package manifest SHA-256 is invalid")
+        if tuple(sorted(self.health_capabilities)) != tuple(
+            sorted(DEFAULT_REQUIRED_CAPABILITIES)
+        ):
+            raise ValueError("managed Hyper-V health capabilities differ from canonical set")
+        if not isinstance(self.actions, tuple) or any(
+            not isinstance(action, str) or not action.strip() for action in self.actions
+        ):
+            raise ValueError("managed Hyper-V qualification actions are invalid")
 
     def to_dict(self) -> dict[str, object]:
         self.validate()
@@ -144,11 +256,11 @@ def _require_int(evidence: dict[str, object], key: str) -> int:
 
 
 def _final_health(post: Any) -> AgentHealthDocument:
-    if post is None or not bool(getattr(post, "service_ready", False)):
+    if post is None or getattr(post, "service_ready", None) is not True:
         raise ManagedHyperVAgentQualificationError(
             "managed Hyper-V final service readiness was not proven"
         )
-    if not bool(getattr(post, "agent_healthy", False)):
+    if getattr(post, "agent_healthy", None) is not True:
         raise ManagedHyperVAgentQualificationError(
             "managed Hyper-V final application health was not proven"
         )
@@ -178,7 +290,7 @@ def _prove_exact_device_enrollment(
         enrollment_config,
         expected_device_credential,
     )
-    if not bool(evidence.get("enrollment_ready", False)):
+    if evidence.get("enrollment_ready") is not True:
         raise ManagedHyperVAgentQualificationError(
             "managed Hyper-V device enrollment was not independently proven"
         )
@@ -217,7 +329,12 @@ def qualify_managed_hyperv_agent(
 
     credential.validate()
     expected_device_credential.validate()
-    if max_reconcile_steps < 1 or max_reconcile_steps > 32:
+    if (
+        not isinstance(max_reconcile_steps, int)
+        or isinstance(max_reconcile_steps, bool)
+        or max_reconcile_steps < 1
+        or max_reconcile_steps > 32
+    ):
         raise ValueError("max_reconcile_steps must be between 1 and 32")
 
     agent_runtime = reconcile_runtime.agent_runtime
@@ -230,14 +347,8 @@ def qualify_managed_hyperv_agent(
             "qualification device credential belongs to another managed instance"
         )
 
-    manifest = load_agent_package_manifest(agent_runtime.config.package_manifest_path)
-    pinned_manifest_bytes = canonical_agent_package_manifest_bytes(manifest)
+    manifest, pinned_manifest_bytes = _load_host_package_authority(agent_runtime)
     pinned_manifest_sha256 = canonical_agent_package_manifest_sha256(manifest)
-    if agent_runtime.config.package_manifest_path.read_bytes() != pinned_manifest_bytes:
-        raise ManagedHyperVAgentQualificationError(
-            "qualification package manifest is not canonical"
-        )
-    verify_agent_package(agent_runtime.config.package_source_root, manifest)
 
     starting_record = reconcile_runtime.orchestrator.store.load()
     if starting_record is None:
@@ -306,26 +417,23 @@ def qualify_managed_hyperv_agent(
         expected_device_credential,
     )
 
-    # Re-read and re-verify host authority after all mutations. This prevents a
-    # same-count/same-size package swap from escaping the pinned manifest proof.
-    if agent_runtime.config.package_manifest_path.read_bytes() != pinned_manifest_bytes:
+    # Re-read and re-verify the same lexical host authority after all mutations.
+    # This catches both byte changes and package-path redirects during the run.
+    final_host_manifest, final_manifest_bytes = _load_host_package_authority(agent_runtime)
+    if final_manifest_bytes != pinned_manifest_bytes:
         raise ManagedHyperVAgentQualificationError(
             "qualification package manifest changed during managed guest execution"
         )
-    final_host_manifest = load_agent_package_manifest(
-        agent_runtime.config.package_manifest_path
-    )
     if final_host_manifest != manifest:
         raise ManagedHyperVAgentQualificationError(
             "qualification package manifest identity changed during execution"
         )
-    verify_agent_package(agent_runtime.config.package_source_root, manifest)
 
     final_observation, post = agent_runtime.observe(credential)
     if not (
-        final_observation.agent_package_ready
-        and final_observation.agent_service_ready
-        and final_observation.agent_healthy
+        final_observation.agent_package_ready is True
+        and final_observation.agent_service_ready is True
+        and final_observation.agent_healthy is True
     ):
         raise ManagedHyperVAgentQualificationError(
             "managed Hyper-V final Agent observation is incomplete"
@@ -434,6 +542,7 @@ def write_managed_hyperv_agent_qualification_proof(
         ) as handle:
             handle.write(payload)
             handle.flush()
+            os.fsync(handle.fileno())
             temp = Path(handle.name)
         temp.replace(target)
     finally:
