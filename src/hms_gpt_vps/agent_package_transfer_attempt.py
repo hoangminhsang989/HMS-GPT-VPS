@@ -70,6 +70,10 @@ def _path_chain_has_redirect(path: Path) -> bool:
     return False
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
 @dataclass(frozen=True)
 class AgentPackageTransferAttempt:
     instance_id: str
@@ -139,8 +143,6 @@ class AgentPackageTransferAttemptStore:
         *,
         secret_path: Path | None = None,
     ) -> None:
-        # Do not resolve: resolving can canonicalize away symlink/reparse
-        # evidence before the authority-path gate observes it.
         self.metadata_path = metadata_path.expanduser().absolute()
         self.secret_store = secret_store
         self.secret_path = (
@@ -182,7 +184,8 @@ class AgentPackageTransferAttemptStore:
         self._assert_safe_metadata_path()
         self._assert_safe_secret_path()
 
-    def _write_metadata(self, attempt: AgentPackageTransferAttempt) -> None:
+    @staticmethod
+    def _metadata_bytes(attempt: AgentPackageTransferAttempt) -> bytes:
         payload = json.dumps(
             attempt.metadata(),
             ensure_ascii=True,
@@ -193,7 +196,10 @@ class AgentPackageTransferAttemptStore:
         encoded = payload.encode("utf-8")
         if not encoded or len(encoded) > _MAX_TRANSFER_ATTEMPT_METADATA_BYTES:
             raise ValueError("Agent package transfer attempt metadata exceeds supported size")
+        return encoded
 
+    def _write_metadata(self, attempt: AgentPackageTransferAttempt) -> None:
+        encoded = self._metadata_bytes(attempt)
         self._assert_safe_authority_paths()
         self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
         self._assert_safe_authority_paths()
@@ -213,22 +219,62 @@ class AgentPackageTransferAttemptStore:
             self._assert_safe_authority_paths()
             temp.replace(self.metadata_path)
             self._assert_safe_authority_paths()
+            if self.metadata_path.read_bytes() != encoded:
+                raise ValueError("Agent package transfer metadata readback mismatch")
+            self._assert_safe_authority_paths()
         finally:
-            if temp is not None:
+            if temp is not None and not _path_chain_has_redirect(temp):
                 temp.unlink(missing_ok=True)
 
-    def load(self) -> AgentPackageTransferAttempt | None:
+    def _read_metadata_bytes_pinned(self) -> tuple[bytes, os.stat_result] | None:
         self._assert_safe_authority_paths()
         if not self.metadata_path.exists():
             return None
-        size = self.metadata_path.stat().st_size
-        if size <= 0 or size > _MAX_TRANSFER_ATTEMPT_METADATA_BYTES:
-            raise ValueError("Agent package transfer attempt metadata size is invalid")
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        fd: int | None = None
         try:
-            raw = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            fd = os.open(self.metadata_path, flags)
+            opened_stat = os.fstat(fd)
+            # A zero-byte file is the owned post-clear tombstone. It carries no
+            # transfer id and therefore cannot authorize staging cleanup.
+            if opened_stat.st_size == 0:
+                self._assert_safe_metadata_path()
+                current_stat = self.metadata_path.stat()
+                if not _same_file_identity(opened_stat, current_stat):
+                    raise ValueError("Agent package transfer metadata authority changed during open")
+                return b"", opened_stat
+            if opened_stat.st_size < 0 or opened_stat.st_size > _MAX_TRANSFER_ATTEMPT_METADATA_BYTES:
+                raise ValueError("Agent package transfer attempt metadata size is invalid")
+            self._assert_safe_authority_paths()
+            current_stat = self.metadata_path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise ValueError("Agent package transfer metadata authority changed during open")
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                fd = None
+                raw_bytes = handle.read(_MAX_TRANSFER_ATTEMPT_METADATA_BYTES + 1)
+            self._assert_safe_authority_paths()
+            current_stat = self.metadata_path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise ValueError("Agent package transfer metadata authority changed during read")
+            if len(raw_bytes) != opened_stat.st_size:
+                raise ValueError("Agent package transfer metadata changed during read")
+            return raw_bytes, opened_stat
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def load(self) -> AgentPackageTransferAttempt | None:
+        pinned = self._read_metadata_bytes_pinned()
+        if pinned is None:
+            return None
+        raw_bytes, _ = pinned
+        if not raw_bytes:
+            return None
+        try:
+            raw = json.loads(raw_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("Agent package transfer attempt metadata is invalid") from exc
-        self._assert_safe_authority_paths()
         if not isinstance(raw, dict):
             raise ValueError("Agent package transfer attempt metadata must be an object")
         required = {
@@ -243,7 +289,12 @@ class AgentPackageTransferAttemptStore:
         }
         if set(raw) != required:
             raise ValueError("Agent package transfer attempt metadata fields are invalid")
-        if raw["schema_version"] != AGENT_PACKAGE_TRANSFER_ATTEMPT_SCHEMA_VERSION:
+        schema_version = raw["schema_version"]
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != AGENT_PACKAGE_TRANSFER_ATTEMPT_SCHEMA_VERSION
+        ):
             raise ValueError("unsupported Agent package transfer attempt schema")
         instance_id = _require_text(raw["instance_id"], "instance_id")
         vm_name = _require_text(raw["vm_name"], "vm_name")
@@ -320,16 +371,11 @@ class AgentPackageTransferAttemptStore:
         )
         attempt.validate()
         self._assert_safe_authority_paths()
-        # Secret first: a crash here leaves only an orphan secret, which cannot
-        # authorize guest cleanup because no transfer id has been persisted.
         self.secret_store.save_text(token)
         self._assert_safe_authority_paths()
         try:
             self._write_metadata(attempt)
         except Exception:
-            # Cleanup only while the token authority path is still proven safe.
-            # If authority changed concurrently, leave an inert orphan DPAPI
-            # blob rather than risk deleting through a redirected path.
             self._assert_safe_secret_path()
             self.secret_store.clear()
             raise
@@ -400,9 +446,42 @@ class AgentPackageTransferAttemptStore:
             return
         if current.phase is not AgentPackageTransferPhase.PUBLISHED:
             raise ValueError("only a published transfer attempt may be cleared")
+
+        expected_bytes = self._metadata_bytes(current)
         self._assert_safe_authority_paths()
-        # Metadata first: a crash can leave an orphan protected token, but never
-        # metadata that points at a transfer id whose cleanup token disappeared.
-        self.metadata_path.unlink(missing_ok=True)
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        fd: int | None = None
+        try:
+            fd = os.open(self.metadata_path, flags)
+            opened_stat = os.fstat(fd)
+            self._assert_safe_authority_paths()
+            current_stat = self.metadata_path.stat()
+            if not _same_file_identity(opened_stat, current_stat):
+                raise ValueError("Agent package transfer metadata authority changed before clear")
+            with os.fdopen(fd, "r+b", closefd=True) as handle:
+                fd = None
+                raw_bytes = handle.read(_MAX_TRANSFER_ATTEMPT_METADATA_BYTES + 1)
+                if raw_bytes != expected_bytes:
+                    raise ValueError("Agent package transfer metadata changed before clear")
+                handle.seek(0)
+                handle.truncate(0)
+                handle.flush()
+                os.fsync(handle.fileno())
+                if os.fstat(handle.fileno()).st_size != 0:
+                    raise ValueError("Agent package transfer metadata tombstone write failed")
+            self._assert_safe_authority_paths()
+            tombstone_stat = self.metadata_path.stat()
+            if not _same_file_identity(opened_stat, tombstone_stat):
+                raise ValueError("Agent package transfer metadata authority changed during clear")
+            if tombstone_stat.st_size != 0:
+                raise ValueError("Agent package transfer metadata tombstone is not empty")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+        # Metadata authority is removed first without unlinking a lexical path.
+        # A crash can leave an orphan secret, but no transfer id remains to
+        # authorize guest staging cleanup. A later begin_or_resume safely
+        # overwrites that orphan secret before publishing new metadata.
         self._assert_safe_secret_path()
         self.secret_store.clear()
