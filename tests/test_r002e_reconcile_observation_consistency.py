@@ -106,6 +106,37 @@ def test_contradictory_agent_observation_fails_before_state_advance_or_mutation(
     assert agent.apply_called is False
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("agent_package_ready", "false"),
+        ("agent_service_ready", 1),
+        ("agent_healthy", None),
+    ],
+)
+def test_malformed_agent_observation_types_fail_before_orchestrator(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    orchestrator = orchestrator_at(tmp_path, ProvisionState.AGENT_INSTALLING)
+    values: dict[str, object] = {
+        "agent_package_ready": False,
+        "agent_service_ready": False,
+        "agent_healthy": False,
+    }
+    values[field] = value
+    observation = ProvisionObservation(**values)  # type: ignore[arg-type]
+    agent = ContradictoryAgentRuntime(observation)
+    runtime = ManagedAgentReconcileRuntime(orchestrator, agent)  # type: ignore[arg-type]
+
+    with pytest.raises(ManagedAgentReconcileError, match=f"boolean evidence: {field}"):
+        runtime.reconcile_once(context(), credential())
+
+    assert orchestrator.current("hms-01").state is ProvisionState.AGENT_INSTALLING
+    assert agent.apply_called is False
+
+
 def test_missing_checkpoint_fails_without_creating_state_or_observing_agent(
     tmp_path: Path,
 ) -> None:
