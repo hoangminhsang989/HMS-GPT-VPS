@@ -110,6 +110,21 @@ def test_manifest_rejects_links_and_case_collisions(tmp_path: Path) -> None:
         build_agent_package_manifest(package, version="0.1.0")
 
 
+def test_manifest_and_verifier_reject_linked_package_root_before_resolution(tmp_path: Path) -> None:
+    package = make_package(tmp_path)
+    manifest = build_agent_package_manifest(package, version="0.1.0")
+    linked_root = tmp_path / "hms-agent-linked"
+    try:
+        linked_root.symlink_to(package, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlink creation unavailable on this host")
+
+    with pytest.raises(ValueError, match="root must not be a link or reparse point"):
+        build_agent_package_manifest(linked_root, version="0.1.0")
+    with pytest.raises(ValueError, match="root must not be a link or reparse point"):
+        verify_agent_package(linked_root, manifest)
+
+
 def test_windows_amd64_pe_gate_accepts_x64_and_rejects_wrong_machine(tmp_path: Path) -> None:
     x64 = tmp_path / "hms-agent.exe"
     write_fake_pe(x64)
