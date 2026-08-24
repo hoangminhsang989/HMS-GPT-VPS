@@ -9,18 +9,23 @@ from tempfile import NamedTemporaryFile
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _MAX_INSTANCE_REGISTRY_BYTES = 1024 * 1024
-_VM_RECORD_FIELDS = frozenset(
+_VM_RECORD_REQUIRED_FIELDS = frozenset(
     {
         "instance_id",
         "vm_name",
         "backend",
         "phase",
         "workspace_path",
+    }
+)
+_VM_RECORD_OPTIONAL_FIELDS = frozenset(
+    {
         "vm_id",
         "switch_name",
         "guest_ipv4",
     }
 )
+_VM_RECORD_FIELDS = _VM_RECORD_REQUIRED_FIELDS | _VM_RECORD_OPTIONAL_FIELDS
 
 
 def _require_text(value: object, label: str) -> str:
@@ -85,7 +90,10 @@ class VMRecord:
     def from_mapping(cls, raw: object) -> "VMRecord":
         if not isinstance(raw, dict):
             raise ValueError("registry VM record must be an object")
-        if frozenset(raw.keys()) != _VM_RECORD_FIELDS:
+        keys = frozenset(raw.keys())
+        if not _VM_RECORD_REQUIRED_FIELDS.issubset(keys) or not keys.issubset(
+            _VM_RECORD_FIELDS
+        ):
             raise ValueError("registry VM record fields are invalid")
         record = cls(
             instance_id=_require_text(raw["instance_id"], "instance_id"),
@@ -93,9 +101,9 @@ class VMRecord:
             backend=_require_text(raw["backend"], "backend"),
             phase=_require_text(raw["phase"], "phase"),
             workspace_path=_require_text(raw["workspace_path"], "workspace_path"),
-            vm_id=_require_optional_text(raw["vm_id"], "vm_id"),
-            switch_name=_require_optional_text(raw["switch_name"], "switch_name"),
-            guest_ipv4=_require_optional_text(raw["guest_ipv4"], "guest_ipv4"),
+            vm_id=_require_optional_text(raw.get("vm_id"), "vm_id"),
+            switch_name=_require_optional_text(raw.get("switch_name"), "switch_name"),
+            guest_ipv4=_require_optional_text(raw.get("guest_ipv4"), "guest_ipv4"),
         )
         record.validate()
         return record
