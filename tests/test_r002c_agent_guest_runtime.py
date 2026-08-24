@@ -37,15 +37,25 @@ def _identity() -> AgentRuntimeIdentity:
     )
 
 
+def _tool(path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"trusted-test-tool")
+    return str(path.resolve())
+
+
 def _config(tmp_path) -> AgentGuestRuntimeConfig:
     workspace = tmp_path / "workspace"
     state = tmp_path / "state"
     workspace.mkdir()
     state.mkdir()
+    python_executable = _tool(tmp_path / "trusted-tools" / "python-test.exe")
+    git_executable = _tool(tmp_path / "trusted-tools" / "git-test.exe")
     return AgentGuestRuntimeConfig(
         instance_id="hms-01",
         project_id="project-01",
         bridge_origin="https://bridge.example",
+        python_executable=python_executable,
+        git_executable=git_executable,
         workspace_root=workspace,
         state_root=state,
         health_port=0,
@@ -190,11 +200,15 @@ def test_guest_runtime_rejects_wrong_instance_before_runtime_store_side_effects(
 def test_guest_runtime_requires_https_and_existing_managed_paths(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     state = tmp_path / "state"
+    python_executable = str((tmp_path / "trusted" / "python.exe").resolve())
+    git_executable = str((tmp_path / "trusted" / "git.exe").resolve())
 
     invalid_origin = AgentGuestRuntimeConfig(
         instance_id="hms-01",
         project_id="project-01",
         bridge_origin="http://bridge.example",
+        python_executable=python_executable,
+        git_executable=git_executable,
         workspace_root=workspace,
         state_root=state,
     )
@@ -205,11 +219,48 @@ def test_guest_runtime_requires_https_and_existing_managed_paths(tmp_path) -> No
         instance_id="hms-01",
         project_id="project-01",
         bridge_origin="https://bridge.example",
+        python_executable=python_executable,
+        git_executable=git_executable,
         workspace_root=workspace,
         state_root=state,
     )
     with pytest.raises(FileNotFoundError, match="workspace root"):
         missing_paths.require_runtime_paths()
+
+
+def test_guest_runtime_rejects_relative_tool_paths(tmp_path) -> None:
+    config = AgentGuestRuntimeConfig(
+        instance_id="hms-01",
+        project_id="project-01",
+        bridge_origin="https://bridge.example",
+        python_executable="python.exe",
+        git_executable=str((tmp_path / "git.exe").resolve()),
+        workspace_root=tmp_path / "workspace",
+        state_root=tmp_path / "state",
+    )
+    with pytest.raises(ValueError, match="absolute path"):
+        config.validate()
+
+
+def test_guest_runtime_rejects_tools_inside_agent_writable_roots(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    state = tmp_path / "state"
+    workspace.mkdir()
+    state.mkdir()
+    python_executable = _tool(workspace / "python.exe")
+    git_executable = _tool(tmp_path / "trusted-tools" / "git.exe")
+
+    config = AgentGuestRuntimeConfig(
+        instance_id="hms-01",
+        project_id="project-01",
+        bridge_origin="https://bridge.example",
+        python_executable=python_executable,
+        git_executable=git_executable,
+        workspace_root=workspace,
+        state_root=state,
+    )
+    with pytest.raises(PermissionError, match="Agent-writable"):
+        config.require_runtime_paths()
 
 
 @pytest.mark.parametrize(

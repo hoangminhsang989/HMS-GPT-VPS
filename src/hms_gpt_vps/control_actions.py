@@ -40,12 +40,15 @@ class ControlActionRuntime:
     workspace: Workspace
     audit_log: AuditLog
     python_executable: str = "python"
+    git_executable: str = "git"
 
     def __post_init__(self) -> None:
         if not self.instance_id.strip():
             raise ValueError("instance_id is required")
         if not self.python_executable.strip():
             raise ValueError("python_executable is required")
+        if not self.git_executable.strip():
+            raise ValueError("git_executable is required")
 
     def _require_instance(self, request: ControlRequest) -> None:
         if request.instance_id != self.instance_id:
@@ -322,6 +325,7 @@ class ControlActionRuntime:
             capability="process.test",
             audit_log=self.audit_log,
             timeout_seconds=float(timeout),
+            require_trusted_executable=True,
         )
         response = self._command_response(result)
         response["argv"] = list(result.argv)
@@ -330,10 +334,17 @@ class ControlActionRuntime:
     def _git_status(self) -> dict[str, Any]:
         result = run_command(
             self.workspace,
-            ["git", "status", "--short", "--branch", "--untracked-files=all"],
+            [
+                self.git_executable,
+                "status",
+                "--short",
+                "--branch",
+                "--untracked-files=all",
+            ],
             capability="git.status",
             audit_log=self.audit_log,
             timeout_seconds=30,
+            require_trusted_executable=True,
         )
         return self._command_response(result)
 
