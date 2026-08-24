@@ -125,6 +125,34 @@ def test_observer_does_not_probe_application_when_service_boundary_is_not_ready(
     assert provision.agent_healthy is False
 
 
+def test_observer_rejects_truthy_non_boolean_service_readiness(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_service(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("service")
+        return {"service_ready": "false"}
+
+    def fake_health(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("health")
+        raise AssertionError("malformed readiness must not cross the health gate")
+
+    monkeypatch.setattr(
+        "hms_gpt_vps.agent_post_install_observe.probe_agent_service_readiness",
+        fake_service,
+    )
+    monkeypatch.setattr(
+        "hms_gpt_vps.agent_post_install_observe.probe_agent_application_health_for_runtime",
+        fake_health,
+    )
+
+    observed = AgentPostInstallObserver(observer_config()).observe(credential())
+
+    assert calls == ["service"]
+    assert observed.service_ready is False
+    assert observed.agent_healthy is False
+    assert observed.health_error == "service_not_ready"
+
+
 def test_observer_sets_agent_healthy_only_after_both_verified_layers(monkeypatch) -> None:
     calls: list[str] = []
 
