@@ -88,3 +88,22 @@ def test_registry_rejects_unknown_record_fields(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="record fields are invalid"):
         InstanceRegistry(path).load()
+
+
+def test_registry_preserves_legacy_missing_optional_fields(tmp_path: Path) -> None:
+    path = tmp_path / "instances.json"
+    legacy = {
+        "instance_id": "hms-legacy",
+        "vm_name": "HMS-GPT-VPS-LEGACY",
+        "backend": "hyperv",
+        "phase": "network_ready",
+        "workspace_path": r"C:\HMS-Workspace",
+    }
+    path.write_text(json.dumps({"hms-legacy": legacy}), encoding="utf-8")
+
+    record = InstanceRegistry(path).get("hms-legacy")
+
+    assert record is not None
+    assert record.vm_id is None
+    assert record.switch_name is None
+    assert record.guest_ipv4 is None
