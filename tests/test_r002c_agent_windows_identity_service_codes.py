@@ -10,7 +10,6 @@ from hms_gpt_vps.agent_service_runtime_config import (
 )
 from hms_gpt_vps.agent_windows_identity import (
     IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
-    IDENTITY_FAILURE_ELEVATED,
     IDENTITY_FAILURE_NOT_LOCAL_SERVICE,
     IDENTITY_FAILURE_SERVICE_SID_ABSENT,
     LOCAL_SERVICE_SID,
@@ -88,10 +87,10 @@ def _config(tmp_path: Path) -> AgentServiceRuntimeConfig:
             AgentWindowsTokenSnapshot(
                 user_sid=LOCAL_SERVICE_SID,
                 service_sid_present=True,
-                administrators_sid_present=False,
+                administrators_sid_present=True,
                 elevated=True,
             ),
-            IDENTITY_FAILURE_ELEVATED,
+            IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
         ),
     ],
 )
@@ -119,6 +118,19 @@ def test_identity_validation_failure_is_bounded_to_safe_scm_subcode(
     failed = backend.statuses[-1]
     assert failed.win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR
     assert failed.service_specific_exit_code == expected_code
+
+
+def test_token_elevation_flag_cannot_create_an_identity_failure_code() -> None:
+    identity = validate_agent_service_token(
+        AgentWindowsTokenSnapshot(
+            user_sid=LOCAL_SERVICE_SID,
+            service_sid_present=True,
+            administrators_sid_present=False,
+            elevated=True,
+        )
+    )
+
+    assert identity.privilege == "non-admin"
 
 
 def test_untrusted_identity_exception_code_cannot_escape_bounded_mapping(tmp_path: Path) -> None:
