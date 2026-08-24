@@ -41,7 +41,8 @@ def test_service_readiness_requires_exact_runtime_config_hash_and_acl() -> None:
     assert "runtimeConfigInAgentRoot" in script
     assert "runtimeConfigRead" in script
     assert "runtime_config_sha256_ok" in script
-    assert "Get-FileHash -LiteralPath $runtimeConfigPath" in script
+    assert "$actualRuntimeConfigHash = Get-HmsSha256 $runtimeConfigPath" in script
+    assert "Get-FileHash" not in script
     service_ready_block = script[script.index("$serviceReady ="):script.index("[pscustomobject]")]
     assert "$runtimeConfigExists" in service_ready_block
     assert "$runtimeConfigHashOk" in service_ready_block
