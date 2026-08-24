@@ -11,6 +11,7 @@ from hms_gpt_vps.agent_health_contract import (
     parse_agent_health,
 )
 from hms_gpt_vps.agent_health_probe import probe_agent_application_health_for_runtime
+from hms_gpt_vps.agent_package import AgentPackageFile, AgentPackageManifest
 from hms_gpt_vps.agent_post_install_observe import (
     AgentPostInstallObservationConfig,
     AgentPostInstallObserver,
@@ -38,6 +39,23 @@ def runtime_config(*, health_port: int = 8765) -> AgentServiceRuntimeConfig:
     )
 
 
+def package_manifest() -> AgentPackageManifest:
+    return AgentPackageManifest(
+        platform="windows-x64",
+        version="0.1.0",
+        entrypoint="hms-agent.exe",
+        file_count=1,
+        total_size=1,
+        files=(
+            AgentPackageFile(
+                path="hms-agent.exe",
+                size=1,
+                sha256="a" * 64,
+            ),
+        ),
+    )
+
+
 def health_document():
     return parse_agent_health(
         {
@@ -57,10 +75,11 @@ def health_document():
 
 
 def observer_config() -> AgentPostInstallObservationConfig:
+    manifest = package_manifest()
     return AgentPostInstallObservationConfig(
         vm_name="HMS-GPT-VPS-01",
-        expected_agent_sha256="a" * 64,
-        expected_agent_version="0.1.0",
+        package_manifest=manifest,
+        expected_agent_version=manifest.version,
         service=AgentServiceConfig(),
         runtime=runtime_config(),
     )
