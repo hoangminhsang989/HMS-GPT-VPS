@@ -41,12 +41,36 @@ from .powershell_direct import PowerShellDirectCredential
 from .provisioning import ProvisionObservation
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+
+
 class ManagedAgentProvisioningError(RuntimeError):
     pass
 
 
 def _same_windows_path(left: str, right: str) -> bool:
     return str(PureWindowsPath(left)).casefold() == str(PureWindowsPath(right)).casefold()
+
+
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = path.expanduser().absolute()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
 
 
 def _normalize_vm_id(value: str, label: str) -> str:
@@ -87,8 +111,8 @@ class ManagedAgentProvisioningConfig:
             raise FileNotFoundError(self.package_manifest_path)
         if not self.registry_path.is_file():
             raise FileNotFoundError(self.registry_path)
-        if self.registry_path.is_symlink():
-            raise ValueError("instance registry path must not be a symbolic link")
+        if _path_chain_has_redirect(self.registry_path):
+            raise ValueError("instance registry path must not traverse a link or reparse point")
 
 
 class ManagedAgentProvisioningRuntime:
@@ -113,6 +137,10 @@ class ManagedAgentProvisioningRuntime:
         self.registry = InstanceRegistry(config.registry_path)
 
     def _expected_vm_id(self) -> str:
+        if _path_chain_has_redirect(self.config.registry_path):
+            raise ManagedAgentProvisioningError(
+                "instance registry authority path traverses a link or reparse point"
+            )
         record = self.registry.get(self.config.instance_id)
         if record is None:
             raise ManagedAgentProvisioningError(
