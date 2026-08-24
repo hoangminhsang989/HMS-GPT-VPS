@@ -67,6 +67,12 @@ def test_service_readiness_requires_exact_package_runtime_config_hash_and_acl() 
     assert "FileSystemAclExtensions" not in script
     assert "icacls.exe $Path" in script
     assert "[string]$serviceSid.Value" in script
+    assert "$identityPrefixes" in script
+    assert "($servicePrincipal + ':')" in script
+    assert "([string]$serviceSid.Value + ':')" in script
+    assert "('*' + [string]$serviceSid.Value + ':')" in script
+    assert "$line.IndexOf($identityPrefix" in script
+    assert "$line.IndexOf($identity," not in script
     assert "@('RX', 'M', 'F')" in script
     assert "@('M', 'F')" in script
     ready_start = script.index("$serviceReady =")
