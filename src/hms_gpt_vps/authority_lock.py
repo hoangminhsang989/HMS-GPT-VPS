@@ -57,11 +57,11 @@ def _assert_lock_authority(path: Path) -> None:
 
 
 def _windows_mutex_name(path: Path) -> str:
-    """Derive one case-insensitive Windows-local mutex namespace from lexical authority."""
+    """Derive one case-insensitive, cross-session Windows mutex from lexical authority."""
 
     lexical = str(path.expanduser().absolute()).casefold().encode("utf-8")
     digest = hashlib.sha256(lexical).hexdigest()
-    return f"Local\\HMS-GPT-VPS-Authority-{digest}"
+    return f"Global\\HMS-GPT-VPS-Authority-{digest}"
 
 
 def _acquire_windows_mutex(path: Path, timeout_seconds: float):  # type: ignore[no-untyped-def]
@@ -130,15 +130,18 @@ def exclusive_authority_lock(
     """Serialize one authority mutation without stale ownership after crash.
 
     On Windows, the actual exclusion domain is a named kernel mutex derived from
-    the case-insensitive lexical authority path. Renaming/replacing the rendezvous
-    file therefore cannot split two production processes into different lock
+    the case-insensitive lexical authority path in the Global namespace. The
+    mutex therefore serializes cooperating processes across interactive/RDP and
+    service sessions that share the same host authority file. Renaming/replacing
+    the rendezvous file cannot split those Windows processes into different lock
     domains while one is inside the critical section. A crashed mutex owner is
     reported as WAIT_ABANDONED and ownership transfers to the waiter.
 
     On non-Windows test/development hosts, an advisory flock on the persistent
     rendezvous inode provides process serialization. In both modes the file is
     never deleted and its lexical identity is checked for tampering before and
-    after the critical section.
+    after the critical section. The mutex is a serialization primitive, not an
+    authorization primitive; path authority checks remain mandatory.
     """
 
     if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
