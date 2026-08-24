@@ -62,6 +62,17 @@ def _is_reparse_point(path: Path) -> bool:
     return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+def _resolve_package_root(root: Path) -> Path:
+    """Reject a linked root before resolution can erase the trust-boundary fact."""
+    root.lstat()
+    if root.is_symlink() or _is_reparse_point(root):
+        raise ValueError("Agent package root must not be a link or reparse point")
+    resolved = root.resolve(strict=True)
+    if not resolved.is_dir():
+        raise FileNotFoundError(root)
+    return resolved
+
+
 def _iter_package_files(root: Path) -> list[Path]:
     if not root.is_dir():
         raise FileNotFoundError(root)
@@ -266,7 +277,7 @@ class AgentPackageManifest:
 
 def build_agent_package_manifest(root: Path, *, version: str) -> AgentPackageManifest:
     """Build deterministic integrity metadata for a complete onedir package."""
-    root = root.resolve(strict=True)
+    root = _resolve_package_root(root)
     paths = _iter_package_files(root)
     items: list[AgentPackageFile] = []
     total = 0
@@ -301,7 +312,7 @@ def build_agent_package_manifest(root: Path, *, version: str) -> AgentPackageMan
 def verify_agent_package(root: Path, manifest: AgentPackageManifest) -> None:
     """Fail closed unless the complete package tree exactly matches its manifest."""
     manifest.validate()
-    root = root.resolve(strict=True)
+    root = _resolve_package_root(root)
     actual_paths = _iter_package_files(root)
     actual_by_folded: dict[str, Path] = {}
     for path in actual_paths:
