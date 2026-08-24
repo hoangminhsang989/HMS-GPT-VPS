@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from .authority_lock import exclusive_authority_lock
+
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _MAX_INSTANCE_REGISTRY_BYTES = 1024 * 1024
@@ -113,6 +115,7 @@ class InstanceRegistry:
     def __init__(self, path: Path) -> None:
         # Keep lexical authority; resolving would erase symlink/junction evidence.
         self.path = path.expanduser().absolute()
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
 
     def _assert_safe_authority_path(self) -> None:
         if _path_chain_has_redirect(self.path):
@@ -123,7 +126,14 @@ class InstanceRegistry:
         if self.path.exists() and not self.path.is_file():
             raise ValueError("instance registry authority path is not a regular file")
 
-    def load(self) -> dict[str, VMRecord]:
+    def _prepare_authority_parent(self) -> None:
+        self._assert_safe_authority_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_safe_authority_path()
+        if not self.path.parent.is_dir():
+            raise ValueError("instance registry parent authority is not a directory")
+
+    def _load_unlocked(self) -> dict[str, VMRecord]:
         self._assert_safe_authority_path()
         if not self.path.exists():
             return {}
@@ -169,26 +179,24 @@ class InstanceRegistry:
             records[key] = record
         return records
 
+    def load(self) -> dict[str, VMRecord]:
+        # Atomic replacement means an unlocked reader observes either the prior
+        # complete registry or the next complete registry. All cooperating
+        # writers serialize and re-read the latest registry under lock.
+        return self._load_unlocked()
+
     def get(self, instance_id: str) -> VMRecord | None:
         _require_text(instance_id, "lookup instance_id")
         return self.load().get(instance_id)
 
-    def upsert(self, record: VMRecord) -> None:
-        record.validate()
-        records = self.load()
-        existing = records.get(record.instance_id)
-        if (
-            existing is not None
-            and existing.vm_id is not None
-            and record.vm_id is not None
-            and existing.vm_id != record.vm_id
-        ):
-            raise ValueError("refusing to replace persisted VM identity with a different VMId")
-        records[record.instance_id] = record
+    def _write_records_unlocked(self, records: dict[str, VMRecord]) -> None:
+        self._prepare_authority_parent()
+        for key, value in records.items():
+            _require_text(key, "instance key")
+            value.validate()
+            if value.instance_id != key:
+                raise ValueError("registry key does not match VM record instance_id")
 
-        self._assert_safe_authority_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._assert_safe_authority_path()
         payload = {key: asdict(value) for key, value in sorted(records.items())}
         encoded = (
             json.dumps(
@@ -222,3 +230,22 @@ class InstanceRegistry:
         finally:
             if temp_path is not None and not _path_chain_has_redirect(temp_path):
                 temp_path.unlink(missing_ok=True)
+
+    def upsert(self, record: VMRecord) -> None:
+        record.validate()
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            # Re-read inside the writer lock. This prevents two host processes
+            # from loading the same snapshot and then replacing each other's
+            # unrelated records or stale VM identity evidence.
+            records = self._load_unlocked()
+            existing = records.get(record.instance_id)
+            if (
+                existing is not None
+                and existing.vm_id is not None
+                and record.vm_id is not None
+                and existing.vm_id != record.vm_id
+            ):
+                raise ValueError("refusing to replace persisted VM identity with a different VMId")
+            records[record.instance_id] = record
+            self._write_records_unlocked(records)
