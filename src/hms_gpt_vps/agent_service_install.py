@@ -134,6 +134,8 @@ $expectedRuntimeConfigHash = {expected_config_hash}
 $runtimeConfigPayload = {runtime_config_payload}
 $packageManifestPayload = {package_manifest_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
+$expectedQuotedCommand = '"' + $binaryPath + '" service'
+$expectedUnquotedCommand = $binaryPath + ' service'
 
 {POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION}
 
@@ -208,14 +210,17 @@ if ($actualRuntimeConfigHash -ne $expectedRuntimeConfigHash) {{
   throw 'HMS Agent runtime config SHA-256 mismatch inside guest'
 }}
 
-$quotedBinary = '"' + $binaryPath + '" service'
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($null -eq $existing) {{
-  & sc.exe create $serviceName 'binPath=' $quotedBinary 'start=' 'auto' 'obj=' 'NT AUTHORITY\\LocalService' 'DisplayName=' $displayName | Out-Null
+  & sc.exe create $serviceName 'binPath=' $expectedQuotedCommand 'start=' 'auto' 'obj=' 'NT AUTHORITY\\LocalService' 'DisplayName=' $displayName | Out-Null
   if ($LASTEXITCODE -ne 0) {{ throw 'sc.exe create HMS Agent failed' }}
 }} else {{
   $wmi = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
-  if ($wmi.PathName -ne $quotedBinary) {{
+  $commandOk = [bool](
+    $wmi.PathName -eq $expectedQuotedCommand -or
+    (($binaryPath -notmatch '\\s') -and $wmi.PathName -eq $expectedUnquotedCommand)
+  )
+  if (-not $commandOk) {{
     throw 'Existing HMS Agent service binary path conflicts with managed configuration'
   }}
   if ($wmi.StartName -ne 'NT AUTHORITY\\LocalService') {{
