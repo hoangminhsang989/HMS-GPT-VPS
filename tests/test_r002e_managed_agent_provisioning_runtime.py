@@ -20,6 +20,7 @@ from hms_gpt_vps.agent_service_runtime_config import (
     AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
     AgentServiceRuntimeConfig,
 )
+from hms_gpt_vps.instance_registry import InstanceRegistry, VMRecord
 from hms_gpt_vps.managed_agent_provisioning_runtime import (
     ManagedAgentProvisioningConfig,
     ManagedAgentProvisioningError,
@@ -27,6 +28,11 @@ from hms_gpt_vps.managed_agent_provisioning_runtime import (
 )
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
 from hms_gpt_vps import managed_agent_provisioning_runtime as runtime_module
+
+
+VM_ID = "11111111-2222-3333-4444-555555555555"
+OTHER_VM_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+VM_NAME = "HMS-GPT-VPS-01"
 
 
 class MemorySecretStore:
@@ -69,6 +75,20 @@ def build_runtime(tmp_path: Path) -> tuple[ManagedAgentProvisioningRuntime, Agen
     manifest_path = tmp_path / "hms-agent.manifest.json"
     write_agent_package_manifest(manifest_path, manifest)
 
+    registry_path = tmp_path / "instances.json"
+    InstanceRegistry(registry_path).upsert(
+        VMRecord(
+            instance_id="hms-01",
+            vm_name=VM_NAME,
+            backend="hyperv",
+            phase="vm_created",
+            workspace_path=r"C:\HMS-Workspace",
+            vm_id=VM_ID,
+            switch_name="HMS-GPT-VPS-NAT",
+            guest_ipv4="192.168.127.2",
+        )
+    )
+
     secret_store = MemorySecretStore()
     attempt_store = AgentPackageTransferAttemptStore(
         tmp_path / "transfer-attempt.json",
@@ -77,9 +97,10 @@ def build_runtime(tmp_path: Path) -> tuple[ManagedAgentProvisioningRuntime, Agen
     runtime = ManagedAgentProvisioningRuntime(
         ManagedAgentProvisioningConfig(
             instance_id="hms-01",
-            vm_name="HMS-GPT-VPS-01",
+            vm_name=VM_NAME,
             package_source_root=package,
             package_manifest_path=manifest_path,
+            registry_path=registry_path,
             service=AgentServiceConfig(),
             runtime=runtime_config(),
         ),
@@ -90,6 +111,23 @@ def build_runtime(tmp_path: Path) -> tuple[ManagedAgentProvisioningRuntime, Agen
 
 def credential() -> PowerShellDirectCredential:
     return PowerShellDirectCredential("hmsbootstrap", "Aa1!test-secret")
+
+
+def install_vm_identity_mock(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    observed_vm_id: str = VM_ID,
+    observed_vm_name: str = VM_NAME,
+) -> list[str]:
+    scripts: list[str] = []
+
+    def identity_probe(script: str, *, timeout_seconds: int, **_kwargs: object):
+        scripts.append(script)
+        assert timeout_seconds == 30
+        return {"vm_id": observed_vm_id, "vm_name": observed_vm_name}
+
+    monkeypatch.setattr(runtime_module, "run_powershell_json", identity_probe)
+    return scripts
 
 
 def install_host_integration_mocks(
@@ -116,11 +154,56 @@ def install_host_integration_mocks(
     return restored
 
 
+def test_vm_name_reuse_with_different_vm_id_fails_before_guest_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _, _ = build_runtime(tmp_path)
+    scripts = install_vm_identity_mock(monkeypatch, observed_vm_id=OTHER_VM_ID)
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("guest mutation/probe must not run after VMId mismatch")
+
+    monkeypatch.setattr(runtime_module, "probe_agent_package_ready", forbidden)
+    monkeypatch.setattr(runtime_module, "install_agent_service", forbidden)
+
+    with pytest.raises(ManagedAgentProvisioningError, match="does not match persisted"):
+        runtime.install_service(credential())
+    assert scripts
+    assert "Get-VM -Id $expectedVmId" in scripts[0]
+    assert VM_ID in scripts[0]
+
+
+def test_registry_backend_must_be_hyperv_before_late_guest_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _, _ = build_runtime(tmp_path)
+    runtime.registry.upsert(
+        VMRecord(
+            instance_id="hms-01",
+            vm_name=VM_NAME,
+            backend="other",
+            phase="vm_created",
+            workspace_path=r"C:\HMS-Workspace",
+            vm_id=VM_ID,
+        )
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("host VM probe must not run for non-Hyper-V registry record")
+
+    monkeypatch.setattr(runtime_module, "run_powershell_json", forbidden)
+    with pytest.raises(ManagedAgentProvisioningError, match="backend is not Hyper-V"):
+        runtime.install_service(credential())
+
+
 def test_stage_retry_reuses_exact_owned_attempt_and_restores_host_baseline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, store, manifest = build_runtime(tmp_path)
+    install_vm_identity_mock(monkeypatch)
     seen: list[tuple[str, str]] = []
     restored = install_host_integration_mocks(monkeypatch, baseline=False)
     monkeypatch.setattr(
@@ -180,6 +263,7 @@ def test_enabled_integration_baseline_is_preserved_not_forced_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _, manifest = build_runtime(tmp_path)
+    install_vm_identity_mock(monkeypatch)
     restored = install_host_integration_mocks(monkeypatch, baseline=True)
     monkeypatch.setattr(
         runtime_module,
@@ -211,10 +295,11 @@ def test_published_attempt_only_restores_host_baseline_and_reprobes_final_packag
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, store, manifest = build_runtime(tmp_path)
+    install_vm_identity_mock(monkeypatch)
     manifest_sha = canonical_agent_package_manifest_sha256(manifest)
     store.begin_or_resume(
         instance_id="hms-01",
-        vm_name="HMS-GPT-VPS-01",
+        vm_name=VM_NAME,
         manifest_sha256=manifest_sha,
     )
     store.bind_guest_service_interface_baseline(False)
@@ -249,9 +334,10 @@ def test_published_attempt_with_lost_final_proof_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, store, manifest = build_runtime(tmp_path)
+    install_vm_identity_mock(monkeypatch)
     store.begin_or_resume(
         instance_id="hms-01",
-        vm_name="HMS-GPT-VPS-01",
+        vm_name=VM_NAME,
         manifest_sha256=canonical_agent_package_manifest_sha256(manifest),
     )
     store.bind_guest_service_interface_baseline(False)
@@ -274,6 +360,7 @@ def test_service_install_requires_package_ready_before_scm_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _, _ = build_runtime(tmp_path)
+    install_vm_identity_mock(monkeypatch)
     monkeypatch.setattr(
         runtime_module,
         "probe_agent_package_ready",
@@ -293,6 +380,7 @@ def test_service_install_runs_only_after_exact_package_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _, manifest = build_runtime(tmp_path)
+    install_vm_identity_mock(monkeypatch)
     monkeypatch.setattr(
         runtime_module,
         "probe_agent_package_ready",
