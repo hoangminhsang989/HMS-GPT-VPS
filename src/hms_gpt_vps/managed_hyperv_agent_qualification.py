@@ -8,7 +8,6 @@ from typing import Any
 
 from .agent_device_credential_store import GUEST_PROTECTION_SCOPE
 from .agent_device_enrollment import AgentDeviceEnrollmentConfig
-from .agent_device_enrollment_probe import probe_agent_device_enrollment
 from .agent_health_contract import AgentHealthDocument
 from .agent_package import load_agent_package_manifest, verify_agent_package
 from .agent_package_manifest_artifact import (
@@ -17,6 +16,7 @@ from .agent_package_manifest_artifact import (
 )
 from .agent_transport_protocol import AgentDeviceCredential
 from .managed_agent_reconcile_runtime import ManagedAgentReconcileRuntime
+from .managed_vm_id_operations import probe_agent_device_enrollment_by_id
 from .powershell_direct import PowerShellDirectCredential
 from .provision_state import ProvisionState
 from .provisioning import ProvisionContext
@@ -161,6 +161,7 @@ def _final_health(post: Any) -> AgentHealthDocument:
 
 
 def _prove_exact_device_enrollment(
+    vm_id: str,
     agent_runtime: Any,
     credential: PowerShellDirectCredential,
     expected_device_credential: AgentDeviceCredential,
@@ -170,7 +171,8 @@ def _prove_exact_device_enrollment(
         guest_state_path=agent_runtime.config.service.state_path,
         service_name=agent_runtime.config.service.service_name,
     )
-    evidence = probe_agent_device_enrollment(
+    evidence = probe_agent_device_enrollment_by_id(
+        vm_id,
         agent_runtime.config.vm_name,
         credential,
         enrollment_config,
@@ -209,7 +211,8 @@ def qualify_managed_hyperv_agent(
     credentials. It pins the exact host package manifest, re-proves stable
     Hyper-V identity and the Bridge-bound LocalMachine-DPAPI device credential,
     exercises the production late reconcile runtime until AGENT_HEALTHY, then
-    independently re-verifies package, SCM and strict application health.
+    independently re-verifies package, SCM and strict application health. Every
+    qualification guest call after stable identity is proven is bound to VMId.
     """
 
     credential.validate()
@@ -256,6 +259,7 @@ def qualify_managed_hyperv_agent(
 
     starting_vm_id = agent_runtime._assert_vm_identity()
     _prove_exact_device_enrollment(
+        starting_vm_id,
         agent_runtime,
         credential,
         expected_device_credential,
@@ -296,6 +300,7 @@ def qualify_managed_hyperv_agent(
             "managed Hyper-V VMId changed during Agent qualification"
         )
     _prove_exact_device_enrollment(
+        ending_vm_id,
         agent_runtime,
         credential,
         expected_device_credential,
