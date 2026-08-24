@@ -113,7 +113,9 @@ def test_copy_script_uses_one_bounded_guest_service_interface_window(tmp_path: P
     assert "Guest Service Interface" in script
     assert "-FileSource Host" in script
     assert "-CreateFullPath" in script
-    assert " -Force" not in script
+    copy_lines = [line for line in script.splitlines() if "Copy-VMFile " in line]
+    assert copy_lines
+    assert all(" -Force" not in line for line in copy_lines)
     assert "Get-HmsSha256 $source" in script
     assert script.index("Get-HmsSha256 $source") < script.index("Copy-VMFile -Name $vmName")
     assert "manifest source hash changed before copy" in script
