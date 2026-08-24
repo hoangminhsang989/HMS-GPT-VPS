@@ -16,6 +16,7 @@ from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
 
 
 VM_ID = "11111111-2222-3333-4444-555555555555"
+OTHER_VM_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
 class FakeBaseProof:
@@ -36,13 +37,23 @@ class FakeBaseProof:
         }
 
 
-def runtime():  # type: ignore[no-untyped-def]
+def runtime(vm_ids: list[str] | None = None):  # type: ignore[no-untyped-def]
+    observed = list(vm_ids or [VM_ID, VM_ID])
+    last = observed[-1]
+
+    def assert_vm_identity() -> str:
+        nonlocal last
+        if observed:
+            last = observed.pop(0)
+        return last
+
     agent_runtime = SimpleNamespace(
         config=SimpleNamespace(
             vm_name="HMS-GPT-VPS-01",
             service=AgentServiceConfig(),
             runtime=SimpleNamespace(health_port=8765),
-        )
+        ),
+        _assert_vm_identity=assert_vm_identity,
     )
     return SimpleNamespace(agent_runtime=agent_runtime)
 
@@ -69,15 +80,30 @@ def valid_strict_payload() -> dict[str, object]:
     }
 
 
-def test_strict_qualification_adds_independent_os_listener_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def install_base_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         strict_module,
         "qualify_managed_hyperv_agent",
         lambda *_args, **_kwargs: FakeBaseProof(),
     )
 
+
+def good_listener(*_args, **_kwargs) -> dict[str, object]:  # type: ignore[no-untyped-def]
+    return {
+        "os_listener_proven": True,
+        "service_name": "HMSAgent",
+        "process_id": 4321,
+        "health_port": 8765,
+        "listener_count": 1,
+        "local_addresses": ["127.0.0.1"],
+        "vm_id": VM_ID,
+    }
+
+
+def test_strict_qualification_adds_independent_os_listener_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
     seen: dict[str, object] = {}
 
     def listener(vm_id, vm_name, _credential, service, health_port):  # type: ignore[no-untyped-def]
@@ -87,15 +113,7 @@ def test_strict_qualification_adds_independent_os_listener_evidence(
             service_name=service.service_name,
             health_port=health_port,
         )
-        return {
-            "os_listener_proven": True,
-            "service_name": "HMSAgent",
-            "process_id": 4321,
-            "health_port": 8765,
-            "listener_count": 1,
-            "local_addresses": ["127.0.0.1"],
-            "vm_id": VM_ID,
-        }
+        return good_listener()
 
     monkeypatch.setattr(
         strict_module,
@@ -125,14 +143,52 @@ def test_strict_qualification_adds_independent_os_listener_evidence(
     assert payload["health_listener_port"] == 8765
 
 
+def test_strict_qualification_reproves_vm_id_before_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+
+    def forbidden(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("listener probe must not run after pre-proof VMId change")
+
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        forbidden,
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="before strict"):
+        qualify_managed_hyperv_agent_strict(
+            runtime([OTHER_VM_ID]),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            credential(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+
+
+def test_strict_qualification_reproves_vm_id_after_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_base_mock(monkeypatch)
+    monkeypatch.setattr(
+        strict_module,
+        "probe_managed_agent_health_listener_by_id",
+        good_listener,
+    )
+
+    with pytest.raises(StrictManagedHyperVAgentQualificationError, match="during strict"):
+        qualify_managed_hyperv_agent_strict(
+            runtime([VM_ID, OTHER_VM_ID]),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            credential(),
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+
+
 def test_strict_qualification_refuses_incomplete_listener_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        strict_module,
-        "qualify_managed_hyperv_agent",
-        lambda *_args, **_kwargs: FakeBaseProof(),
-    )
+    install_base_mock(monkeypatch)
     monkeypatch.setattr(
         strict_module,
         "probe_managed_agent_health_listener_by_id",
@@ -154,17 +210,13 @@ def test_strict_qualification_refuses_incomplete_listener_proof(
 def test_strict_qualification_refuses_listener_vm_id_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        strict_module,
-        "qualify_managed_hyperv_agent",
-        lambda *_args, **_kwargs: FakeBaseProof(),
-    )
+    install_base_mock(monkeypatch)
     monkeypatch.setattr(
         strict_module,
         "probe_managed_agent_health_listener_by_id",
         lambda *_args, **_kwargs: {
             "os_listener_proven": True,
-            "vm_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "vm_id": OTHER_VM_ID,
         },
     )
 
