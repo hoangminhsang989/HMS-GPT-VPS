@@ -79,7 +79,9 @@ def test_service_readiness_is_not_application_health() -> None:
     assert "qsidtype" in script
     assert "ReadAndExecute" in script
     assert "FileSystemRights]::Modify" in script
-    assert "Get-FileHash" in script
+    assert "Get-HmsSha256" in script
+    assert "System.Security.Cryptography.SHA256" in script
+    assert "Get-FileHash" not in script
     assert "runtime_config_sha256_ok" in script
 
     require_agent_service_ready({"service_ready": True})
