@@ -17,10 +17,7 @@ from hms_gpt_vps.managed_agent_provisioning_runtime import (
     ManagedAgentProvisioningRuntime,
 )
 from hms_gpt_vps.managed_agent_reconcile_runtime import ManagedAgentReconcileRuntime
-from hms_gpt_vps.managed_hyperv_agent_qualification import (
-    qualify_managed_hyperv_agent,
-    write_managed_hyperv_agent_qualification_proof,
-)
+from hms_gpt_vps.managed_hyperv_agent_qualification import qualify_managed_hyperv_agent
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
 from hms_gpt_vps.provisioning import ProvisionContext, ProvisioningOrchestrator
 from hms_gpt_vps.windows_provisioner import HyperVHostState, WindowsVMConfig
@@ -80,6 +77,38 @@ def _new_proof_path(raw: str) -> Path:
     if not parent.is_dir():
         raise ValueError("qualification proof parent must be an existing directory")
     return path
+
+
+def _write_proof_create_only(path: Path, payload: dict[str, object]) -> None:
+    """Publish exactly one proof without ever replacing an existing path."""
+
+    target = _new_proof_path(str(path))
+    data = (
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd: int | None = None
+    published = False
+    try:
+        fd = os.open(target, flags, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = None
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        published = True
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if not published:
+            target.unlink(missing_ok=True)
 
 
 def _load_bootstrap_credential() -> PowerShellDirectCredential:
@@ -188,8 +217,9 @@ def main(argv: list[str] | None = None) -> int:
         bridge_credential,
         max_reconcile_steps=args.max_reconcile_steps,
     )
-    write_managed_hyperv_agent_qualification_proof(proof_path, proof)
-    print(json.dumps(proof.to_dict(), ensure_ascii=True, sort_keys=True))
+    proof_payload = proof.to_dict()
+    _write_proof_create_only(proof_path, proof_payload)
+    print(json.dumps(proof_payload, ensure_ascii=True, sort_keys=True))
     return 0
 
 
