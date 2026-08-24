@@ -11,7 +11,10 @@ from .agent_device_enrollment import AgentDeviceEnrollmentConfig
 from .agent_device_enrollment_probe import probe_agent_device_enrollment
 from .agent_health_contract import AgentHealthDocument
 from .agent_package import load_agent_package_manifest, verify_agent_package
-from .agent_package_manifest_artifact import canonical_agent_package_manifest_bytes
+from .agent_package_manifest_artifact import (
+    canonical_agent_package_manifest_bytes,
+    canonical_agent_package_manifest_sha256,
+)
 from .agent_transport_protocol import AgentDeviceCredential
 from .managed_agent_reconcile_runtime import ManagedAgentReconcileRuntime
 from .powershell_direct import PowerShellDirectCredential
@@ -46,6 +49,7 @@ class ManagedHyperVAgentQualificationProof:
     package_file_count: int
     package_total_size: int
     package_entrypoint_sha256: str
+    package_manifest_sha256: str
     package_tree_ok: bool
     package_manifest_sha256_ok: bool
     local_service_account: bool
@@ -110,6 +114,8 @@ class ManagedHyperVAgentQualificationProof:
             raise ValueError("managed Hyper-V package proof is empty")
         if len(self.package_entrypoint_sha256) != 64:
             raise ValueError("managed Hyper-V package entrypoint SHA-256 is invalid")
+        if len(self.package_manifest_sha256) != 64:
+            raise ValueError("managed Hyper-V package manifest SHA-256 is invalid")
 
     def to_dict(self) -> dict[str, object]:
         self.validate()
@@ -154,6 +160,41 @@ def _final_health(post: Any) -> AgentHealthDocument:
     return health
 
 
+def _prove_exact_device_enrollment(
+    agent_runtime: Any,
+    credential: PowerShellDirectCredential,
+    expected_device_credential: AgentDeviceCredential,
+) -> dict[str, object]:
+    enrollment_config = AgentDeviceEnrollmentConfig(
+        instance_id=expected_device_credential.instance_id,
+        guest_state_path=agent_runtime.config.service.state_path,
+        service_name=agent_runtime.config.service.service_name,
+    )
+    evidence = probe_agent_device_enrollment(
+        agent_runtime.config.vm_name,
+        credential,
+        enrollment_config,
+        expected_device_credential,
+    )
+    if not bool(evidence.get("enrollment_ready", False)):
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment was not independently proven"
+        )
+    if evidence.get("instance_id") != expected_device_credential.instance_id:
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment instance differs from Bridge authority"
+        )
+    if evidence.get("device_id") != expected_device_credential.device_id:
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment identity differs from Bridge authority"
+        )
+    if evidence.get("protection_scope") != GUEST_PROTECTION_SCOPE:
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment is not LocalMachine-DPAPI protected"
+        )
+    return evidence
+
+
 def qualify_managed_hyperv_agent(
     reconcile_runtime: ManagedAgentReconcileRuntime,
     context: ProvisionContext,
@@ -165,10 +206,10 @@ def qualify_managed_hyperv_agent(
     """Prove the late Agent path inside one already-managed Hyper-V Windows guest.
 
     This coordinator never creates/deletes a VM and never retires bootstrap
-    credentials. It re-proves stable Hyper-V identity and the exact Bridge-bound
-    LocalMachine-DPAPI guest device credential, exercises the production late
-    reconcile runtime until AGENT_HEALTHY, then independently re-observes the
-    package, SCM and strict application health before emitting a non-secret proof.
+    credentials. It pins the exact host package manifest, re-proves stable
+    Hyper-V identity and the Bridge-bound LocalMachine-DPAPI device credential,
+    exercises the production late reconcile runtime until AGENT_HEALTHY, then
+    independently re-verifies package, SCM and strict application health.
     """
 
     credential.validate()
@@ -187,10 +228,9 @@ def qualify_managed_hyperv_agent(
         )
 
     manifest = load_agent_package_manifest(agent_runtime.config.package_manifest_path)
-    if (
-        agent_runtime.config.package_manifest_path.read_bytes()
-        != canonical_agent_package_manifest_bytes(manifest)
-    ):
+    pinned_manifest_bytes = canonical_agent_package_manifest_bytes(manifest)
+    pinned_manifest_sha256 = canonical_agent_package_manifest_sha256(manifest)
+    if agent_runtime.config.package_manifest_path.read_bytes() != pinned_manifest_bytes:
         raise ManagedHyperVAgentQualificationError(
             "qualification package manifest is not canonical"
         )
@@ -214,34 +254,12 @@ def qualify_managed_hyperv_agent(
             "qualification must start at the managed late-Agent checkpoint"
         )
 
-    # Every production observe/mutation invokes this same gate. Capture the
-    # persisted/read-back VMId before and after the bounded reconcile loop so
-    # the proof cannot be detached from the managed Hyper-V identity.
     starting_vm_id = agent_runtime._assert_vm_identity()
-
-    enrollment_config = AgentDeviceEnrollmentConfig(
-        instance_id=context.instance_id,
-        guest_state_path=agent_runtime.config.service.state_path,
-        service_name=agent_runtime.config.service.service_name,
-    )
-    enrollment_evidence = probe_agent_device_enrollment(
-        agent_runtime.config.vm_name,
+    _prove_exact_device_enrollment(
+        agent_runtime,
         credential,
-        enrollment_config,
         expected_device_credential,
     )
-    if not bool(enrollment_evidence.get("enrollment_ready", False)):
-        raise ManagedHyperVAgentQualificationError(
-            "managed Hyper-V device enrollment was not independently proven"
-        )
-    if enrollment_evidence.get("device_id") != expected_device_credential.device_id:
-        raise ManagedHyperVAgentQualificationError(
-            "managed Hyper-V device enrollment identity differs from Bridge authority"
-        )
-    if enrollment_evidence.get("protection_scope") != GUEST_PROTECTION_SCOPE:
-        raise ManagedHyperVAgentQualificationError(
-            "managed Hyper-V device enrollment is not LocalMachine-DPAPI protected"
-        )
 
     actions: list[str] = []
     for _ in range(max_reconcile_steps):
@@ -277,6 +295,26 @@ def qualify_managed_hyperv_agent(
         raise ManagedHyperVAgentQualificationError(
             "managed Hyper-V VMId changed during Agent qualification"
         )
+    _prove_exact_device_enrollment(
+        agent_runtime,
+        credential,
+        expected_device_credential,
+    )
+
+    # Re-read and re-verify host authority after all mutations. This prevents a
+    # same-count/same-size package swap from escaping the pinned manifest proof.
+    if agent_runtime.config.package_manifest_path.read_bytes() != pinned_manifest_bytes:
+        raise ManagedHyperVAgentQualificationError(
+            "qualification package manifest changed during managed guest execution"
+        )
+    final_host_manifest = load_agent_package_manifest(
+        agent_runtime.config.package_manifest_path
+    )
+    if final_host_manifest != manifest:
+        raise ManagedHyperVAgentQualificationError(
+            "qualification package manifest identity changed during execution"
+        )
+    verify_agent_package(agent_runtime.config.package_source_root, manifest)
 
     final_observation, post = agent_runtime.observe(credential)
     if not (
@@ -294,16 +332,24 @@ def qualify_managed_hyperv_agent(
     package_total_size = _require_int(service_evidence, "package_total_size")
     if package_file_count != manifest.file_count:
         raise ManagedHyperVAgentQualificationError(
-            "managed Hyper-V package file-count evidence differs from host manifest"
+            "managed Hyper-V package file-count evidence differs from pinned host manifest"
         )
     if package_total_size != manifest.total_size:
         raise ManagedHyperVAgentQualificationError(
-            "managed Hyper-V package size evidence differs from host manifest"
+            "managed Hyper-V package size evidence differs from pinned host manifest"
         )
     binary_sha256 = service_evidence.get("binary_sha256")
     if not isinstance(binary_sha256, str) or binary_sha256.lower() != manifest.sha256.lower():
         raise ManagedHyperVAgentQualificationError(
-            "managed Hyper-V package entrypoint evidence differs from host manifest"
+            "managed Hyper-V package entrypoint evidence differs from pinned host manifest"
+        )
+    guest_manifest_sha256 = service_evidence.get("package_manifest_sha256")
+    if (
+        not isinstance(guest_manifest_sha256, str)
+        or guest_manifest_sha256.lower() != pinned_manifest_sha256
+    ):
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V guest manifest identity differs from pinned host manifest"
         )
 
     proof = ManagedHyperVAgentQualificationProof(
@@ -323,6 +369,7 @@ def qualify_managed_hyperv_agent(
         package_file_count=manifest.file_count,
         package_total_size=manifest.total_size,
         package_entrypoint_sha256=manifest.sha256.lower(),
+        package_manifest_sha256=pinned_manifest_sha256,
         package_tree_ok=_require_bool(service_evidence, "package_tree_ok"),
         package_manifest_sha256_ok=_require_bool(
             service_evidence, "package_manifest_sha256_ok"
