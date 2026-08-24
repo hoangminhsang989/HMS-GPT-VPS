@@ -25,11 +25,23 @@ def validate_strict_managed_hyperv_proof_payload(
     *,
     expected_health_port: int | None = None,
 ) -> None:
-    if payload.get("strict_publication_schema_version") != (
-        STRICT_MANAGED_HYPERV_PUBLICATION_SCHEMA_VERSION
+    schema_version = payload.get("strict_publication_schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != STRICT_MANAGED_HYPERV_PUBLICATION_SCHEMA_VERSION
     ):
         raise StrictManagedHyperVAgentQualificationError(
             "strict managed Hyper-V publication schema mismatch"
+        )
+    if expected_health_port is not None and (
+        not isinstance(expected_health_port, int)
+        or isinstance(expected_health_port, bool)
+        or expected_health_port < 1
+        or expected_health_port > 65535
+    ):
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict managed Hyper-V expected listener port is invalid"
         )
     if payload.get("hyperv_guest_proven") is not True:
         raise StrictManagedHyperVAgentQualificationError(
