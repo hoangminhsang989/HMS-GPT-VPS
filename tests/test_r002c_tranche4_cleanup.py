@@ -87,11 +87,13 @@ def test_service_readiness_is_not_application_health(tmp_path: Path) -> None:
     assert "application_health = 'NOT_IMPLEMENTED'" in script
     assert "NT AUTHORITY\\LocalService" in script
     assert "qsidtype" in script
-    assert "ReadAndExecute" in script
-    assert "FileSystemRights]::Modify" in script
+    assert "icacls.exe $Path" in script
+    assert "@('RX', 'M', 'F')" in script
+    assert "@('M', 'F')" in script
     assert "Get-HmsSha256" in script
     assert "System.Security.Cryptography.SHA256" in script
     assert "Get-FileHash" not in script
+    assert "Get-Acl" not in script
     assert "runtime_config_sha256_ok" in script
     assert "package_tree_ok" in script
 
