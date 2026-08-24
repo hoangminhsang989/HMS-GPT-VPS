@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .agent_health_contract import AgentHealthDocument
 from .agent_transport_protocol import AgentDeviceCredential
 from .managed_guest_listener_probe import probe_managed_agent_health_listener_by_id
 from .managed_hyperv_agent_qualification import qualify_managed_hyperv_agent
@@ -88,6 +89,85 @@ def validate_strict_managed_hyperv_proof_payload(
         )
 
 
+def _require_fresh_observation_matches_base(
+    agent_runtime: Any,
+    credential: PowerShellDirectCredential,
+    base_proof: Any,
+) -> None:
+    observation, post = agent_runtime.observe(credential)
+    if not (
+        observation.agent_package_ready
+        and observation.agent_service_ready
+        and observation.agent_healthy
+    ):
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication fresh Agent observation is incomplete"
+        )
+    if post is None or not post.service_ready or not post.agent_healthy:
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication fresh post-install observation is incomplete"
+        )
+    health = post.health
+    if not isinstance(health, AgentHealthDocument):
+        raise StrictManagedHyperVAgentQualificationError(
+            "strict publication fresh health document is missing"
+        )
+    if health.boot_id != base_proof.health_boot_id:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V Agent service incarnation changed before publication"
+        )
+    if health.agent_version != base_proof.health_agent_version:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V Agent version changed before publication"
+        )
+
+    evidence = dict(post.service_evidence)
+    expected_values = {
+        "package_file_count": base_proof.package_file_count,
+        "package_total_size": base_proof.package_total_size,
+        "binary_sha256": base_proof.package_entrypoint_sha256,
+        "package_manifest_sha256": base_proof.package_manifest_sha256,
+    }
+    for key, expected in expected_values.items():
+        actual = evidence.get(key)
+        if isinstance(expected, str):
+            if not isinstance(actual, str) or actual.lower() != expected.lower():
+                raise StrictManagedHyperVAgentQualificationError(
+                    f"strict publication fresh evidence changed: {key}"
+                )
+        elif actual != expected:
+            raise StrictManagedHyperVAgentQualificationError(
+                f"strict publication fresh evidence changed: {key}"
+            )
+    for key in (
+        "package_tree_ok",
+        "package_manifest_sha256_ok",
+        "local_service_account",
+        "service_sid_unrestricted",
+        "runtime_config_sha256_ok",
+        "service_ready",
+    ):
+        if evidence.get(key) is not True:
+            raise StrictManagedHyperVAgentQualificationError(
+                f"strict publication fresh readiness evidence is not proven: {key}"
+            )
+
+
+def _require_listener_matches(
+    listener: dict[str, object],
+    *,
+    expected_vm_id: str,
+) -> None:
+    if listener.get("os_listener_proven") is not True:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V OS listener proof is incomplete"
+        )
+    if listener.get("vm_id") != expected_vm_id.lower():
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V OS listener proof returned the wrong VMId"
+        )
+
+
 def qualify_managed_hyperv_agent_strict(
     reconcile_runtime: Any,
     context: ProvisionContext,
@@ -96,14 +176,14 @@ def qualify_managed_hyperv_agent_strict(
     *,
     max_reconcile_steps: int = 8,
 ) -> dict[str, object]:
-    """Build the publishable R002E proof with independent OS listener evidence.
+    """Build the publishable R002E proof with a freshness-bound OS listener gate.
 
-    ``qualify_managed_hyperv_agent`` supplies the package/SCM/health/enrollment
-    evidence. This final publication gate additionally proves the real listening
-    socket from Windows guest OS state, bound to the exact managed VMId. Stable
-    registry/Hyper-V identity is re-proved immediately before and after that
-    final OS observation so the publication boundary cannot rely on stale VM
-    identity from the base qualification.
+    The base qualification pins package/SCM/health/enrollment evidence. The final
+    publication gate brackets one fresh full Agent observation between two
+    VMId-bound guest OS listener probes and requires the same live service PID,
+    VMId and health boot id throughout. This prevents publication from combining
+    health/package evidence from one service incarnation with socket evidence
+    from another.
     """
 
     base_proof = qualify_managed_hyperv_agent(
@@ -127,20 +207,33 @@ def qualify_managed_hyperv_agent_strict(
         )
 
     health_port = agent_runtime.config.runtime.health_port
-    listener = probe_managed_agent_health_listener_by_id(
+    listener_before = probe_managed_agent_health_listener_by_id(
         pre_listener_vm_id,
         agent_runtime.config.vm_name,
         credential,
         agent_runtime.config.service,
         health_port,
     )
-    if listener.get("os_listener_proven") is not True:
+    _require_listener_matches(listener_before, expected_vm_id=base_proof.vm_id)
+
+    _require_fresh_observation_matches_base(agent_runtime, credential, base_proof)
+
+    mid_vm_id = agent_runtime._assert_vm_identity()
+    if mid_vm_id != base_proof.vm_id:
         raise StrictManagedHyperVAgentQualificationError(
-            "managed Hyper-V OS listener proof is incomplete"
+            "managed Hyper-V VMId changed during strict health observation"
         )
-    if listener.get("vm_id") != base_proof.vm_id.lower():
+    listener_after = probe_managed_agent_health_listener_by_id(
+        mid_vm_id,
+        agent_runtime.config.vm_name,
+        credential,
+        agent_runtime.config.service,
+        health_port,
+    )
+    _require_listener_matches(listener_after, expected_vm_id=base_proof.vm_id)
+    if listener_after.get("process_id") != listener_before.get("process_id"):
         raise StrictManagedHyperVAgentQualificationError(
-            "managed Hyper-V OS listener proof returned the wrong VMId"
+            "managed Hyper-V Agent service process changed during strict publication proof"
         )
 
     post_listener_vm_id = agent_runtime._assert_vm_identity()
@@ -156,10 +249,10 @@ def qualify_managed_hyperv_agent_strict(
                 STRICT_MANAGED_HYPERV_PUBLICATION_SCHEMA_VERSION
             ),
             "os_listener_proven": True,
-            "health_listener_process_id": listener["process_id"],
-            "health_listener_count": listener["listener_count"],
-            "health_listener_addresses": listener["local_addresses"],
-            "health_listener_port": listener["health_port"],
+            "health_listener_process_id": listener_after["process_id"],
+            "health_listener_count": listener_after["listener_count"],
+            "health_listener_addresses": listener_after["local_addresses"],
+            "health_listener_port": listener_after["health_port"],
         }
     )
     validate_strict_managed_hyperv_proof_payload(
