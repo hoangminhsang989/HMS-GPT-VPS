@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from threading import Event, Thread
 
 import pytest
 
-from hms_gpt_vps.authority_lock import AuthorityLockError, exclusive_authority_lock
+from hms_gpt_vps.authority_lock import (
+    AuthorityLockError,
+    _windows_mutex_name,
+    exclusive_authority_lock,
+)
 from hms_gpt_vps import authority_lock as lock_module
 
 
@@ -78,6 +83,27 @@ def test_authority_lock_rejects_target_substitution_after_open(
 
     assert path.exists()
     assert displaced.exists()
+
+
+def test_windows_mutex_namespace_is_case_insensitive_and_path_opaque(tmp_path: Path) -> None:
+    path = (tmp_path / "State.Lock").absolute()
+    same_windows_path_case_variant = Path(str(path).upper())
+
+    first = _windows_mutex_name(path)
+    second = _windows_mutex_name(same_windows_path_case_variant)
+
+    assert first == second
+    assert first.startswith("Local\\HMS-GPT-VPS-Authority-")
+    assert len(first.rsplit("-", 1)[-1]) == 64
+    assert str(path).casefold() not in first.casefold()
+
+
+def test_windows_authority_path_uses_kernel_mutex_not_crt_file_lock() -> None:
+    source = inspect.getsource(lock_module)
+    assert "CreateMutexW" in source
+    assert "WaitForSingleObject" in source
+    assert "WAIT_ABANDONED" in source
+    assert "msvcrt.locking" not in source
 
 
 def test_authority_lock_rejects_boolean_timeout(tmp_path: Path) -> None:
