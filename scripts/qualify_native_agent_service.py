@@ -377,7 +377,7 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     service = AgentServiceConfig()
     service.validate()
 
-    source_package = (package_dir / "hms-agent").resolve(strict=True)
+    source_package = package_dir / "hms-agent"
     source_manifest_path = (package_dir / "hms-agent.manifest.json").resolve(strict=True)
     manifest: AgentPackageManifest = load_agent_package_manifest(source_manifest_path)
     verify_agent_package(source_package, manifest)
