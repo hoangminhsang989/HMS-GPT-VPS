@@ -188,6 +188,30 @@ $serviceReady = [bool](
   $stateModify
 )
 
+if (-not $serviceReady) {{
+  $failedChecks = @()
+  $readinessChecks = [ordered]@{{
+    service_exists = [bool]$serviceExists
+    service_running = [bool]$serviceRunning
+    local_service_account = [bool]$startNameOk
+    binary_command_ok = [bool]$commandOk
+    agent_root_layout_ok = [bool]$agentRootLayoutOk
+    package_tree_ok = [bool]$packageTreeOk
+    binary_sha256_ok = [bool]$binaryHashOk
+    runtime_config_exists = [bool]$runtimeConfigExists
+    runtime_config_sha256_ok = [bool]$runtimeConfigHashOk
+    service_sid_unrestricted = [bool]$sidTypeOk
+    agent_root_read_execute = [bool]$agentRootReadExecute
+    runtime_config_read = [bool]$runtimeConfigRead
+    workspace_modify = [bool]$workspaceModify
+    state_modify = [bool]$stateModify
+  }}
+  foreach ($entry in $readinessChecks.GetEnumerator()) {{
+    if (-not [bool]$entry.Value) {{ $failedChecks += [string]$entry.Key }}
+  }}
+  throw ('HMS Agent readiness false checks: ' + ($failedChecks -join ','))
+}}
+
 [pscustomobject]@{{
   service_ready = $serviceReady
   application_health = 'NOT_IMPLEMENTED'
