@@ -28,8 +28,8 @@ class FakeInspector:
 def good_snapshot() -> AgentWindowsTokenSnapshot:
     return AgentWindowsTokenSnapshot(
         user_sid=LOCAL_SERVICE_SID,
-        service_sid_member=True,
-        administrators_member=False,
+        service_sid_present=True,
+        administrators_sid_present=False,
         elevated=False,
     )
 
@@ -50,8 +50,8 @@ def test_valid_native_snapshot_is_the_only_source_of_runtime_identity() -> None:
         (
             AgentWindowsTokenSnapshot(
                 user_sid="S-1-5-18",
-                service_sid_member=True,
-                administrators_member=False,
+                service_sid_present=True,
+                administrators_sid_present=False,
                 elevated=False,
             ),
             "not LocalService",
@@ -59,8 +59,8 @@ def test_valid_native_snapshot_is_the_only_source_of_runtime_identity() -> None:
         (
             AgentWindowsTokenSnapshot(
                 user_sid=LOCAL_SERVICE_SID,
-                service_sid_member=False,
-                administrators_member=False,
+                service_sid_present=False,
+                administrators_sid_present=False,
                 elevated=False,
             ),
             "per-service SID",
@@ -68,8 +68,8 @@ def test_valid_native_snapshot_is_the_only_source_of_runtime_identity() -> None:
         (
             AgentWindowsTokenSnapshot(
                 user_sid=LOCAL_SERVICE_SID,
-                service_sid_member=True,
-                administrators_member=True,
+                service_sid_present=True,
+                administrators_sid_present=True,
                 elevated=False,
             ),
             "Administrators",
@@ -77,8 +77,8 @@ def test_valid_native_snapshot_is_the_only_source_of_runtime_identity() -> None:
         (
             AgentWindowsTokenSnapshot(
                 user_sid=LOCAL_SERVICE_SID,
-                service_sid_member=True,
-                administrators_member=False,
+                service_sid_present=True,
+                administrators_sid_present=False,
                 elevated=True,
             ),
             "elevated",
@@ -97,16 +97,16 @@ def test_snapshot_shape_rejects_empty_sid_and_non_boolean_facts() -> None:
     with pytest.raises(AgentWindowsIdentityError, match="empty"):
         AgentWindowsTokenSnapshot(
             user_sid="",
-            service_sid_member=True,
-            administrators_member=False,
+            service_sid_present=True,
+            administrators_sid_present=False,
             elevated=False,
         ).validate_shape()
 
     with pytest.raises(AgentWindowsIdentityError, match="must be boolean"):
         AgentWindowsTokenSnapshot(
             user_sid=LOCAL_SERVICE_SID,
-            service_sid_member=1,  # type: ignore[arg-type]
-            administrators_member=False,
+            service_sid_present=1,  # type: ignore[arg-type]
+            administrators_sid_present=False,
             elevated=False,
         ).validate_shape()
 
