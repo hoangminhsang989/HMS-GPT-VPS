@@ -15,7 +15,7 @@ The qualification harness fails closed unless all of these are proven with the a
 - the production service-install script creates `HMSAgent` as `NT AUTHORITY\LocalService`, enables an unrestricted per-service SID `NT SERVICE\HMSAgent` and applies the production ACL contract;
 - the packaged service reaches SCM `Running`, which requires its internal native token proof, protected config load and LocalMachine-DPAPI credential load to have completed;
 - the production service-readiness contract passes, including exact package-tree/config checks and the service-SID ACL checks;
-- the packaged process publishes valid `/healthz` evidence reporting `NT AUTHORITY\LocalService`, `non-admin`, the exact instance/workspace/version and canonical capability set;
+- the packaged process publishes valid `/healthz` evidence reporting the per-service identity `NT SERVICE\HMSAgent`, `non-admin`, the exact instance/workspace/version and canonical capability set;
 - external `Get-NetTCPConnection` evidence proves exactly one health listener owned by the service process and bound to `127.0.0.1` only;
 - the outbound runtime creates a durable connection epoch and increments it while retrying a deliberately closed loopback HTTPS target;
 - a graceful SCM stop removes the health listener;
