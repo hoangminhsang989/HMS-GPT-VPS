@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from hms_gpt_vps.agent_package import AgentPackageFile, AgentPackageManifest
 from hms_gpt_vps.agent_service_install import (
     AgentServiceConfig,
     build_agent_service_install_script,
@@ -33,19 +34,30 @@ def _runtime_config() -> AgentServiceRuntimeConfig:
     )
 
 
+def _manifest() -> AgentPackageManifest:
+    return AgentPackageManifest(
+        platform="windows-x64",
+        version="0.1.0",
+        entrypoint="hms-agent.exe",
+        file_count=1,
+        total_size=1,
+        files=(AgentPackageFile(path="hms-agent.exe", size=1, sha256="ab" * 32),),
+    )
+
+
 def test_service_scripts_use_cmdlet_independent_sha256() -> None:
     config = AgentServiceConfig()
     runtime = _runtime_config()
-    expected = "ab" * 32
+    manifest = _manifest()
 
     install = build_agent_service_install_script(
         config,
-        expected_sha256=expected,
+        package_manifest=manifest,
         runtime_config=runtime,
     )
     readiness = build_agent_service_readiness_script(
         config,
-        expected_sha256=expected,
+        package_manifest=manifest,
         runtime_config=runtime,
     )
 
@@ -53,6 +65,7 @@ def test_service_scripts_use_cmdlet_independent_sha256() -> None:
         assert "function Get-HmsSha256" in script
         assert "Get-FileHash" not in script
         assert "System.Security.Cryptography.SHA256" in script
+        assert "Test-HmsAgentPackageTree" in script
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows PowerShell")
