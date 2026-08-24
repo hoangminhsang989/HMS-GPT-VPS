@@ -84,3 +84,10 @@ def test_authority_lock_rejects_boolean_timeout(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="timeout"):
         with exclusive_authority_lock(tmp_path / "authority.lock", timeout_seconds=True):
             pass
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_authority_lock_rejects_non_finite_timeout(tmp_path: Path, timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        with exclusive_authority_lock(tmp_path / "authority.lock", timeout_seconds=timeout):
+            pass
