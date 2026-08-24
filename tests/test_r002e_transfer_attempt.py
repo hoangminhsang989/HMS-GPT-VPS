@@ -43,18 +43,23 @@ def test_transfer_attempt_metadata_never_contains_ownership_token(tmp_path: Path
     raw_text = (tmp_path / "transfer.json").read_text(encoding="utf-8")
     raw = json.loads(raw_text)
     assert "ownership_token" not in raw
+    assert raw["guest_service_interface_was_enabled"] is None
     assert attempt.ownership_token not in raw_text
     assert secret_store.value == attempt.ownership_token
     assert attempt.ownership_token not in repr(attempt)
 
 
-def test_transfer_attempt_resume_reuses_exact_id_and_protected_token(tmp_path: Path) -> None:
+def test_transfer_attempt_resume_reuses_exact_id_token_and_integration_baseline(
+    tmp_path: Path,
+) -> None:
     store, _ = make_store(tmp_path)
     first = store.begin_or_resume(
         instance_id="hms-01",
         vm_name="HMS-GPT-VPS-01",
         manifest_sha256="b" * 64,
     )
+    bound = store.bind_guest_service_interface_baseline(False)
+    assert bound.transfer_id == first.transfer_id
     store.transition(
         AgentPackageTransferPhase.PLANNED,
         AgentPackageTransferPhase.TRANSFERRING,
@@ -67,7 +72,40 @@ def test_transfer_attempt_resume_reuses_exact_id_and_protected_token(tmp_path: P
 
     assert resumed.transfer_id == first.transfer_id
     assert resumed.ownership_token == first.ownership_token
+    assert resumed.guest_service_interface_was_enabled is False
     assert resumed.phase is AgentPackageTransferPhase.TRANSFERRING
+
+
+def test_transfer_cannot_mutate_before_integration_baseline_is_persisted(tmp_path: Path) -> None:
+    store, _ = make_store(tmp_path)
+    store.begin_or_resume(
+        instance_id="hms-01",
+        vm_name="HMS-GPT-VPS-01",
+        manifest_sha256="1" * 64,
+    )
+
+    with pytest.raises(ValueError, match="baseline must be persisted"):
+        store.transition(
+            AgentPackageTransferPhase.PLANNED,
+            AgentPackageTransferPhase.TRANSFERRING,
+        )
+
+
+def test_integration_baseline_cannot_change_after_transfer_mutation(tmp_path: Path) -> None:
+    store, _ = make_store(tmp_path)
+    store.begin_or_resume(
+        instance_id="hms-01",
+        vm_name="HMS-GPT-VPS-01",
+        manifest_sha256="2" * 64,
+    )
+    store.bind_guest_service_interface_baseline(False)
+    store.transition(
+        AgentPackageTransferPhase.PLANNED,
+        AgentPackageTransferPhase.TRANSFERRING,
+    )
+
+    with pytest.raises(ValueError, match="cannot change"):
+        store.bind_guest_service_interface_baseline(True)
 
 
 def test_transfer_attempt_mismatch_fails_closed(tmp_path: Path) -> None:
@@ -115,6 +153,7 @@ def test_only_published_attempt_can_be_cleared(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="only a published"):
         store.clear_published()
 
+    store.bind_guest_service_interface_baseline(False)
     store.transition(
         AgentPackageTransferPhase.PLANNED,
         AgentPackageTransferPhase.TRANSFERRING,
