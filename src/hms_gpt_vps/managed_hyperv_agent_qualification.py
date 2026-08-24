@@ -6,9 +6,13 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
+from .agent_device_credential_store import GUEST_PROTECTION_SCOPE
+from .agent_device_enrollment import AgentDeviceEnrollmentConfig
+from .agent_device_enrollment_probe import probe_agent_device_enrollment
+from .agent_health_contract import AgentHealthDocument
 from .agent_package import load_agent_package_manifest, verify_agent_package
 from .agent_package_manifest_artifact import canonical_agent_package_manifest_bytes
-from .agent_health_contract import AgentHealthDocument
+from .agent_transport_protocol import AgentDeviceCredential
 from .managed_agent_reconcile_runtime import ManagedAgentReconcileRuntime
 from .powershell_direct import PowerShellDirectCredential
 from .provision_state import ProvisionState
@@ -31,6 +35,9 @@ class ManagedHyperVAgentQualificationProof:
     instance_id: str
     vm_name: str
     vm_id: str
+    device_id: str
+    device_enrollment_ready: bool
+    device_protection_scope: str
     starting_state: str
     final_state: str
     actions: tuple[str, ...]
@@ -64,6 +71,10 @@ class ManagedHyperVAgentQualificationProof:
             raise ValueError("managed Hyper-V qualification proof type mismatch")
         if not self.instance_id.strip() or not self.vm_name.strip() or not self.vm_id.strip():
             raise ValueError("managed Hyper-V qualification identity fields are required")
+        if not self.device_id.strip() or not self.device_enrollment_ready:
+            raise ValueError("managed Hyper-V qualification device enrollment is incomplete")
+        if self.device_protection_scope != GUEST_PROTECTION_SCOPE:
+            raise ValueError("managed Hyper-V qualification device credential is not LocalMachine")
         if self.final_state != ProvisionState.AGENT_HEALTHY.value:
             raise ValueError("managed Hyper-V qualification must finish at AGENT_HEALTHY")
         if not self.hyperv_guest_proven:
@@ -147,18 +158,21 @@ def qualify_managed_hyperv_agent(
     reconcile_runtime: ManagedAgentReconcileRuntime,
     context: ProvisionContext,
     credential: PowerShellDirectCredential,
+    expected_device_credential: AgentDeviceCredential,
     *,
     max_reconcile_steps: int = _DEFAULT_MAX_RECONCILE_STEPS,
 ) -> ManagedHyperVAgentQualificationProof:
     """Prove the late Agent path inside one already-managed Hyper-V Windows guest.
 
     This coordinator never creates/deletes a VM and never retires bootstrap
-    credentials. It exercises the production late reconcile runtime until the
-    durable state reaches AGENT_HEALTHY, then independently re-observes package,
-    SCM and strict application health before emitting a non-secret proof.
+    credentials. It re-proves stable Hyper-V identity and the exact Bridge-bound
+    LocalMachine-DPAPI guest device credential, exercises the production late
+    reconcile runtime until AGENT_HEALTHY, then independently re-observes the
+    package, SCM and strict application health before emitting a non-secret proof.
     """
 
     credential.validate()
+    expected_device_credential.validate()
     if max_reconcile_steps < 1 or max_reconcile_steps > 32:
         raise ValueError("max_reconcile_steps must be between 1 and 32")
 
@@ -166,6 +180,10 @@ def qualify_managed_hyperv_agent(
     if context.instance_id != agent_runtime.config.instance_id:
         raise ManagedHyperVAgentQualificationError(
             "qualification context belongs to another managed instance"
+        )
+    if expected_device_credential.instance_id != context.instance_id:
+        raise ManagedHyperVAgentQualificationError(
+            "qualification device credential belongs to another managed instance"
         )
 
     manifest = load_agent_package_manifest(agent_runtime.config.package_manifest_path)
@@ -200,8 +218,32 @@ def qualify_managed_hyperv_agent(
     # persisted/read-back VMId before and after the bounded reconcile loop so
     # the proof cannot be detached from the managed Hyper-V identity.
     starting_vm_id = agent_runtime._assert_vm_identity()
-    actions: list[str] = []
 
+    enrollment_config = AgentDeviceEnrollmentConfig(
+        instance_id=context.instance_id,
+        guest_state_path=agent_runtime.config.service.state_path,
+        service_name=agent_runtime.config.service.service_name,
+    )
+    enrollment_evidence = probe_agent_device_enrollment(
+        agent_runtime.config.vm_name,
+        credential,
+        enrollment_config,
+        expected_device_credential,
+    )
+    if not bool(enrollment_evidence.get("enrollment_ready", False)):
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment was not independently proven"
+        )
+    if enrollment_evidence.get("device_id") != expected_device_credential.device_id:
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment identity differs from Bridge authority"
+        )
+    if enrollment_evidence.get("protection_scope") != GUEST_PROTECTION_SCOPE:
+        raise ManagedHyperVAgentQualificationError(
+            "managed Hyper-V device enrollment is not LocalMachine-DPAPI protected"
+        )
+
+    actions: list[str] = []
     for _ in range(max_reconcile_steps):
         record = reconcile_runtime.orchestrator.store.load()
         if record is None:
@@ -270,6 +312,9 @@ def qualify_managed_hyperv_agent(
         instance_id=context.instance_id,
         vm_name=agent_runtime.config.vm_name,
         vm_id=starting_vm_id,
+        device_id=expected_device_credential.device_id,
+        device_enrollment_ready=True,
+        device_protection_scope=GUEST_PROTECTION_SCOPE,
         starting_state=starting_record.state.value,
         final_state=final_record.state.value,
         actions=tuple(actions),
