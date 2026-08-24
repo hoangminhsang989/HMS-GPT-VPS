@@ -8,6 +8,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
+from .authority_lock import exclusive_authority_lock
+
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _MAX_PROVISION_STATE_BYTES = 64 * 1024
@@ -138,6 +140,7 @@ class ProvisionStateStore:
         # Do not resolve: resolving could canonicalize away symlink/reparse
         # evidence before the authority-path gate observes it.
         self.path = path.expanduser().absolute()
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
 
     def _assert_safe_authority_path(self) -> None:
         if _path_chain_has_redirect(self.path):
@@ -147,7 +150,14 @@ class ProvisionStateStore:
         if self.path.exists() and not self.path.is_file():
             raise ValueError("provision state authority path is not a regular file")
 
-    def load(self) -> ProvisionRecord | None:
+    def _prepare_authority_parent(self) -> None:
+        self._assert_safe_authority_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_safe_authority_path()
+        if not self.path.parent.is_dir():
+            raise ValueError("provision state parent is not a directory")
+
+    def _load_unlocked(self) -> ProvisionRecord | None:
         self._assert_safe_authority_path()
         if not self.path.exists():
             return None
@@ -187,7 +197,13 @@ class ProvisionStateStore:
             raise ValueError(f"unsupported provision state schema: {record.schema_version}")
         return record
 
-    def save(self, record: ProvisionRecord) -> None:
+    def load(self) -> ProvisionRecord | None:
+        # Atomic replace + file-identity pinning make an unlocked read safe: it
+        # observes either the prior or next complete record. Writers perform CAS
+        # under the authority lock before publishing a transition.
+        return self._load_unlocked()
+
+    def _save_unlocked(self, record: ProvisionRecord) -> None:
         if (
             not isinstance(record.schema_version, int)
             or isinstance(record.schema_version, bool)
@@ -205,14 +221,7 @@ class ProvisionStateStore:
         if record.resume_state is not None and not isinstance(record.resume_state, ProvisionState):
             raise ValueError("record resume_state is invalid")
 
-        # Gate existing ancestors before creating anything, then verify again
-        # after mkdir so an existing redirect is never silently traversed.
-        self._assert_safe_authority_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._assert_safe_authority_path()
-        if not self.path.parent.is_dir():
-            raise ValueError("provision state parent is not a directory")
-
+        self._prepare_authority_parent()
         payload = json.dumps(
             record.to_dict(),
             ensure_ascii=False,
@@ -244,6 +253,11 @@ class ProvisionStateStore:
             if temp_path is not None and not _path_chain_has_redirect(temp_path):
                 temp_path.unlink(missing_ok=True)
 
+    def save(self, record: ProvisionRecord) -> None:
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            self._save_unlocked(record)
+
     def transition(
         self,
         *,
@@ -254,23 +268,25 @@ class ProvisionStateStore:
         last_error: str | None = None,
         increment_attempt: bool = False,
     ) -> ProvisionRecord:
-        current = self.load()
-        if current is not None and current.instance_id != instance_id:
-            raise ValueError("provision state belongs to another instance")
-        attempt = current.attempt if current else 0
-        if increment_attempt:
-            attempt += 1
-        record = ProvisionRecord(
-            schema_version=self.SCHEMA_VERSION,
-            instance_id=instance_id,
-            state=state,
-            attempt=attempt,
-            reason=reason,
-            resume_state=resume_state,
-            last_error=last_error,
-        )
-        self.save(record)
-        return record
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            current = self._load_unlocked()
+            if current is not None and current.instance_id != instance_id:
+                raise ValueError("provision state belongs to another instance")
+            attempt = current.attempt if current else 0
+            if increment_attempt:
+                attempt += 1
+            record = ProvisionRecord(
+                schema_version=self.SCHEMA_VERSION,
+                instance_id=instance_id,
+                state=state,
+                attempt=attempt,
+                reason=reason,
+                resume_state=resume_state,
+                last_error=last_error,
+            )
+            self._save_unlocked(record)
+            return record
 
     def transition_checked(
         self,
@@ -279,21 +295,32 @@ class ProvisionStateStore:
         expected_state: ProvisionState,
         state: ProvisionState,
         reason: str | None = None,
+        resume_state: ProvisionState | None = None,
         last_error: str | None = None,
+        increment_attempt: bool = False,
     ) -> ProvisionRecord:
-        """Advance only from the exact persisted checkpoint expected by caller."""
-        current = self.load()
-        if current is None:
-            raise ValueError("provision state does not exist")
-        if current.instance_id != instance_id:
-            raise ValueError("provision state belongs to another instance")
-        if current.state is not expected_state:
-            raise ValueError(
-                f"expected provision state {expected_state.value}, found {current.state.value}"
+        """Atomically advance only from the exact persisted checkpoint expected."""
+
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            current = self._load_unlocked()
+            if current is None:
+                raise ValueError("provision state does not exist")
+            if current.instance_id != instance_id:
+                raise ValueError("provision state belongs to another instance")
+            if current.state is not expected_state:
+                raise ValueError(
+                    f"expected provision state {expected_state.value}, found {current.state.value}"
+                )
+            attempt = current.attempt + (1 if increment_attempt else 0)
+            record = ProvisionRecord(
+                schema_version=self.SCHEMA_VERSION,
+                instance_id=instance_id,
+                state=state,
+                attempt=attempt,
+                reason=reason,
+                resume_state=resume_state,
+                last_error=last_error,
             )
-        return self.transition(
-            instance_id=instance_id,
-            state=state,
-            reason=reason,
-            last_error=last_error,
-        )
+            self._save_unlocked(record)
+            return record
