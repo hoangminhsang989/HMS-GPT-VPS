@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+import uuid
 
 from .authority_lock import exclusive_authority_lock
 
@@ -40,6 +41,19 @@ def _require_optional_text(value: object, label: str) -> str | None:
     if value is None:
         return None
     return _require_text(value, label)
+
+
+def _require_optional_vm_id(value: object) -> str | None:
+    if value is None:
+        return None
+    vm_id = _require_text(value, "vm_id")
+    try:
+        canonical = str(uuid.UUID(vm_id))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("registry vm_id must be a canonical GUID") from exc
+    if vm_id != canonical:
+        raise ValueError("registry vm_id must use canonical lowercase GUID form")
+    return canonical
 
 
 def _path_chain_has_redirect(path: Path) -> bool:
@@ -84,7 +98,7 @@ class VMRecord:
         _require_text(self.backend, "backend")
         _require_text(self.phase, "phase")
         _require_text(self.workspace_path, "workspace_path")
-        _require_optional_text(self.vm_id, "vm_id")
+        _require_optional_vm_id(self.vm_id)
         _require_optional_text(self.switch_name, "switch_name")
         _require_optional_text(self.guest_ipv4, "guest_ipv4")
 
@@ -103,7 +117,7 @@ class VMRecord:
             backend=_require_text(raw["backend"], "backend"),
             phase=_require_text(raw["phase"], "phase"),
             workspace_path=_require_text(raw["workspace_path"], "workspace_path"),
-            vm_id=_require_optional_text(raw.get("vm_id"), "vm_id"),
+            vm_id=_require_optional_vm_id(raw.get("vm_id")),
             switch_name=_require_optional_text(raw.get("switch_name"), "switch_name"),
             guest_ipv4=_require_optional_text(raw.get("guest_ipv4"), "guest_ipv4"),
         )
