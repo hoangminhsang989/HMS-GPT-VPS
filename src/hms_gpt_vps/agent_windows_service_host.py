@@ -12,7 +12,14 @@ from .agent_service_runtime_config import (
     AgentServiceRuntimeConfig,
     load_agent_service_runtime_config,
 )
-from .agent_windows_identity import probe_agent_service_identity
+from .agent_windows_identity import (
+    IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
+    IDENTITY_FAILURE_ELEVATED,
+    IDENTITY_FAILURE_NATIVE_INSPECTION,
+    IDENTITY_FAILURE_NOT_LOCAL_SERVICE,
+    IDENTITY_FAILURE_SERVICE_SID_ABSENT,
+    probe_agent_service_identity,
+)
 
 
 HMS_AGENT_SERVICE_NAME = "HMSAgent"
@@ -33,15 +40,20 @@ NO_ERROR = 0
 ERROR_CALL_NOT_IMPLEMENTED = 120
 ERROR_SERVICE_SPECIFIC_ERROR = 1066
 
-# These codes intentionally disclose only the startup/runtime phase, never an
-# exception string, credential, endpoint response, path contents or other
-# sensitive state. They make native SCM qualification actionable while keeping
-# the production service fail-closed and non-verbose.
 SERVICE_FAILURE_IDENTITY = 10
 SERVICE_FAILURE_CONFIG = 20
 SERVICE_FAILURE_RUNTIME_CONSTRUCTION = 30
 SERVICE_FAILURE_RUNTIME_EXECUTION = 40
 SERVICE_FAILURE_HOST_LIFECYCLE = 90
+_SAFE_IDENTITY_FAILURE_CODES = frozenset(
+    {
+        IDENTITY_FAILURE_NATIVE_INSPECTION,
+        IDENTITY_FAILURE_NOT_LOCAL_SERVICE,
+        IDENTITY_FAILURE_SERVICE_SID_ABSENT,
+        IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
+        IDENTITY_FAILURE_ELEVATED,
+    }
+)
 
 _CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 _SERVICE_MAIN_FUNCTION = _CALLBACK_FACTORY(None, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR))
@@ -122,13 +134,15 @@ def _default_runtime_factory(
     return AgentGuestRuntime.from_guest_state(config, identity)
 
 
-class AgentWindowsServiceHost:
-    """Own the SCM lifecycle around the fail-closed guest Agent runtime.
+def _bounded_identity_failure_code(exc: BaseException) -> int:
+    raw = getattr(exc, "safe_service_code", None)
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw in _SAFE_IDENTITY_FAILURE_CODES:
+        return raw
+    return SERVICE_FAILURE_IDENTITY
 
-    Native process identity is proven before any runtime config or device
-    credential is read. The config loader is intentionally fixed by dependency
-    injection/default path rather than accepting command-line path overrides.
-    """
+
+class AgentWindowsServiceHost:
+    """Own the SCM lifecycle around the fail-closed guest Agent runtime."""
 
     def __init__(
         self,
@@ -201,9 +215,6 @@ class AgentWindowsServiceHost:
                 )
             )
 
-            # Security ordering is deliberate: token proof precedes config and
-            # credential access. The default runtime factory loads the device
-            # credential only after both identity and config have passed.
             failure_code = SERVICE_FAILURE_IDENTITY
             identity = self.identity_probe()
 
@@ -227,9 +238,7 @@ class AgentWindowsServiceHost:
                 self._report(
                     AgentServiceStatus(
                         current_state=SERVICE_RUNNING,
-                        controls_accepted=(
-                            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
-                        ),
+                        controls_accepted=(SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN),
                     )
                 )
                 failure_code = SERVICE_FAILURE_RUNTIME_EXECUTION
@@ -240,13 +249,16 @@ class AgentWindowsServiceHost:
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+            report_code = failure_code
+            if failure_code == SERVICE_FAILURE_IDENTITY:
+                report_code = _bounded_identity_failure_code(exc)
             if self._status_handle is not None:
                 try:
                     self._report(
                         AgentServiceStatus(
                             current_state=SERVICE_STOPPED,
                             win32_exit_code=ERROR_SERVICE_SPECIFIC_ERROR,
-                            service_specific_exit_code=failure_code,
+                            service_specific_exit_code=report_code,
                         )
                     )
                 except Exception:
@@ -327,10 +339,7 @@ class NativeWindowsServiceControlBackend:
         self._service_main_callbacks.append(callback)
         table_type = _SERVICE_TABLE_ENTRYW * 2
         table = table_type(
-            _SERVICE_TABLE_ENTRYW(
-                service_name,
-                ctypes.cast(callback, ctypes.c_void_p),
-            ),
+            _SERVICE_TABLE_ENTRYW(service_name, ctypes.cast(callback, ctypes.c_void_p)),
             _SERVICE_TABLE_ENTRYW(None, None),
         )
         if not self._advapi32.StartServiceCtrlDispatcherW(table):
@@ -357,11 +366,7 @@ class NativeWindowsServiceControlBackend:
 
         callback = _HANDLER_EX_FUNCTION(native_handler)
         self._handler_callbacks.append(callback)
-        handle = self._advapi32.RegisterServiceCtrlHandlerExW(
-            service_name,
-            callback,
-            None,
-        )
+        handle = self._advapi32.RegisterServiceCtrlHandlerExW(service_name, callback, None)
         if not handle:
             raise _native_error("RegisterServiceCtrlHandlerExW failed")
         return handle
