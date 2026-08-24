@@ -86,11 +86,23 @@ class ManagedAgentReconcileRuntime:
         return record.state
 
     @staticmethod
+    def _validate_agent_observation(agent: ProvisionObservation) -> None:
+        if agent.agent_service_ready and not agent.agent_package_ready:
+            raise ManagedAgentReconcileError(
+                "Agent observation cannot prove service readiness without package readiness"
+            )
+        if agent.agent_healthy and not agent.agent_service_ready:
+            raise ManagedAgentReconcileError(
+                "Agent observation cannot prove health without service readiness"
+            )
+
+    @staticmethod
     def _merge_agent_observation(
         base: ProvisionObservation,
         agent: ProvisionObservation,
     ) -> ProvisionObservation:
         """Preserve unrelated host observations while replacing Agent facts."""
+        ManagedAgentReconcileRuntime._validate_agent_observation(agent)
         return replace(
             base,
             agent_package_ready=agent.agent_package_ready,
@@ -111,6 +123,7 @@ class ManagedAgentReconcileRuntime:
         self._current_late_state(context.instance_id)
 
         agent_observation = self.agent_runtime.provision_observation(credential)
+        self._validate_agent_observation(agent_observation)
         observed_context = replace(
             context,
             observation=self._merge_agent_observation(
