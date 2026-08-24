@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
+from .agent_package import AgentPackageManifest
+from .agent_package_powershell import (
+    POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION,
+    package_manifest_ps_literal,
+)
 from .agent_service_install import AgentServiceConfig
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
-from .powershell_sha256 import POWERSHELL_SHA256_FUNCTION
 
 
 def _same_windows_path(left: str, right: str) -> bool:
@@ -27,45 +31,46 @@ def _validate_runtime_alignment(
 def build_agent_service_readiness_script(
     config: AgentServiceConfig,
     *,
-    expected_sha256: str,
+    package_manifest: AgentPackageManifest,
     runtime_config: AgentServiceRuntimeConfig,
 ) -> str:
     """Build a read-only guest probe for the Windows service bootstrap boundary.
 
-    This proves SCM configuration, binary integrity, the exact protected runtime
-    config, per-service SID and the minimum filesystem ACL contract. It still
-    leaves application protocol health to the separate `/healthz` gate.
+    The probe re-verifies the entire immutable onedir package tree, SCM
+    configuration, exact runtime config, per-service SID and filesystem ACLs.
+    Application protocol health remains a separate `/healthz` gate.
     """
     config.validate()
+    package_manifest.validate()
     _validate_runtime_alignment(config, runtime_config)
-    if len(expected_sha256) != 64:
-        raise ValueError("expected_sha256 must contain 64 hex characters")
-    try:
-        int(expected_sha256, 16)
-    except ValueError as exc:
-        raise ValueError("expected_sha256 must be hexadecimal") from exc
 
     service_name = ps_literal(config.service_name)
+    agent_root = ps_literal(config.agent_root_path)
+    package_root = ps_literal(config.package_path)
     binary_path = ps_literal(config.binary_path)
     runtime_config_path = ps_literal(config.runtime_config_path)
     workspace = ps_literal(config.workspace_path)
     state_path = ps_literal(config.state_path)
-    expected_hash = ps_literal(expected_sha256.lower())
+    expected_hash = ps_literal(package_manifest.sha256.lower())
     expected_runtime_config_hash = ps_literal(runtime_config.sha256())
+    package_manifest_payload = package_manifest_ps_literal(package_manifest)
 
     return f"""
 $ErrorActionPreference = 'Stop'
 $serviceName = {service_name}
+$agentRoot = {agent_root}
+$packageRoot = {package_root}
 $binaryPath = {binary_path}
 $runtimeConfigPath = {runtime_config_path}
 $workspace = {workspace}
 $statePath = {state_path}
 $expectedHash = {expected_hash}
 $expectedRuntimeConfigHash = {expected_runtime_config_hash}
+$packageManifestPayload = {package_manifest_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 $expectedCommand = '"' + $binaryPath + '" service'
 
-{POWERSHELL_SHA256_FUNCTION}
+{POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION}
 
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 $serviceExists = $null -ne $service
@@ -79,12 +84,28 @@ if ($serviceExists) {{
   $commandOk = $cim.PathName -eq $expectedCommand
 }}
 
-$binaryExists = Test-Path -LiteralPath $binaryPath -PathType Leaf
+$agentRootLayoutOk = (
+  (Split-Path -Parent $packageRoot) -eq $agentRoot -and
+  (Split-Path -Parent $binaryPath) -eq $packageRoot -and
+  (Split-Path -Parent $runtimeConfigPath) -eq $agentRoot
+)
+
+$packageTreeOk = $false
 $binaryHashOk = $false
 $actualHash = $null
-if ($binaryExists) {{
-  $actualHash = Get-HmsSha256 $binaryPath
+$packageFileCount = 0
+$packageTotalSize = 0
+if ($agentRootLayoutOk -and (Test-Path -LiteralPath $packageRoot -PathType Container)) {{
+  $packageProof = Test-HmsAgentPackageTree $packageRoot $packageManifestPayload
+  $actualHash = [string]$packageProof.entrypoint_sha256
   $binaryHashOk = $actualHash -eq $expectedHash
+  $packageFileCount = [int]$packageProof.file_count
+  $packageTotalSize = [int64]$packageProof.total_size
+  $packageTreeOk = [bool](
+    $binaryHashOk -and
+    $packageFileCount -eq {package_manifest.file_count} -and
+    $packageTotalSize -eq {package_manifest.total_size}
+  )
 }}
 
 $runtimeConfigExists = Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf
@@ -125,8 +146,6 @@ function Test-HmsAclRight([string]$Path, [System.Security.AccessControl.FileSyst
   return $false
 }}
 
-$agentRoot = Split-Path -Parent $binaryPath
-$runtimeConfigInAgentRoot = (Split-Path -Parent $runtimeConfigPath) -eq $agentRoot
 $agentRootReadExecute = Test-HmsAclRight $agentRoot ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
 $runtimeConfigRead = Test-HmsAclRight $runtimeConfigPath ([System.Security.AccessControl.FileSystemRights]::Read)
 $workspaceModify = Test-HmsAclRight $workspace ([System.Security.AccessControl.FileSystemRights]::Modify)
@@ -137,11 +156,11 @@ $serviceReady = [bool](
   $serviceRunning -and
   $startNameOk -and
   $commandOk -and
-  $binaryExists -and
+  $agentRootLayoutOk -and
+  $packageTreeOk -and
   $binaryHashOk -and
   $runtimeConfigExists -and
   $runtimeConfigHashOk -and
-  $runtimeConfigInAgentRoot -and
   $sidTypeOk -and
   $agentRootReadExecute -and
   $runtimeConfigRead -and
@@ -156,13 +175,15 @@ $serviceReady = [bool](
   service_running = [bool]$serviceRunning
   local_service_account = [bool]$startNameOk
   binary_command_ok = [bool]$commandOk
-  binary_exists = [bool]$binaryExists
+  agent_root_layout_ok = [bool]$agentRootLayoutOk
+  package_tree_ok = [bool]$packageTreeOk
+  package_file_count = [int]$packageFileCount
+  package_total_size = [int64]$packageTotalSize
   binary_sha256_ok = [bool]$binaryHashOk
   binary_sha256 = $actualHash
   runtime_config_exists = [bool]$runtimeConfigExists
   runtime_config_sha256_ok = [bool]$runtimeConfigHashOk
   runtime_config_sha256 = $actualRuntimeConfigHash
-  runtime_config_in_agent_root = [bool]$runtimeConfigInAgentRoot
   runtime_config_read = [bool]$runtimeConfigRead
   service_sid_unrestricted = [bool]$sidTypeOk
   agent_root_read_execute = [bool]$agentRootReadExecute
@@ -177,7 +198,7 @@ def probe_agent_service_readiness(
     credential: PowerShellDirectCredential,
     config: AgentServiceConfig,
     *,
-    expected_sha256: str,
+    package_manifest: AgentPackageManifest,
     runtime_config: AgentServiceRuntimeConfig,
     timeout_seconds: int = 90,
 ) -> dict[str, object]:
@@ -186,7 +207,7 @@ def probe_agent_service_readiness(
         credential,
         build_agent_service_readiness_script(
             config,
-            expected_sha256=expected_sha256,
+            package_manifest=package_manifest,
             runtime_config=runtime_config,
         ),
         timeout_seconds=timeout_seconds,
