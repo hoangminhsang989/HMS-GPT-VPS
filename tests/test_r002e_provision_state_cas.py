@@ -112,3 +112,35 @@ def test_transition_checked_does_not_double_load_before_publish(
     assert result.state is ProvisionState.PREFLIGHT
     assert calls == 1
     assert store.lock_path.is_file()
+
+
+def test_initialize_if_absent_never_regresses_existing_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "provision.json"
+    store = ProvisionStateStore(path)
+    store.transition(instance_id="hms-01", state=ProvisionState.AGENT_INSTALLING)
+
+    current = store.initialize(instance_id="hms-01")
+
+    assert current.state is ProvisionState.AGENT_INSTALLING
+    assert store.load() == current
+
+
+def test_concurrent_initialize_converges_on_one_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "provision.json"
+    first = ProvisionStateStore(path)
+    second = ProvisionStateStore(path)
+    results: list[object] = []
+
+    def initialize(store: ProvisionStateStore) -> None:
+        results.append(store.initialize(instance_id="hms-01"))
+
+    threads = [Thread(target=initialize, args=(first,)), Thread(target=initialize, args=(second,))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert len(results) == 2
+    assert all(result.state is ProvisionState.IDLE for result in results)  # type: ignore[union-attr]
+    assert first.load() == second.load()
