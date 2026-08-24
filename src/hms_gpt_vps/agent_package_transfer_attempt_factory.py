@@ -41,7 +41,9 @@ def create_dpapi_agent_package_transfer_attempt_store(
     The caller supplies an instance-scoped host runtime directory. Every existing
     path component is required to be a normal directory path rather than a
     symlink/reparse redirect because the DPAPI token authorizes cleanup of one
-    ownership-marked guest staging root.
+    ownership-marked guest staging root. The returned store also receives the
+    lexical DPAPI token path so it can revalidate both authority paths on every
+    later read/write/delete instead of trusting only this factory-time check.
     """
     runtime_dir = instance_runtime_dir.expanduser().absolute()
     _assert_path_chain_not_reparse(runtime_dir)
@@ -57,4 +59,5 @@ def create_dpapi_agent_package_transfer_attempt_store(
     return AgentPackageTransferAttemptStore(
         metadata_path,
         DpapiSecretStore(token_path),
+        secret_path=token_path,
     )
