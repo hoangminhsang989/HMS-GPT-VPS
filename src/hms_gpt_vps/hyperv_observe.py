@@ -2,10 +2,57 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import uuid
 
 from .hyperv_network import HyperVNetworkConfig
 from .powershell import ps_literal, run_powershell_json
 from .windows_provisioner import WindowsVMConfig
+
+
+_HYPERV_OBSERVATION_KEYS = frozenset(
+    {
+        "network_ready",
+        "vm_id",
+        "vm_state",
+        "vm_switch_ready",
+        "install_media_ready",
+        "guest_heartbeat_ok",
+        "secure_boot_enabled",
+        "tpm_enabled",
+    }
+)
+_HYPERV_BOOLEAN_KEYS = (
+    "network_ready",
+    "vm_switch_ready",
+    "install_media_ready",
+    "guest_heartbeat_ok",
+    "secure_boot_enabled",
+    "tpm_enabled",
+)
+
+
+def _canonical_vm_id(value: object, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("Hyper-V VMId must be a canonical GUID string")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("Hyper-V VMId must be a canonical GUID string") from exc
+    canonical = str(parsed)
+    if value != canonical:
+        raise ValueError("Hyper-V VMId must use canonical lowercase GUID form")
+    return canonical
+
+
+def _require_nullable_text(payload: dict[str, object], key: str) -> str | None:
+    value = payload[key]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Hyper-V observation {key} must be a non-empty string or null")
+    return value
 
 
 @dataclass(frozen=True)
@@ -37,6 +84,8 @@ def build_observe_hyperv_script(
 ) -> str:
     vm_config.validate()
     network_config.validate()
+    if expected_vm_id is not None:
+        expected_vm_id = _canonical_vm_id(expected_vm_id)
 
     vm_name = ps_literal(vm_config.name)
     switch_name = ps_literal(network_config.switch_name)
@@ -134,13 +183,27 @@ def observe_hyperv(
         ),
         timeout_seconds=90,
     )
+    if not isinstance(payload, dict) or set(payload) != _HYPERV_OBSERVATION_KEYS:
+        raise ValueError("Hyper-V observation result schema is invalid")
+    for key in _HYPERV_BOOLEAN_KEYS:
+        if not isinstance(payload[key], bool):
+            raise ValueError(f"Hyper-V observation {key} must be boolean")
+
+    vm_id_raw = payload["vm_id"]
+    vm_id = _canonical_vm_id(vm_id_raw, allow_none=True)
+    vm_state = _require_nullable_text(payload, "vm_state")
+    if vm_id is None and vm_state is not None:
+        raise ValueError("Hyper-V observation cannot report VM state without VMId")
+    if vm_id is not None and vm_state is None:
+        raise ValueError("Hyper-V observation cannot report VMId without VM state")
+
     return HyperVObservation(
-        network_ready=bool(payload.get("network_ready", False)),
-        vm_id=str(payload["vm_id"]) if payload.get("vm_id") else None,
-        vm_state=str(payload["vm_state"]) if payload.get("vm_state") else None,
-        vm_switch_ready=bool(payload.get("vm_switch_ready", False)),
-        install_media_ready=bool(payload.get("install_media_ready", False)),
-        guest_heartbeat_ok=bool(payload.get("guest_heartbeat_ok", False)),
-        secure_boot_enabled=bool(payload.get("secure_boot_enabled", False)),
-        tpm_enabled=bool(payload.get("tpm_enabled", False)),
+        network_ready=payload["network_ready"],
+        vm_id=vm_id,
+        vm_state=vm_state,
+        vm_switch_ready=payload["vm_switch_ready"],
+        install_media_ready=payload["install_media_ready"],
+        guest_heartbeat_ok=payload["guest_heartbeat_ok"],
+        secure_boot_enabled=payload["secure_boot_enabled"],
+        tpm_enabled=payload["tpm_enabled"],
     )
