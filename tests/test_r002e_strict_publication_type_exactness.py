@@ -12,6 +12,7 @@ from hms_gpt_vps.managed_hyperv_agent_strict_qualification import (
     StrictManagedHyperVAgentQualificationError,
     _require_fresh_observation_matches_base,
     _require_listener_matches,
+    validate_strict_managed_hyperv_proof_payload,
 )
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
 from hms_gpt_vps.provisioning import ProvisionObservation
@@ -84,6 +85,23 @@ def _runtime(service_evidence: dict[str, object]) -> SimpleNamespace:
     return SimpleNamespace(observe=observe)
 
 
+def _strict_payload() -> dict[str, object]:
+    return {
+        "strict_publication_schema_version": 1,
+        "hyperv_guest_proven": True,
+        "os_listener_proven": True,
+        "device_enrollment_reproven_at_publication": True,
+        "full_bridge_command_flow_proven": False,
+        "bootstrap_retired": False,
+        "pairing_ready": False,
+        "health_listener_scope": "loopback-only",
+        "health_listener_process_id": 4321,
+        "health_listener_count": 1,
+        "health_listener_addresses": ["127.0.0.1"],
+        "health_listener_port": 8765,
+    }
+
+
 def test_fresh_publication_rejects_boolean_true_as_integer_one() -> None:
     with pytest.raises(
         StrictManagedHyperVAgentQualificationError,
@@ -143,4 +161,29 @@ def test_listener_bracket_rejects_boolean_listener_count() -> None:
             listener,
             expected_vm_id=VM_ID,
             expected_health_port=8765,
+        )
+
+
+def test_strict_payload_rejects_boolean_true_as_schema_one() -> None:
+    payload = _strict_payload()
+    payload["strict_publication_schema_version"] = True
+
+    with pytest.raises(
+        StrictManagedHyperVAgentQualificationError,
+        match="schema mismatch",
+    ):
+        validate_strict_managed_hyperv_proof_payload(
+            payload,
+            expected_health_port=8765,
+        )
+
+
+def test_strict_payload_rejects_boolean_expected_health_port() -> None:
+    with pytest.raises(
+        StrictManagedHyperVAgentQualificationError,
+        match="expected listener port is invalid",
+    ):
+        validate_strict_managed_hyperv_proof_payload(
+            _strict_payload(),
+            expected_health_port=True,  # type: ignore[arg-type]
         )
