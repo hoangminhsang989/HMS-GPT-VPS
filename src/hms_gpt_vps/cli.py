@@ -3,11 +3,17 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from . import __version__
 from .health import health_json
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hms-gpt-vps")
+    parser = argparse.ArgumentParser(prog="hms-agent")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"hms-agent {__version__}",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     health = subparsers.add_parser("health", help="Print agent health as JSON")
