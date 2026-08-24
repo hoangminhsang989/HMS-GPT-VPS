@@ -92,12 +92,37 @@ def credential() -> PowerShellDirectCredential:
     return PowerShellDirectCredential("hmsbootstrap", "Aa1!test-secret")
 
 
-def test_stage_retry_reuses_exact_owned_attempt_after_interruption(
+def install_host_integration_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    baseline: bool = False,
+) -> list[bool]:
+    restored: list[bool] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "probe_guest_service_interface_enabled",
+        lambda *_args, **_kwargs: baseline,
+    )
+
+    def restore(_vm_name: str, expected_enabled: bool):  # type: ignore[no-untyped-def]
+        restored.append(expected_enabled)
+        return {
+            "restored": True,
+            "enabled": expected_enabled,
+            "changed": False,
+        }
+
+    monkeypatch.setattr(runtime_module, "restore_guest_service_interface_state", restore)
+    return restored
+
+
+def test_stage_retry_reuses_exact_owned_attempt_and_restores_host_baseline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, store, manifest = build_runtime(tmp_path)
     seen: list[tuple[str, str]] = []
+    restored = install_host_integration_mocks(monkeypatch, baseline=False)
     monkeypatch.setattr(
         runtime_module,
         "reset_owned_agent_package_staging",
@@ -116,6 +141,8 @@ def test_stage_retry_reuses_exact_owned_attempt_after_interruption(
     current = store.load()
     assert current is not None
     assert current.phase is AgentPackageTransferPhase.TRANSFERRING
+    assert current.guest_service_interface_was_enabled is False
+    assert restored == [False, False]
 
     def completed(*args: object, **kwargs: object) -> dict[str, object]:
         plan = args[2]
@@ -141,12 +168,45 @@ def test_stage_retry_reuses_exact_owned_attempt_after_interruption(
     result = runtime.stage_package(credential())
 
     assert result["package_ready"] is True
+    assert result["guest_service_interface_restored"] is True
     assert len(seen) == 2
     assert seen[0] == seen[1]
+    assert restored == [False, False, False, False]
     assert store.load() is None
 
 
-def test_published_attempt_only_reprobes_and_never_retransfers(
+def test_enabled_integration_baseline_is_preserved_not_forced_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _, manifest = build_runtime(tmp_path)
+    restored = install_host_integration_mocks(monkeypatch, baseline=True)
+    monkeypatch.setattr(
+        runtime_module,
+        "reset_owned_agent_package_staging",
+        lambda *args, **kwargs: {"reset": True},
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "transfer_agent_package_to_guest",
+        lambda *args, **kwargs: {"published": True},
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "probe_agent_package_ready",
+        lambda *args, **kwargs: {
+            "package_ready": True,
+            "file_count": manifest.file_count,
+            "total_size": manifest.total_size,
+            "entrypoint_sha256": manifest.sha256,
+        },
+    )
+
+    runtime.stage_package(credential())
+    assert restored == [True, True]
+
+
+def test_published_attempt_only_restores_host_baseline_and_reprobes_final_package(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -157,11 +217,13 @@ def test_published_attempt_only_reprobes_and_never_retransfers(
         vm_name="HMS-GPT-VPS-01",
         manifest_sha256=manifest_sha,
     )
+    store.bind_guest_service_interface_baseline(False)
     store.transition(AgentPackageTransferPhase.PLANNED, AgentPackageTransferPhase.TRANSFERRING)
     store.transition(AgentPackageTransferPhase.TRANSFERRING, AgentPackageTransferPhase.PUBLISHED)
+    restored = install_host_integration_mocks(monkeypatch, baseline=True)
 
     def forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError("published retry must not mutate or retransfer")
+        raise AssertionError("published retry must not reset guest staging or retransfer")
 
     monkeypatch.setattr(runtime_module, "reset_owned_agent_package_staging", forbidden)
     monkeypatch.setattr(runtime_module, "transfer_agent_package_to_guest", forbidden)
@@ -178,6 +240,7 @@ def test_published_attempt_only_reprobes_and_never_retransfers(
 
     result = runtime.stage_package(credential())
     assert result["resumed_published_attempt"] is True
+    assert restored == [False]
     assert store.load() is None
 
 
@@ -191,8 +254,10 @@ def test_published_attempt_with_lost_final_proof_fails_closed(
         vm_name="HMS-GPT-VPS-01",
         manifest_sha256=canonical_agent_package_manifest_sha256(manifest),
     )
+    store.bind_guest_service_interface_baseline(False)
     store.transition(AgentPackageTransferPhase.PLANNED, AgentPackageTransferPhase.TRANSFERRING)
     store.transition(AgentPackageTransferPhase.TRANSFERRING, AgentPackageTransferPhase.PUBLISHED)
+    install_host_integration_mocks(monkeypatch)
     monkeypatch.setattr(
         runtime_module,
         "probe_agent_package_ready",
