@@ -14,7 +14,6 @@ from .agent_service_runtime_config import (
 )
 from .agent_windows_identity import (
     IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
-    IDENTITY_FAILURE_ELEVATED,
     IDENTITY_FAILURE_NATIVE_INSPECTION,
     IDENTITY_FAILURE_NOT_LOCAL_SERVICE,
     IDENTITY_FAILURE_SERVICE_SID_ABSENT,
@@ -51,7 +50,6 @@ _SAFE_IDENTITY_FAILURE_CODES = frozenset(
         IDENTITY_FAILURE_NOT_LOCAL_SERVICE,
         IDENTITY_FAILURE_SERVICE_SID_ABSENT,
         IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
-        IDENTITY_FAILURE_ELEVATED,
     }
 )
 
@@ -280,33 +278,30 @@ class _SERVICE_STATUS(ctypes.Structure):
     ]
 
 
-class _SERVICE_TABLE_ENTRYW(ctypes.Structure):
-    _fields_ = [
-        ("lpServiceName", wintypes.LPWSTR),
-        ("lpServiceProc", ctypes.c_void_p),
-    ]
+class _SERVICE_TABLE_ENTRY(ctypes.Structure):
+    pass
 
 
-def _native_error(message: str) -> OSError:
-    code = ctypes.get_last_error()
-    return OSError(code, f"{message} (WinError {code})")
+_SERVICE_TABLE_ENTRY._fields_ = [
+    ("lpServiceName", wintypes.LPWSTR),
+    ("lpServiceProc", _SERVICE_MAIN_FUNCTION),
+]
 
 
 class NativeWindowsServiceControlBackend:
-    """Minimal stdlib-only wrapper over the Windows Service Control Manager."""
+    """Small native SCM adapter used by the packaged Agent service host."""
 
     def __init__(self) -> None:
         if os.name != "nt":
-            raise OSError("native Windows service hosting requires Windows")
+            raise OSError("native Windows service host requires Windows")
         self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-        self._service_main_callbacks: list[object] = []
-        self._handler_callbacks: list[object] = []
-        self._callback_errors: list[BaseException] = []
         self._configure_prototypes()
+        self._service_main_callback: object | None = None
+        self._handler_callback: object | None = None
 
     def _configure_prototypes(self) -> None:
         self._advapi32.StartServiceCtrlDispatcherW.argtypes = [
-            ctypes.POINTER(_SERVICE_TABLE_ENTRYW)
+            ctypes.POINTER(_SERVICE_TABLE_ENTRY)
         ]
         self._advapi32.StartServiceCtrlDispatcherW.restype = wintypes.BOOL
         self._advapi32.RegisterServiceCtrlHandlerExW.argtypes = [
@@ -321,31 +316,27 @@ class NativeWindowsServiceControlBackend:
         ]
         self._advapi32.SetServiceStatus.restype = wintypes.BOOL
 
+    @staticmethod
+    def _last_error(message: str) -> OSError:
+        return OSError(ctypes.get_last_error(), message)
+
     def run_dispatcher(
         self,
         service_name: str,
         service_main: Callable[[], None],
     ) -> None:
-        def native_service_main(
-            _argc: int,
-            _argv: ctypes.POINTER(wintypes.LPWSTR),
-        ) -> None:
-            try:
-                service_main()
-            except BaseException as exc:
-                self._callback_errors.append(exc)
+        def native_main(_argc: int, _argv: ctypes.POINTER(wintypes.LPWSTR)) -> None:
+            service_main()
 
-        callback = _SERVICE_MAIN_FUNCTION(native_service_main)
-        self._service_main_callbacks.append(callback)
-        table_type = _SERVICE_TABLE_ENTRYW * 2
-        table = table_type(
-            _SERVICE_TABLE_ENTRYW(service_name, ctypes.cast(callback, ctypes.c_void_p)),
-            _SERVICE_TABLE_ENTRYW(None, None),
-        )
+        callback = _SERVICE_MAIN_FUNCTION(native_main)
+        self._service_main_callback = callback
+        table = (_SERVICE_TABLE_ENTRY * 2)()
+        table[0].lpServiceName = service_name
+        table[0].lpServiceProc = callback
+        table[1].lpServiceName = None
+        table[1].lpServiceProc = _SERVICE_MAIN_FUNCTION()
         if not self._advapi32.StartServiceCtrlDispatcherW(table):
-            raise _native_error("StartServiceCtrlDispatcherW failed")
-        if self._callback_errors:
-            raise RuntimeError("HMS Agent ServiceMain callback failed") from self._callback_errors[0]
+            raise self._last_error("StartServiceCtrlDispatcherW failed")
 
     def register_control_handler(
         self,
@@ -358,17 +349,17 @@ class NativeWindowsServiceControlBackend:
             _event_data: ctypes.c_void_p,
             _context: ctypes.c_void_p,
         ) -> int:
-            try:
-                return int(handler(int(control)))
-            except BaseException as exc:
-                self._callback_errors.append(exc)
-                return ERROR_CALL_NOT_IMPLEMENTED
+            return int(handler(control))
 
         callback = _HANDLER_EX_FUNCTION(native_handler)
-        self._handler_callbacks.append(callback)
-        handle = self._advapi32.RegisterServiceCtrlHandlerExW(service_name, callback, None)
+        self._handler_callback = callback
+        handle = self._advapi32.RegisterServiceCtrlHandlerExW(
+            service_name,
+            callback,
+            None,
+        )
         if not handle:
-            raise _native_error("RegisterServiceCtrlHandlerExW failed")
+            raise self._last_error("RegisterServiceCtrlHandlerExW failed")
         return handle
 
     def set_service_status(
@@ -378,18 +369,16 @@ class NativeWindowsServiceControlBackend:
     ) -> None:
         status.validate()
         native = _SERVICE_STATUS(
-            SERVICE_WIN32_OWN_PROCESS,
-            status.current_state,
-            status.controls_accepted,
-            status.win32_exit_code,
-            status.service_specific_exit_code,
-            status.checkpoint,
-            status.wait_hint_ms,
+            dwServiceType=SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState=status.current_state,
+            dwControlsAccepted=status.controls_accepted,
+            dwWin32ExitCode=status.win32_exit_code,
+            dwServiceSpecificExitCode=status.service_specific_exit_code,
+            dwCheckPoint=status.checkpoint,
+            dwWaitHint=status.wait_hint_ms,
         )
-        handle = wintypes.HANDLE(status_handle)
-        if not self._advapi32.SetServiceStatus(handle, ctypes.byref(native)):
-            raise _native_error("SetServiceStatus failed")
-
-
-def run_hms_agent_windows_service() -> None:
-    AgentWindowsServiceHost(NativeWindowsServiceControlBackend()).run()
+        if not self._advapi32.SetServiceStatus(
+            wintypes.HANDLE(status_handle),
+            ctypes.byref(native),
+        ):
+            raise self._last_error("SetServiceStatus failed")
