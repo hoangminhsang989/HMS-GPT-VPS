@@ -89,9 +89,12 @@ def test_agent_service_uses_localservice_and_per_service_sid() -> None:
 
 def test_agent_service_hash_verifies_guest_binary_before_scm_mutation() -> None:
     script = install_script("b")
-    hash_position = script.index("Get-FileHash")
+    hash_position = script.index("$actualHash = Get-HmsSha256 $binaryPath")
     create_position = script.index("sc.exe create")
     assert hash_position < create_position
+    assert "function Get-HmsSha256" in script
+    assert "System.Security.Cryptography.SHA256" in script
+    assert "Get-FileHash" not in script
     assert "SHA-256 mismatch inside guest" in script
 
 
