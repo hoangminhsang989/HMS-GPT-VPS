@@ -186,10 +186,24 @@ def exclusive_authority_lock(
         if not _same_file_identity(opened_stat, current_stat):
             raise AuthorityLockError("authority lock identity changed during critical section")
     finally:
+        cleanup_error: Exception | None = None
         if windows_mutex is not None:
             kernel32, handle = windows_mutex
-            _release_windows_mutex(kernel32, handle)
+            try:
+                _release_windows_mutex(kernel32, handle)
+            except Exception as exc:  # pragma: no cover - exceptional OS cleanup path
+                cleanup_error = exc
         if fd is not None:
             if posix_locked:
-                _unlock_posix(fd)
-            os.close(fd)
+                try:
+                    _unlock_posix(fd)
+                except Exception as exc:  # pragma: no cover - exceptional OS cleanup path
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            try:
+                os.close(fd)
+            except Exception as exc:  # pragma: no cover - exceptional OS cleanup path
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            raise cleanup_error
