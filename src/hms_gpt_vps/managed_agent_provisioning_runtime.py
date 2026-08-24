@@ -13,29 +13,25 @@ from .agent_package_manifest_artifact import (
     canonical_agent_package_manifest_bytes,
     canonical_agent_package_manifest_sha256,
 )
-from .agent_package_transfer import (
-    AgentPackageTransferPlan,
-    transfer_agent_package_to_guest,
-)
+from .agent_package_transfer import AgentPackageTransferPlan
 from .agent_package_transfer_attempt import (
     AgentPackageTransferAttempt,
     AgentPackageTransferAttemptStore,
     AgentPackageTransferPhase,
 )
-from .agent_package_transfer_recovery import (
-    probe_agent_package_ready,
-    probe_guest_service_interface_enabled,
-    reset_owned_agent_package_staging,
-    restore_guest_service_interface_state,
-)
-from .agent_post_install_observe import (
-    AgentPostInstallObservation,
-    AgentPostInstallObservationConfig,
-    AgentPostInstallObserver,
-)
-from .agent_service_install import AgentServiceConfig, install_agent_service
+from .agent_post_install_observe import AgentPostInstallObservation
+from .agent_service_install import AgentServiceConfig
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .instance_registry import InstanceRegistry
+from .managed_vm_id_operations import (
+    install_agent_service_by_id,
+    observe_agent_post_install_by_id,
+    probe_agent_package_ready_by_id,
+    probe_guest_service_interface_enabled_by_id,
+    reset_owned_agent_package_staging_by_id,
+    restore_guest_service_interface_state_by_id,
+    transfer_agent_package_to_guest_by_id,
+)
 from .powershell import ps_literal, run_powershell_json
 from .powershell_direct import PowerShellDirectCredential
 from .provisioning import ProvisionObservation
@@ -244,8 +240,11 @@ if ($vm.Name -ine $expectedVmName) {{
 
         if attempt.phase is AgentPackageTransferPhase.PLANNED:
             if attempt.guest_service_interface_was_enabled is None:
-                self._assert_vm_identity()
-                baseline = probe_guest_service_interface_enabled(self.config.vm_name)
+                vm_id = self._assert_vm_identity()
+                baseline = probe_guest_service_interface_enabled_by_id(
+                    vm_id,
+                    self.config.vm_name,
+                )
                 attempt = self.transfer_attempt_store.bind_guest_service_interface_baseline(
                     baseline
                 )
@@ -258,10 +257,15 @@ if ($vm.Name -ine $expectedVmName) {{
         plan = self._plan(manifest, attempt)
 
         if attempt.phase is AgentPackageTransferPhase.PUBLISHED:
-            self._assert_vm_identity()
-            restore_guest_service_interface_state(self.config.vm_name, baseline)
-            self._assert_vm_identity()
-            proof = probe_agent_package_ready(
+            vm_id = self._assert_vm_identity()
+            restore_guest_service_interface_state_by_id(
+                vm_id,
+                self.config.vm_name,
+                baseline,
+            )
+            vm_id = self._assert_vm_identity()
+            proof = probe_agent_package_ready_by_id(
+                vm_id,
                 self.config.vm_name,
                 credential,
                 self.config.service,
@@ -284,24 +288,34 @@ if ($vm.Name -ine $expectedVmName) {{
         if attempt.phase is not AgentPackageTransferPhase.TRANSFERRING:
             raise ManagedAgentProvisioningError("unsupported Agent transfer attempt phase")
 
-        self._assert_vm_identity()
-        restore_guest_service_interface_state(self.config.vm_name, baseline)
-        self._assert_vm_identity()
-        reset_owned_agent_package_staging(
+        vm_id = self._assert_vm_identity()
+        restore_guest_service_interface_state_by_id(
+            vm_id,
+            self.config.vm_name,
+            baseline,
+        )
+        vm_id = self._assert_vm_identity()
+        reset_owned_agent_package_staging_by_id(
+            vm_id,
             self.config.vm_name,
             credential,
             plan,
         )
         try:
-            self._assert_vm_identity()
-            transfer = transfer_agent_package_to_guest(
+            vm_id = self._assert_vm_identity()
+            transfer = transfer_agent_package_to_guest_by_id(
+                vm_id,
                 self.config.vm_name,
                 credential,
                 plan,
             )
         finally:
-            self._assert_vm_identity()
-            restore_guest_service_interface_state(self.config.vm_name, baseline)
+            vm_id = self._assert_vm_identity()
+            restore_guest_service_interface_state_by_id(
+                vm_id,
+                self.config.vm_name,
+                baseline,
+            )
 
         attempt = self.transfer_attempt_store.transition(
             AgentPackageTransferPhase.TRANSFERRING,
@@ -309,8 +323,9 @@ if ($vm.Name -ine $expectedVmName) {{
         )
         _ = attempt
 
-        self._assert_vm_identity()
-        proof = probe_agent_package_ready(
+        vm_id = self._assert_vm_identity()
+        proof = probe_agent_package_ready_by_id(
+            vm_id,
             self.config.vm_name,
             credential,
             self.config.service,
@@ -333,9 +348,10 @@ if ($vm.Name -ine $expectedVmName) {{
         credential: PowerShellDirectCredential,
     ) -> dict[str, object]:
         credential.validate()
-        self._assert_vm_identity()
+        vm_id = self._assert_vm_identity()
         manifest = self._load_approved_manifest()
-        package_proof = probe_agent_package_ready(
+        package_proof = probe_agent_package_ready_by_id(
+            vm_id,
             self.config.vm_name,
             credential,
             self.config.service,
@@ -345,8 +361,9 @@ if ($vm.Name -ine $expectedVmName) {{
             raise ManagedAgentProvisioningError(
                 "HMS Agent service install requires exact package-ready proof"
             )
-        self._assert_vm_identity()
-        result = install_agent_service(
+        vm_id = self._assert_vm_identity()
+        result = install_agent_service_by_id(
+            vm_id,
             self.config.vm_name,
             credential,
             self.config.service,
@@ -362,9 +379,10 @@ if ($vm.Name -ine $expectedVmName) {{
         credential: PowerShellDirectCredential,
     ) -> tuple[ProvisionObservation, AgentPostInstallObservation | None]:
         credential.validate()
-        self._assert_vm_identity()
+        vm_id = self._assert_vm_identity()
         manifest = self._load_approved_manifest()
-        package_proof = probe_agent_package_ready(
+        package_proof = probe_agent_package_ready_by_id(
+            vm_id,
             self.config.vm_name,
             credential,
             self.config.service,
@@ -374,16 +392,16 @@ if ($vm.Name -ine $expectedVmName) {{
         if not package_ready:
             return ProvisionObservation(agent_package_ready=False), None
 
-        self._assert_vm_identity()
-        post = AgentPostInstallObserver(
-            AgentPostInstallObservationConfig(
-                vm_name=self.config.vm_name,
-                package_manifest=manifest,
-                expected_agent_version=manifest.version,
-                service=self.config.service,
-                runtime=self.config.runtime,
-            )
-        ).observe(credential)
+        vm_id = self._assert_vm_identity()
+        post = observe_agent_post_install_by_id(
+            vm_id,
+            self.config.vm_name,
+            credential,
+            package_manifest=manifest,
+            expected_agent_version=manifest.version,
+            service=self.config.service,
+            runtime=self.config.runtime,
+        )
         return (
             ProvisionObservation(
                 agent_package_ready=True,
