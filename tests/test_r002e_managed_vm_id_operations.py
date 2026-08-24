@@ -6,9 +6,11 @@ import pytest
 
 from hms_gpt_vps.agent_package import build_agent_package_manifest, write_agent_package_manifest
 from hms_gpt_vps.agent_package_transfer import AgentPackageTransferPlan
+from hms_gpt_vps.agent_service_install import AgentServiceConfig
 from hms_gpt_vps.managed_vm_id_operations import (
     build_copy_agent_package_to_staging_by_id_script,
     normalize_managed_vm_id,
+    probe_agent_package_ready_by_id,
     probe_guest_service_interface_enabled_by_id,
     restore_guest_service_interface_state_by_id,
     transfer_agent_package_to_guest_by_id,
@@ -93,6 +95,24 @@ def test_integration_service_probe_and_restore_use_vm_object(
         assert "-VMName" not in script
 
 
+def test_integration_restore_rejects_truthy_string_postcondition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        managed_ops,
+        "run_powershell_json",
+        lambda *args, **kwargs: {
+            "restored": "false",
+            "enabled": False,
+            "changed": False,
+            "vm_id": VM_ID,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="malformed boolean evidence: restored"):
+        restore_guest_service_interface_state_by_id(VM_ID, VM_NAME, False)
+
+
 def test_package_transfer_dispatches_guest_steps_by_id_and_host_copy_by_vm_object(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -150,3 +170,64 @@ def test_package_transfer_dispatches_guest_steps_by_id_and_host_copy_by_vm_objec
     assert len(host_scripts) == 1
     assert "Copy-VMFile -VM $managedVm" in host_scripts[0]
     assert "Copy-VMFile -Name" not in host_scripts[0]
+
+
+def test_package_transfer_rejects_string_integer_copy_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = make_plan(tmp_path)
+
+    def fake_guest(
+        _vm_id: str,
+        _vm_name: str,
+        _credential,
+        script: str,
+        *,
+        timeout_seconds: int,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        if "staging_ready" in script:
+            return {"staging_ready": True}
+        raise AssertionError("publication must not run after malformed copy evidence")
+
+    monkeypatch.setattr(managed_ops, "run_vm_powershell_json_by_id", fake_guest)
+    monkeypatch.setattr(
+        managed_ops,
+        "run_powershell_json",
+        lambda *args, **kwargs: {
+            "copied": True,
+            "copied_files": str(plan.manifest.file_count),
+            "manifest_copied": True,
+            "vm_id": VM_ID,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="malformed integer evidence: copied_files"):
+        transfer_agent_package_to_guest_by_id(
+            VM_ID,
+            VM_NAME,
+            PowerShellDirectCredential("hmsbootstrap", "temporary-secret"),
+            plan,
+        )
+
+
+def test_package_ready_probe_rejects_truthy_non_boolean_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = make_plan(tmp_path)
+    monkeypatch.setattr(
+        managed_ops,
+        "run_vm_powershell_json_by_id",
+        lambda *args, **kwargs: {"package_ready": "true"},
+    )
+
+    with pytest.raises(RuntimeError, match="malformed boolean evidence: package_ready"):
+        probe_agent_package_ready_by_id(
+            VM_ID,
+            VM_NAME,
+            PowerShellDirectCredential("hmsbootstrap", "temporary-secret"),
+            AgentServiceConfig(),
+            plan.manifest,
+        )
