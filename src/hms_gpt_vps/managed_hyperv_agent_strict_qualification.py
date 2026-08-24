@@ -103,14 +103,14 @@ def _require_fresh_observation_matches_base(
 ) -> None:
     observation, post = agent_runtime.observe(credential)
     if not (
-        observation.agent_package_ready
-        and observation.agent_service_ready
-        and observation.agent_healthy
+        observation.agent_package_ready is True
+        and observation.agent_service_ready is True
+        and observation.agent_healthy is True
     ):
         raise StrictManagedHyperVAgentQualificationError(
             "strict publication fresh Agent observation is incomplete"
         )
-    if post is None or not post.service_ready or not post.agent_healthy:
+    if post is None or post.service_ready is not True or post.agent_healthy is not True:
         raise StrictManagedHyperVAgentQualificationError(
             "strict publication fresh post-install observation is incomplete"
         )
@@ -142,6 +142,15 @@ def _require_fresh_observation_matches_base(
                 raise StrictManagedHyperVAgentQualificationError(
                     f"strict publication fresh evidence changed: {key}"
                 )
+        elif isinstance(expected, int) and not isinstance(expected, bool):
+            if (
+                not isinstance(actual, int)
+                or isinstance(actual, bool)
+                or actual != expected
+            ):
+                raise StrictManagedHyperVAgentQualificationError(
+                    f"strict publication fresh evidence changed: {key}"
+                )
         elif actual != expected:
             raise StrictManagedHyperVAgentQualificationError(
                 f"strict publication fresh evidence changed: {key}"
@@ -164,6 +173,7 @@ def _require_listener_matches(
     listener: dict[str, object],
     *,
     expected_vm_id: str,
+    expected_health_port: int,
 ) -> None:
     if listener.get("os_listener_proven") is not True:
         raise StrictManagedHyperVAgentQualificationError(
@@ -172,6 +182,37 @@ def _require_listener_matches(
     if listener.get("vm_id") != expected_vm_id.lower():
         raise StrictManagedHyperVAgentQualificationError(
             "managed Hyper-V OS listener proof returned the wrong VMId"
+        )
+    process_id = listener.get("process_id")
+    if (
+        not isinstance(process_id, int)
+        or isinstance(process_id, bool)
+        or process_id <= 0
+    ):
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V OS listener proof returned an invalid process id"
+        )
+    listener_count = listener.get("listener_count")
+    if (
+        not isinstance(listener_count, int)
+        or isinstance(listener_count, bool)
+        or listener_count != 1
+    ):
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V OS listener proof returned an invalid listener count"
+        )
+    if listener.get("local_addresses") != ["127.0.0.1"]:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V OS listener proof is not exclusive IPv4 loopback"
+        )
+    listener_port = listener.get("health_port")
+    if (
+        not isinstance(listener_port, int)
+        or isinstance(listener_port, bool)
+        or listener_port != expected_health_port
+    ):
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V OS listener proof returned the wrong health port"
         )
 
 
@@ -237,7 +278,7 @@ def qualify_managed_hyperv_agent_strict(
         max_reconcile_steps=max_reconcile_steps,
     )
     base_proof.validate()
-    if not base_proof.hyperv_guest_proven:
+    if base_proof.hyperv_guest_proven is not True:
         raise StrictManagedHyperVAgentQualificationError(
             "base managed Hyper-V qualification did not prove the guest path"
         )
@@ -257,7 +298,11 @@ def qualify_managed_hyperv_agent_strict(
         agent_runtime.config.service,
         health_port,
     )
-    _require_listener_matches(listener_before, expected_vm_id=base_proof.vm_id)
+    _require_listener_matches(
+        listener_before,
+        expected_vm_id=base_proof.vm_id,
+        expected_health_port=health_port,
+    )
 
     _require_fresh_observation_matches_base(agent_runtime, credential, base_proof)
 
@@ -273,7 +318,11 @@ def qualify_managed_hyperv_agent_strict(
         agent_runtime.config.service,
         health_port,
     )
-    _require_listener_matches(listener_after, expected_vm_id=base_proof.vm_id)
+    _require_listener_matches(
+        listener_after,
+        expected_vm_id=base_proof.vm_id,
+        expected_health_port=health_port,
+    )
     if listener_after.get("process_id") != listener_before.get("process_id"):
         raise StrictManagedHyperVAgentQualificationError(
             "managed Hyper-V Agent service process changed during strict publication proof"
