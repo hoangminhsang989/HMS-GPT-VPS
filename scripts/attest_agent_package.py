@@ -25,14 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    package_root = args.package_root.resolve(strict=True)
+    package_root = args.package_root
     manifest_path = args.manifest.resolve()
-    if not package_root.is_dir():
-        raise ValueError("production Agent package root must be a directory")
 
-    entrypoint = package_root / AGENT_PACKAGE_ENTRYPOINT
-    require_windows_amd64_pe(entrypoint)
     manifest = build_agent_package_manifest(package_root, version=__version__)
+    require_windows_amd64_pe(package_root / manifest.entrypoint)
     write_agent_package_manifest(manifest_path, manifest)
 
     published = load_agent_package_manifest(manifest_path)
