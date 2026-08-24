@@ -163,12 +163,12 @@ def main() -> int:
     if Path(service.runtime_path).exists() or Path(service.workspace_path).exists():
         raise RuntimeError("managed HMS paths already exist before service-start probe")
 
-    source_package = (artifact_root / "hms-agent").resolve(strict=True)
+    source_package = artifact_root / "hms-agent"
     manifest = load_agent_package_manifest(
         (artifact_root / "hms-agent.manifest.json").resolve(strict=True)
     )
     verify_agent_package(source_package, manifest)
-    source_entrypoint = (source_package / manifest.entrypoint).resolve(strict=True)
+    source_entrypoint = source_package / manifest.entrypoint
     require_windows_amd64_pe(source_entrypoint)
 
     runtime_token = secrets.token_hex(24)
