@@ -15,8 +15,10 @@ AGENT_SERVICE_ACCOUNT = r"NT SERVICE\HMSAgent"
 
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
+_TOKEN_GROUPS = 2
 _TOKEN_ELEVATION = 20
 _ERROR_INSUFFICIENT_BUFFER = 122
+_MAX_TOKEN_GROUPS = 4096
 
 
 class AgentWindowsIdentityError(RuntimeError):
@@ -26,8 +28,8 @@ class AgentWindowsIdentityError(RuntimeError):
 @dataclass(frozen=True)
 class AgentWindowsTokenSnapshot:
     user_sid: str
-    service_sid_member: bool
-    administrators_member: bool
+    service_sid_present: bool
+    administrators_sid_present: bool
     elevated: bool
 
     def validate_shape(self) -> None:
@@ -36,8 +38,8 @@ class AgentWindowsTokenSnapshot:
         if not self.user_sid.upper().startswith("S-"):
             raise AgentWindowsIdentityError("Windows token user SID is malformed")
         for name, value in (
-            ("service_sid_member", self.service_sid_member),
-            ("administrators_member", self.administrators_member),
+            ("service_sid_present", self.service_sid_present),
+            ("administrators_sid_present", self.administrators_sid_present),
             ("elevated", self.elevated),
         ):
             if not isinstance(value, bool):
@@ -51,24 +53,27 @@ class AgentWindowsTokenInspector(Protocol):
 def validate_agent_service_token(
     snapshot: AgentWindowsTokenSnapshot,
 ) -> AgentRuntimeIdentity:
-    """Convert a native Windows token proof into the runtime identity contract.
+    """Convert native Windows token facts into the runtime identity contract.
 
     The service process must simultaneously prove all of the following:
     - its primary user is LocalService (S-1-5-19),
-    - the per-service SID `NT SERVICE\\HMSAgent` is enabled in the token,
-    - the token is not a member of Builtin Administrators,
+    - the per-service SID `NT SERVICE\\HMSAgent` is present in TokenGroups,
+    - the Builtin Administrators SID is absent from TokenGroups,
     - the token is not elevated.
 
-    No value from a config file, environment variable, command-line argument, or
-    health document can substitute for these operating-system token facts.
+    Presence is read directly with GetTokenInformation(TokenGroups). This avoids
+    treating `CheckTokenMembership` as a primary-token enumeration API and also
+    lets this proof reject an Administrators SID even if Windows marked it
+    deny-only or disabled. No value from config, environment, command line, or
+    the health document can substitute for these operating-system token facts.
     """
     snapshot.validate_shape()
     if snapshot.user_sid.upper() != LOCAL_SERVICE_SID:
         raise PermissionError("HMS Agent process token is not LocalService")
-    if not snapshot.service_sid_member:
+    if not snapshot.service_sid_present:
         raise PermissionError("HMS Agent per-service SID is absent from process token")
-    if snapshot.administrators_member:
-        raise PermissionError("HMS Agent process token is an Administrators member")
+    if snapshot.administrators_sid_present:
+        raise PermissionError("HMS Agent process token contains Administrators SID")
     if snapshot.elevated:
         raise PermissionError("HMS Agent process token is elevated")
 
@@ -99,6 +104,13 @@ class _TOKEN_USER_VALUE(ctypes.Structure):
     _fields_ = [("User", _SID_AND_ATTRIBUTES)]
 
 
+class _TOKEN_GROUPS_LAYOUT(ctypes.Structure):
+    _fields_ = [
+        ("GroupCount", wintypes.DWORD),
+        ("Groups", _SID_AND_ATTRIBUTES * 1),
+    ]
+
+
 class _TOKEN_ELEVATION_VALUE(ctypes.Structure):
     _fields_ = [("TokenIsElevated", wintypes.DWORD)]
 
@@ -109,7 +121,7 @@ def _last_error(message: str) -> AgentWindowsIdentityError:
 
 
 class NativeWindowsTokenInspector:
-    """Read the current process identity directly through Win32 token APIs."""
+    """Read current-process identity directly through Win32 token APIs."""
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -160,12 +172,8 @@ class NativeWindowsTokenInspector:
             ctypes.POINTER(wintypes.DWORD),
         ]
         self._advapi32.LookupAccountNameW.restype = wintypes.BOOL
-        self._advapi32.CheckTokenMembership.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.BOOL),
-        ]
-        self._advapi32.CheckTokenMembership.restype = wintypes.BOOL
+        self._advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._advapi32.EqualSid.restype = wintypes.BOOL
 
     def _open_current_token(self) -> wintypes.HANDLE:
         token = wintypes.HANDLE()
@@ -177,31 +185,39 @@ class NativeWindowsTokenInspector:
             raise _last_error("OpenProcessToken failed")
         return token
 
-    def _token_user_sid(self, token: wintypes.HANDLE) -> str:
+    def _read_token_buffer(
+        self,
+        token: wintypes.HANDLE,
+        information_class: int,
+        label: str,
+    ) -> ctypes.Array[ctypes.c_char]:
         needed = wintypes.DWORD(0)
         ctypes.set_last_error(0)
         ok = self._advapi32.GetTokenInformation(
             token,
-            _TOKEN_USER,
+            information_class,
             None,
             0,
             ctypes.byref(needed),
         )
         if ok or ctypes.get_last_error() != _ERROR_INSUFFICIENT_BUFFER:
-            raise _last_error("GetTokenInformation(TokenUser) sizing failed")
+            raise _last_error(f"GetTokenInformation({label}) sizing failed")
         if needed.value == 0:
-            raise AgentWindowsIdentityError("TokenUser returned an empty buffer size")
+            raise AgentWindowsIdentityError(f"{label} returned an empty buffer size")
 
         buffer = ctypes.create_string_buffer(needed.value)
         if not self._advapi32.GetTokenInformation(
             token,
-            _TOKEN_USER,
+            information_class,
             buffer,
             needed.value,
             ctypes.byref(needed),
         ):
-            raise _last_error("GetTokenInformation(TokenUser) failed")
+            raise _last_error(f"GetTokenInformation({label}) failed")
+        return buffer
 
+    def _token_user_sid(self, token: wintypes.HANDLE) -> str:
+        buffer = self._read_token_buffer(token, _TOKEN_USER, "TokenUser")
         token_user = ctypes.cast(
             buffer,
             ctypes.POINTER(_TOKEN_USER_VALUE),
@@ -209,6 +225,41 @@ class NativeWindowsTokenInspector:
         if not token_user.User.Sid:
             raise AgentWindowsIdentityError("TokenUser returned a null SID")
         return self._sid_to_string(token_user.User.Sid)
+
+    def _token_groups_contain_sid(
+        self,
+        token: wintypes.HANDLE,
+        target_sid: ctypes.c_void_p,
+    ) -> bool:
+        buffer = self._read_token_buffer(token, _TOKEN_GROUPS, "TokenGroups")
+        buffer_size = ctypes.sizeof(buffer)
+        groups_offset = _TOKEN_GROUPS_LAYOUT.Groups.offset
+        if buffer_size < groups_offset:
+            raise AgentWindowsIdentityError("TokenGroups buffer is shorter than header")
+
+        group_count = ctypes.cast(
+            buffer,
+            ctypes.POINTER(wintypes.DWORD),
+        ).contents.value
+        if group_count > _MAX_TOKEN_GROUPS:
+            raise AgentWindowsIdentityError("TokenGroups count exceeds safety bound")
+
+        entry_size = ctypes.sizeof(_SID_AND_ATTRIBUTES)
+        required_size = groups_offset + (group_count * entry_size)
+        if required_size > buffer_size:
+            raise AgentWindowsIdentityError("TokenGroups buffer is structurally truncated")
+
+        base_address = ctypes.addressof(buffer) + groups_offset
+        for index in range(group_count):
+            entry = ctypes.cast(
+                base_address + (index * entry_size),
+                ctypes.POINTER(_SID_AND_ATTRIBUTES),
+            ).contents
+            if not entry.Sid:
+                raise AgentWindowsIdentityError("TokenGroups contains a null SID")
+            if self._advapi32.EqualSid(entry.Sid, target_sid):
+                return True
+        return False
 
     def _sid_to_string(self, sid: ctypes.c_void_p | int) -> str:
         text = wintypes.LPWSTR()
@@ -284,16 +335,6 @@ class NativeWindowsTokenInspector:
             raise _last_error(f"LookupAccountNameW failed for {account}")
         return sid_buffer
 
-    def _check_membership(self, token: wintypes.HANDLE, sid: ctypes.c_void_p) -> bool:
-        member = wintypes.BOOL(False)
-        if not self._advapi32.CheckTokenMembership(
-            token,
-            sid,
-            ctypes.byref(member),
-        ):
-            raise _last_error("CheckTokenMembership failed")
-        return bool(member.value)
-
     def snapshot(self) -> AgentWindowsTokenSnapshot:
         token = self._open_current_token()
         admin_sid: ctypes.c_void_p | None = None
@@ -301,19 +342,22 @@ class NativeWindowsTokenInspector:
             user_sid = self._token_user_sid(token)
 
             service_sid_buffer = self._lookup_account_sid(AGENT_SERVICE_ACCOUNT)
-            service_member = self._check_membership(
+            service_sid_present = self._token_groups_contain_sid(
                 token,
                 ctypes.cast(service_sid_buffer, ctypes.c_void_p),
             )
 
             admin_sid = self._sid_from_string(BUILTIN_ADMINISTRATORS_SID)
-            administrators_member = self._check_membership(token, admin_sid)
+            administrators_sid_present = self._token_groups_contain_sid(
+                token,
+                admin_sid,
+            )
             elevated = self._token_is_elevated(token)
 
             snapshot = AgentWindowsTokenSnapshot(
                 user_sid=user_sid,
-                service_sid_member=service_member,
-                administrators_member=administrators_member,
+                service_sid_present=service_sid_present,
+                administrators_sid_present=administrators_sid_present,
                 elevated=elevated,
             )
             snapshot.validate_shape()
