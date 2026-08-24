@@ -262,9 +262,12 @@ class NativeWindowsTokenInspector:
         return False
 
     def _sid_to_string(self, sid: ctypes.c_void_p | int) -> str:
+        sid_value = sid.value if isinstance(sid, ctypes.c_void_p) else sid
+        if not sid_value:
+            raise AgentWindowsIdentityError("cannot stringify a null SID")
         text = wintypes.LPWSTR()
         if not self._advapi32.ConvertSidToStringSidW(
-            ctypes.c_void_p(sid),
+            ctypes.c_void_p(sid_value),
             ctypes.byref(text),
         ):
             raise _last_error("ConvertSidToStringSidW failed")
