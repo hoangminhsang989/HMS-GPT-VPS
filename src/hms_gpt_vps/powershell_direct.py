@@ -35,7 +35,7 @@ def build_powershell_direct_host_script(vm_name: str) -> str:
     if not vm_name.strip():
         raise ValueError("VM name is required")
     vm = ps_literal(vm_name)
-    return f"""
+    return rf"""
 $ErrorActionPreference = 'Stop'
 $vmName = {vm}
 $username = $env:HMS_PSDIRECT_USERNAME
