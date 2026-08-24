@@ -100,7 +100,10 @@ def qualify_managed_hyperv_agent_strict(
 
     ``qualify_managed_hyperv_agent`` supplies the package/SCM/health/enrollment
     evidence. This final publication gate additionally proves the real listening
-    socket from Windows guest OS state, bound to the exact managed VMId.
+    socket from Windows guest OS state, bound to the exact managed VMId. Stable
+    registry/Hyper-V identity is re-proved immediately before and after that
+    final OS observation so the publication boundary cannot rely on stale VM
+    identity from the base qualification.
     """
 
     base_proof = qualify_managed_hyperv_agent(
@@ -117,9 +120,15 @@ def qualify_managed_hyperv_agent_strict(
         )
 
     agent_runtime = reconcile_runtime.agent_runtime
+    pre_listener_vm_id = agent_runtime._assert_vm_identity()
+    if pre_listener_vm_id != base_proof.vm_id:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V VMId changed before strict listener proof"
+        )
+
     health_port = agent_runtime.config.runtime.health_port
     listener = probe_managed_agent_health_listener_by_id(
-        base_proof.vm_id,
+        pre_listener_vm_id,
         agent_runtime.config.vm_name,
         credential,
         agent_runtime.config.service,
@@ -132,6 +141,12 @@ def qualify_managed_hyperv_agent_strict(
     if listener.get("vm_id") != base_proof.vm_id.lower():
         raise StrictManagedHyperVAgentQualificationError(
             "managed Hyper-V OS listener proof returned the wrong VMId"
+        )
+
+    post_listener_vm_id = agent_runtime._assert_vm_identity()
+    if post_listener_vm_id != base_proof.vm_id:
+        raise StrictManagedHyperVAgentQualificationError(
+            "managed Hyper-V VMId changed during strict listener proof"
         )
 
     payload = base_proof.to_dict()
