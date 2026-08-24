@@ -65,6 +65,17 @@ $connections = @(
         timeout_seconds=timeout_seconds,
     )
 
+    expected_keys = {
+        "service_name",
+        "process_id",
+        "health_port",
+        "listener_count",
+        "local_addresses",
+    }
+    if set(result) != expected_keys:
+        raise ManagedGuestListenerProofError(
+            "managed guest listener proof fields do not match schema"
+        )
     if result.get("service_name") != service.service_name:
         raise ManagedGuestListenerProofError(
             "managed guest listener proof returned the wrong service identity"
@@ -97,15 +108,14 @@ $connections = @(
             "managed guest Agent health must have exactly one listening socket"
         )
 
-    addresses_raw = result.get("local_addresses", [])
-    if isinstance(addresses_raw, str):
-        addresses = [addresses_raw]
-    elif isinstance(addresses_raw, list):
-        addresses = [str(value) for value in addresses_raw]
-    else:
+    addresses_raw = result.get("local_addresses")
+    if not isinstance(addresses_raw, list) or not all(
+        isinstance(value, str) for value in addresses_raw
+    ):
         raise ManagedGuestListenerProofError(
             "managed guest listener address evidence has invalid shape"
         )
+    addresses = list(addresses_raw)
     if addresses != ["127.0.0.1"]:
         raise ManagedGuestListenerProofError(
             "managed guest Agent health listener is not bound exclusively to IPv4 loopback"
