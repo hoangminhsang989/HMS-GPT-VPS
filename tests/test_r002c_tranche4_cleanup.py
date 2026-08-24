@@ -14,6 +14,10 @@ from hms_gpt_vps.agent_service_readiness import (
     build_agent_service_readiness_script,
     require_agent_service_ready,
 )
+from hms_gpt_vps.agent_service_runtime_config import (
+    AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+    AgentServiceRuntimeConfig,
+)
 from hms_gpt_vps.bootstrap_retirement import (
     build_detach_answer_iso_script,
     build_retire_bootstrap_guest_script,
@@ -37,6 +41,20 @@ class MemorySecretStore:
         self.value = None
 
 
+def service_runtime_config() -> AgentServiceRuntimeConfig:
+    return AgentServiceRuntimeConfig(
+        schema_version=AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+        instance_id="hms-01",
+        project_id="project-01",
+        bridge_origin="https://bridge.example",
+        workspace_root=r"C:\HMS-Workspace",
+        state_root=r"C:\ProgramData\HMS-GPT-VPS\State",
+        python_executable=r"C:\Program Files\Python\python.exe",
+        git_executable=r"C:\Program Files\Git\cmd\git.exe",
+        health_port=8765,
+    )
+
+
 def test_agent_package_manifest_detects_tamper(tmp_path: Path) -> None:
     artifact = tmp_path / "hms-agent.exe"
     artifact.write_bytes(b"agent-v1")
@@ -54,6 +72,7 @@ def test_service_readiness_is_not_application_health() -> None:
     script = build_agent_service_readiness_script(
         AgentServiceConfig(),
         expected_sha256="a" * 64,
+        runtime_config=service_runtime_config(),
     )
     assert "application_health = 'NOT_IMPLEMENTED'" in script
     assert "NT AUTHORITY\\LocalService" in script
@@ -61,6 +80,7 @@ def test_service_readiness_is_not_application_health() -> None:
     assert "ReadAndExecute" in script
     assert "FileSystemRights]::Modify" in script
     assert "Get-FileHash" in script
+    assert "runtime_config_sha256_ok" in script
 
     require_agent_service_ready({"service_ready": True})
     with pytest.raises(RuntimeError, match="service readiness"):

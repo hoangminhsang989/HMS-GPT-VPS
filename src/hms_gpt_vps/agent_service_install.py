@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from pathlib import PureWindowsPath
 
+from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
 
@@ -11,6 +14,9 @@ class AgentServiceConfig:
     service_name: str = "HMSAgent"
     display_name: str = "HMS GPT VPS Agent"
     binary_path: str = r"C:\ProgramData\HMS-GPT-VPS\Agent\hms-agent.exe"
+    runtime_config_path: str = (
+        r"C:\ProgramData\HMS-GPT-VPS\Agent\agent-runtime.json"
+    )
     workspace_path: str = r"C:\HMS-Workspace"
     runtime_path: str = r"C:\ProgramData\HMS-GPT-VPS"
     state_path: str = r"C:\ProgramData\HMS-GPT-VPS\State"
@@ -18,28 +24,64 @@ class AgentServiceConfig:
     def validate(self) -> None:
         if not self.service_name.strip():
             raise ValueError("service_name is required")
-        if any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in self.service_name):
+        if any(
+            char
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for char in self.service_name
+        ):
             raise ValueError("service_name contains unsupported characters")
-        if not self.binary_path.strip():
-            raise ValueError("binary_path is required")
-        if not self.workspace_path.strip():
-            raise ValueError("workspace_path is required")
-        if not self.state_path.strip():
-            raise ValueError("state_path is required")
+        for name, value in (
+            ("binary_path", self.binary_path),
+            ("runtime_config_path", self.runtime_config_path),
+            ("workspace_path", self.workspace_path),
+            ("runtime_path", self.runtime_path),
+            ("state_path", self.state_path),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} is required")
+            if not PureWindowsPath(value).is_absolute():
+                raise ValueError(f"{name} must be an absolute Windows path")
+
+        binary_parent = str(PureWindowsPath(self.binary_path).parent).casefold()
+        config_parent = str(PureWindowsPath(self.runtime_config_path).parent).casefold()
+        if config_parent != binary_parent:
+            raise ValueError("runtime_config_path must be inside the protected Agent root")
+        if PureWindowsPath(self.runtime_config_path).name.casefold() == PureWindowsPath(
+            self.binary_path
+        ).name.casefold():
+            raise ValueError("runtime config must not replace the Agent executable")
+
+
+def _same_windows_path(left: str, right: str) -> bool:
+    return str(PureWindowsPath(left)).casefold() == str(PureWindowsPath(right)).casefold()
+
+
+def _validate_runtime_config_alignment(
+    service: AgentServiceConfig,
+    runtime: AgentServiceRuntimeConfig,
+) -> None:
+    runtime.validate()
+    if not _same_windows_path(runtime.workspace_root, service.workspace_path):
+        raise ValueError("runtime config workspace_root conflicts with service ACL target")
+    if not _same_windows_path(runtime.state_root, service.state_path):
+        raise ValueError("runtime config state_root conflicts with service ACL target")
 
 
 def build_agent_service_install_script(
     config: AgentServiceConfig,
     *,
     expected_sha256: str,
+    runtime_config: AgentServiceRuntimeConfig,
 ) -> str:
-    """Install/reconcile HMS Agent as LocalService plus per-service SID.
+    """Install/reconcile HMS Agent plus its protected non-secret runtime config.
 
-    The copied agent executable is hash-verified inside the guest before SCM is
-    modified. Workspace/state Modify permission is granted only to the service
-    SID; the executable directory remains read/execute for that SID.
+    Binary and canonical runtime-config hashes are verified inside the guest.
+    Config replacement happens before Agent-root ACL reconciliation and before
+    service start. When an already-running service needs a changed config it is
+    stopped first, then restarted after the exact new config is verified.
     """
     config.validate()
+    _validate_runtime_config_alignment(config, runtime_config)
     if len(expected_sha256) != 64:
         raise ValueError("expected_sha256 must contain 64 hex characters")
     try:
@@ -47,23 +89,33 @@ def build_agent_service_install_script(
     except ValueError as exc:
         raise ValueError("expected_sha256 must be hexadecimal") from exc
 
+    runtime_bytes = runtime_config.to_bytes()
+    runtime_config_b64 = base64.b64encode(runtime_bytes).decode("ascii")
+    runtime_config_hash = runtime_config.sha256()
+
     service_name = ps_literal(config.service_name)
     display_name = ps_literal(config.display_name)
     binary_path = ps_literal(config.binary_path)
+    runtime_config_path = ps_literal(config.runtime_config_path)
     workspace = ps_literal(config.workspace_path)
     runtime = ps_literal(config.runtime_path)
     state = ps_literal(config.state_path)
     expected_hash = ps_literal(expected_sha256.lower())
+    expected_config_hash = ps_literal(runtime_config_hash)
+    runtime_config_payload = ps_literal(runtime_config_b64)
 
     return f"""
 $ErrorActionPreference = 'Stop'
 $serviceName = {service_name}
 $displayName = {display_name}
 $binaryPath = {binary_path}
+$runtimeConfigPath = {runtime_config_path}
 $workspace = {workspace}
 $runtime = {runtime}
 $statePath = {state}
 $expectedHash = {expected_hash}
+$expectedRuntimeConfigHash = {expected_config_hash}
+$runtimeConfigPayload = {runtime_config_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 
 if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {{
@@ -78,6 +130,60 @@ foreach ($path in @($workspace, $runtime, $statePath)) {{
   if (-not (Test-Path -LiteralPath $path)) {{
     New-Item -ItemType Directory -Path $path -Force | Out-Null
   }}
+}}
+
+$agentRoot = Split-Path -Parent $binaryPath
+if ((Split-Path -Parent $runtimeConfigPath) -ne $agentRoot) {{
+  throw 'HMS Agent runtime config escaped the protected Agent root'
+}}
+
+$configChanged = $true
+$actualRuntimeConfigHash = $null
+if (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf) {{
+  $actualRuntimeConfigHash = (Get-FileHash -LiteralPath $runtimeConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+  $configChanged = $actualRuntimeConfigHash -ne $expectedRuntimeConfigHash
+}}
+
+$existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if ($configChanged -and $null -ne $existing -and $existing.Status -eq 'Running') {{
+  Stop-Service -Name $serviceName -ErrorAction Stop
+  $existing.WaitForStatus(
+    [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+    [TimeSpan]::FromSeconds(30)
+  )
+  $existing.Refresh()
+  if ($existing.Status -ne 'Stopped') {{
+    throw 'HMS Agent did not stop for runtime config replacement'
+  }}
+}}
+
+if ($configChanged) {{
+  $configBytes = [Convert]::FromBase64String($runtimeConfigPayload)
+  $configTemp = $runtimeConfigPath + '.hms-' + [guid]::NewGuid().ToString('N') + '.tmp'
+  try {{
+    [System.IO.File]::WriteAllBytes($configTemp, $configBytes)
+    $tempHash = (Get-FileHash -LiteralPath $configTemp -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    if ($tempHash -ne $expectedRuntimeConfigHash) {{
+      throw 'HMS Agent runtime config temp SHA-256 mismatch inside guest'
+    }}
+    if (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf) {{
+      [System.IO.File]::Replace($configTemp, $runtimeConfigPath, $null, $true)
+    }} else {{
+      [System.IO.File]::Move($configTemp, $runtimeConfigPath)
+    }}
+  }} finally {{
+    if (Test-Path -LiteralPath $configTemp -PathType Leaf) {{
+      Remove-Item -LiteralPath $configTemp -Force -ErrorAction SilentlyContinue
+    }}
+  }}
+}}
+
+if (-not (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf)) {{
+  throw 'HMS Agent runtime config publication failed'
+}}
+$actualRuntimeConfigHash = (Get-FileHash -LiteralPath $runtimeConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+if ($actualRuntimeConfigHash -ne $expectedRuntimeConfigHash) {{
+  throw 'HMS Agent runtime config SHA-256 mismatch inside guest'
 }}
 
 $quotedBinary = '"' + $binaryPath + '" service'
@@ -104,13 +210,12 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Failed to configure HMS Agent failure recover
 & sc.exe failureflag $serviceName '1' | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw 'Failed to enable HMS Agent non-crash failure recovery' }}
 
-$agentRoot = Split-Path -Parent $binaryPath
 foreach ($path in @($agentRoot, $workspace, $statePath)) {{
   if (-not (Test-Path -LiteralPath $path)) {{ throw "Required HMS path missing: $path" }}
 }}
 
 & icacls.exe $agentRoot '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)RX" | Out-Null
-if ($LASTEXITCODE -ne 0) {{ throw 'Failed to protect HMS Agent binary directory ACL' }}
+if ($LASTEXITCODE -ne 0) {{ throw 'Failed to protect HMS Agent binary/config directory ACL' }}
 
 foreach ($path in @($workspace, $statePath)) {{
   & icacls.exe $path '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${{servicePrincipal}}:(OI)(CI)M" | Out-Null
@@ -137,6 +242,9 @@ $wmi = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction 
   start_name = $wmi.StartName
   binary_path = $binaryPath
   binary_sha256 = $actualHash
+  runtime_config_path = $runtimeConfigPath
+  runtime_config_sha256 = $actualRuntimeConfigHash
+  runtime_config_changed = [bool]$configChanged
   service_sid_type = 'UNRESTRICTED'
   workspace = $workspace
   state_path = $statePath
@@ -150,14 +258,21 @@ def install_agent_service(
     config: AgentServiceConfig,
     *,
     expected_sha256: str,
+    runtime_config: AgentServiceRuntimeConfig,
     timeout_seconds: int = 180,
 ) -> dict[str, object]:
     result = run_vm_powershell_json(
         vm_name,
         credential,
-        build_agent_service_install_script(config, expected_sha256=expected_sha256),
+        build_agent_service_install_script(
+            config,
+            expected_sha256=expected_sha256,
+            runtime_config=runtime_config,
+        ),
         timeout_seconds=timeout_seconds,
     )
     if not bool(result.get("ready", False)):
         raise RuntimeError("HMS Agent service postcondition failed")
+    if str(result.get("runtime_config_sha256", "")).lower() != runtime_config.sha256():
+        raise RuntimeError("HMS Agent runtime config postcondition failed")
     return result

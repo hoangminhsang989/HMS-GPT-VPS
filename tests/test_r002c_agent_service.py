@@ -1,8 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from hms_gpt_vps.agent_service_install import (
     AgentServiceConfig,
     build_agent_service_install_script,
+)
+from hms_gpt_vps.agent_service_runtime_config import (
+    AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+    AgentServiceRuntimeConfig,
 )
 from hms_gpt_vps.vm_file_copy import VMFileArtifact, build_copy_vm_file_script
 
@@ -17,6 +23,28 @@ def make_artifact(tmp_path: Path) -> VMFileArtifact:
         source=source,
         destination=r"C:\ProgramData\HMS-GPT-VPS\Agent\hms-agent.exe",
         sha256=digest,
+    )
+
+
+def runtime_config() -> AgentServiceRuntimeConfig:
+    return AgentServiceRuntimeConfig(
+        schema_version=AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+        instance_id="hms-01",
+        project_id="project-01",
+        bridge_origin="https://bridge.example",
+        workspace_root=r"C:\HMS-Workspace",
+        state_root=r"C:\ProgramData\HMS-GPT-VPS\State",
+        python_executable=r"C:\Program Files\Python\python.exe",
+        git_executable=r"C:\Program Files\Git\cmd\git.exe",
+        health_port=8765,
+    )
+
+
+def install_script(digest_char: str = "a") -> str:
+    return build_agent_service_install_script(
+        AgentServiceConfig(),
+        expected_sha256=digest_char * 64,
+        runtime_config=runtime_config(),
     )
 
 
@@ -49,10 +77,7 @@ def test_copy_vm_file_validates_host_hash_before_script_build(tmp_path: Path) ->
 
 
 def test_agent_service_uses_localservice_and_per_service_sid() -> None:
-    script = build_agent_service_install_script(
-        AgentServiceConfig(),
-        expected_sha256="a" * 64,
-    )
+    script = install_script("a")
     assert "NT AUTHORITY\\LocalService" in script
     assert "LocalSystem" not in script
     assert "sc.exe sidtype" in script
@@ -63,10 +88,7 @@ def test_agent_service_uses_localservice_and_per_service_sid() -> None:
 
 
 def test_agent_service_hash_verifies_guest_binary_before_scm_mutation() -> None:
-    script = build_agent_service_install_script(
-        AgentServiceConfig(),
-        expected_sha256="b" * 64,
-    )
+    script = install_script("b")
     hash_position = script.index("Get-FileHash")
     create_position = script.index("sc.exe create")
     assert hash_position < create_position
@@ -74,13 +96,63 @@ def test_agent_service_hash_verifies_guest_binary_before_scm_mutation() -> None:
 
 
 def test_agent_service_protects_binary_workspace_and_state_differently() -> None:
-    script = build_agent_service_install_script(
-        AgentServiceConfig(),
-        expected_sha256="c" * 64,
-    )
+    script = install_script("c")
     assert "(OI)(CI)RX" in script
     assert "(OI)(CI)M" in script
     assert "*S-1-5-18:(OI)(CI)F" in script
     assert "*S-1-5-32-544:(OI)(CI)F" in script
     assert "Everyone:(" not in script
     assert "Users:(" not in script
+
+
+def test_agent_service_publishes_exact_runtime_config_before_service_start() -> None:
+    config = runtime_config()
+    script = install_script("d")
+
+    assert r"C:\ProgramData\HMS-GPT-VPS\Agent\agent-runtime.json" in script
+    assert config.sha256() in script
+    assert "FromBase64String" in script
+    assert "WriteAllBytes" in script
+    assert "File]::Replace" in script
+    assert "runtime config temp SHA-256 mismatch" in script
+    assert "runtime_config_sha256" in script
+    assert script.index("WriteAllBytes") < script.index("sc.exe create")
+    assert script.index("runtime config SHA-256 mismatch") < script.index("Start-Service")
+
+
+def test_agent_service_restarts_only_when_runtime_config_changed() -> None:
+    script = install_script("e")
+
+    assert "$configChanged" in script
+    assert "$configChanged -and $null -ne $existing" in script
+    assert "Stop-Service -Name $serviceName" in script
+    assert "WaitForStatus" in script
+    assert "runtime_config_changed" in script
+
+
+def test_agent_service_rejects_runtime_config_outside_protected_agent_root() -> None:
+    service = AgentServiceConfig(
+        runtime_config_path=r"C:\ProgramData\HMS-GPT-VPS\State\agent-runtime.json"
+    )
+    with pytest.raises(ValueError, match="protected Agent root"):
+        service.validate()
+
+
+def test_agent_service_rejects_runtime_config_acl_target_mismatch() -> None:
+    bad_runtime = AgentServiceRuntimeConfig(
+        schema_version=AGENT_SERVICE_RUNTIME_SCHEMA_VERSION,
+        instance_id="hms-01",
+        project_id="project-01",
+        bridge_origin="https://bridge.example",
+        workspace_root=r"C:\Different-Workspace",
+        state_root=r"C:\ProgramData\HMS-GPT-VPS\State",
+        python_executable=r"C:\Program Files\Python\python.exe",
+        git_executable=r"C:\Program Files\Git\cmd\git.exe",
+        health_port=8765,
+    )
+    with pytest.raises(ValueError, match="workspace_root conflicts"):
+        build_agent_service_install_script(
+            AgentServiceConfig(),
+            expected_sha256="f" * 64,
+            runtime_config=bad_runtime,
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
@@ -131,6 +132,15 @@ class AgentServiceRuntimeConfig:
             separators=(",", ":"),
             ensure_ascii=True,
         )
+
+    def to_bytes(self) -> bytes:
+        data = self.to_json().encode("utf-8")
+        if len(data) > MAX_AGENT_RUNTIME_CONFIG_BYTES:
+            raise AgentServiceRuntimeConfigError("Agent service runtime config is too large")
+        return data
+
+    def sha256(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "AgentServiceRuntimeConfig":
