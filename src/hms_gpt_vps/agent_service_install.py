@@ -7,6 +7,7 @@ from pathlib import PureWindowsPath
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
+from .powershell_sha256 import POWERSHELL_SHA256_FUNCTION
 
 
 @dataclass(frozen=True)
@@ -118,10 +119,12 @@ $expectedRuntimeConfigHash = {expected_config_hash}
 $runtimeConfigPayload = {runtime_config_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 
+{POWERSHELL_SHA256_FUNCTION}
+
 if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {{
   throw 'HMS Agent executable is missing inside guest'
 }}
-$actualHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+$actualHash = Get-HmsSha256 $binaryPath
 if ($actualHash -ne $expectedHash) {{
   throw 'HMS Agent executable SHA-256 mismatch inside guest'
 }}
@@ -140,7 +143,7 @@ if ((Split-Path -Parent $runtimeConfigPath) -ne $agentRoot) {{
 $configChanged = $true
 $actualRuntimeConfigHash = $null
 if (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf) {{
-  $actualRuntimeConfigHash = (Get-FileHash -LiteralPath $runtimeConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+  $actualRuntimeConfigHash = Get-HmsSha256 $runtimeConfigPath
   $configChanged = $actualRuntimeConfigHash -ne $expectedRuntimeConfigHash
 }}
 
@@ -162,7 +165,7 @@ if ($configChanged) {{
   $configTemp = $runtimeConfigPath + '.hms-' + [guid]::NewGuid().ToString('N') + '.tmp'
   try {{
     [System.IO.File]::WriteAllBytes($configTemp, $configBytes)
-    $tempHash = (Get-FileHash -LiteralPath $configTemp -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    $tempHash = Get-HmsSha256 $configTemp
     if ($tempHash -ne $expectedRuntimeConfigHash) {{
       throw 'HMS Agent runtime config temp SHA-256 mismatch inside guest'
     }}
@@ -181,7 +184,7 @@ if ($configChanged) {{
 if (-not (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf)) {{
   throw 'HMS Agent runtime config publication failed'
 }}
-$actualRuntimeConfigHash = (Get-FileHash -LiteralPath $runtimeConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+$actualRuntimeConfigHash = Get-HmsSha256 $runtimeConfigPath
 if ($actualRuntimeConfigHash -ne $expectedRuntimeConfigHash) {{
   throw 'HMS Agent runtime config SHA-256 mismatch inside guest'
 }}
