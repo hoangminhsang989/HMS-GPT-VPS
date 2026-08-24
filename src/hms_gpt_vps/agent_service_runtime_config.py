@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
 
 from .agent_guest_runtime import AgentGuestRuntimeConfig
+from .agent_health_server import AgentHealthServerConfig
+from .agent_https_client import AgentHttpsClientConfig
 
 
 AGENT_SERVICE_RUNTIME_SCHEMA_VERSION = 1
@@ -45,6 +47,14 @@ def _require_int(value: object, name: str) -> int:
     return value
 
 
+def _is_absolute_path_text(value: str) -> bool:
+    # Runtime config can be generated/tested on a non-Windows host while still
+    # describing the Windows guest. Accept the native host form or an absolute
+    # drive/UNC Windows path lexically. The actual guest runtime re-validates
+    # using native Windows Path semantics before use.
+    return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
 @dataclass(frozen=True)
 class AgentServiceRuntimeConfig:
     schema_version: int
@@ -71,12 +81,16 @@ class AgentServiceRuntimeConfig:
         _require_text(self.git_executable, "git_executable")
         _require_int(self.health_port, "health_port")
 
-        guest = self.to_guest_runtime_config(validate=False)
-        guest.validate()
-        if not Path(self.workspace_root).is_absolute():
-            raise AgentServiceRuntimeConfigError("workspace_root must be an absolute path")
-        if not Path(self.state_root).is_absolute():
-            raise AgentServiceRuntimeConfigError("state_root must be an absolute path")
+        AgentHttpsClientConfig(self.bridge_origin).validate()
+        AgentHealthServerConfig(port=self.health_port).validate()
+        for name, value in (
+            ("workspace_root", self.workspace_root),
+            ("state_root", self.state_root),
+            ("python_executable", self.python_executable),
+            ("git_executable", self.git_executable),
+        ):
+            if not _is_absolute_path_text(value):
+                raise AgentServiceRuntimeConfigError(f"{name} must be an absolute path")
 
     def to_guest_runtime_config(
         self,
