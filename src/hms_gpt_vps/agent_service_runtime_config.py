@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
 
@@ -16,6 +17,7 @@ DEFAULT_AGENT_RUNTIME_CONFIG_PATH = Path(
     r"C:\ProgramData\HMS-GPT-VPS\Agent\agent-runtime.json"
 )
 MAX_AGENT_RUNTIME_CONFIG_BYTES = 32 * 1024
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 _REQUIRED_KEYS = frozenset(
     {
@@ -56,6 +58,44 @@ def _is_absolute_path_text(value: str) -> bool:
     return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
 
 
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = path.expanduser().absolute()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
+
+
+def _assert_runtime_config_authority(path: Path) -> None:
+    # Preserve the historical direct-symlink error while extending the gate to
+    # parent symlinks and Windows junction/reparse points.
+    if path.is_symlink():
+        raise PermissionError("Agent service runtime config must not be a symbolic link")
+    if _path_chain_has_redirect(path):
+        raise PermissionError(
+            "Agent service runtime config path must not traverse a link or reparse point"
+        )
+    if path.exists() and not path.is_file():
+        raise PermissionError("Agent service runtime config must be a regular file")
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
 @dataclass(frozen=True)
 class AgentServiceRuntimeConfig:
     schema_version: int
@@ -69,7 +109,8 @@ class AgentServiceRuntimeConfig:
     health_port: int = 8765
 
     def validate(self) -> None:
-        if self.schema_version != AGENT_SERVICE_RUNTIME_SCHEMA_VERSION:
+        schema_version = _require_int(self.schema_version, "schema_version")
+        if schema_version != AGENT_SERVICE_RUNTIME_SCHEMA_VERSION:
             raise AgentServiceRuntimeConfigError(
                 "unsupported Agent service runtime config schema_version"
             )
@@ -207,13 +248,40 @@ def load_agent_service_runtime_config(
         raise AgentServiceRuntimeConfigError(
             "Agent service runtime config path must be absolute"
         )
-    if path.is_symlink():
-        raise PermissionError("Agent service runtime config must not be a symbolic link")
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    size = path.stat().st_size
-    if size <= 0 or size > MAX_AGENT_RUNTIME_CONFIG_BYTES:
-        raise AgentServiceRuntimeConfigError(
-            "Agent service runtime config size is outside supported bounds"
-        )
-    return parse_agent_service_runtime_config(path.read_bytes())
+    authority = path.expanduser().absolute()
+    _assert_runtime_config_authority(authority)
+    if not authority.is_file():
+        raise FileNotFoundError(authority)
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(authority, flags)
+        opened_stat = os.fstat(fd)
+        if opened_stat.st_size <= 0 or opened_stat.st_size > MAX_AGENT_RUNTIME_CONFIG_BYTES:
+            raise AgentServiceRuntimeConfigError(
+                "Agent service runtime config size is outside supported bounds"
+            )
+        _assert_runtime_config_authority(authority)
+        current_stat = authority.stat()
+        if not _same_file_identity(opened_stat, current_stat):
+            raise PermissionError(
+                "Agent service runtime config authority changed during open"
+            )
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = None
+            data = handle.read(MAX_AGENT_RUNTIME_CONFIG_BYTES + 1)
+        _assert_runtime_config_authority(authority)
+        current_stat = authority.stat()
+        if not _same_file_identity(opened_stat, current_stat):
+            raise PermissionError(
+                "Agent service runtime config authority changed during read"
+            )
+        if len(data) != opened_stat.st_size:
+            raise AgentServiceRuntimeConfigError(
+                "Agent service runtime config changed during read"
+            )
+        return parse_agent_service_runtime_config(data)
+    finally:
+        if fd is not None:
+            os.close(fd)
