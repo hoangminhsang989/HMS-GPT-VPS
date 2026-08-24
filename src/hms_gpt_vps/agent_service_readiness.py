@@ -129,8 +129,19 @@ if ($serviceExists) {{
 }}
 
 function Test-HmsAclRight([string]$Path, [System.Security.AccessControl.FileSystemRights]$Required) {{
-  if ($null -eq $serviceSid -or -not (Test-Path -LiteralPath $Path)) {{ return $false }}
-  $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+  if ($null -eq $serviceSid) {{ return $false }}
+
+  $acl = $null
+  if ([System.IO.Directory]::Exists($Path)) {{
+    $directoryInfo = [System.IO.DirectoryInfo]::new($Path)
+    $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($directoryInfo)
+  }} elseif ([System.IO.File]::Exists($Path)) {{
+    $fileInfo = [System.IO.FileInfo]::new($Path)
+    $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($fileInfo)
+  }} else {{
+    return $false
+  }}
+
   $rules = $acl.GetAccessRules(
     $true,
     $true,
