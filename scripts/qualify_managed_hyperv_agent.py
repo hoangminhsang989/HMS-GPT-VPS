@@ -17,7 +17,9 @@ from hms_gpt_vps.managed_agent_provisioning_runtime import (
     ManagedAgentProvisioningRuntime,
 )
 from hms_gpt_vps.managed_agent_reconcile_runtime import ManagedAgentReconcileRuntime
-from hms_gpt_vps.managed_hyperv_agent_qualification import qualify_managed_hyperv_agent
+from hms_gpt_vps.managed_hyperv_agent_strict_qualification import (
+    qualify_managed_hyperv_agent_strict,
+)
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
 from hms_gpt_vps.provisioning import ProvisionContext, ProvisioningOrchestrator
 from hms_gpt_vps.windows_provisioner import HyperVHostState, WindowsVMConfig
@@ -215,14 +217,13 @@ def main(argv: list[str] | None = None) -> int:
         image=None,
     )
 
-    proof = qualify_managed_hyperv_agent(
+    proof_payload = qualify_managed_hyperv_agent_strict(
         reconcile_runtime,
         context,
         bootstrap_credential,
         bridge_credential,
         max_reconcile_steps=args.max_reconcile_steps,
     )
-    proof_payload = proof.to_dict()
     _write_proof_create_only(proof_path, proof_payload)
     print(json.dumps(proof_payload, ensure_ascii=True, sort_keys=True))
     return 0
