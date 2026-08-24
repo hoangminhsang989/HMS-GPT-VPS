@@ -10,6 +10,7 @@ import secrets
 from tempfile import NamedTemporaryFile
 import uuid
 
+from .authority_lock import exclusive_authority_lock
 from .install_artifacts import TextSecretStore
 
 
@@ -133,7 +134,8 @@ class AgentPackageTransferAttemptStore:
     Production callers also bind ``secret_path``. Both lexical authority paths
     are revalidated before every read/write/delete so a runtime directory that
     is replaced by a symlink/junction after factory construction cannot redirect
-    transfer metadata or the destructive ownership token.
+    transfer metadata or the destructive ownership token. All metadata/token
+    state mutations are serialized through a crash-released OS authority lock.
     """
 
     def __init__(
@@ -148,6 +150,7 @@ class AgentPackageTransferAttemptStore:
         self.secret_path = (
             secret_path.expanduser().absolute() if secret_path is not None else None
         )
+        self.lock_path = self.metadata_path.with_name(self.metadata_path.name + ".lock")
         if self.secret_path is not None:
             if self.secret_path == self.metadata_path:
                 raise ValueError("transfer metadata and ownership token paths must differ")
@@ -184,6 +187,13 @@ class AgentPackageTransferAttemptStore:
         self._assert_safe_metadata_path()
         self._assert_safe_secret_path()
 
+    def _prepare_authority_parent(self) -> None:
+        self._assert_safe_authority_paths()
+        self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_safe_authority_paths()
+        if not self.metadata_path.parent.is_dir():
+            raise ValueError("Agent package transfer authority parent is not a directory")
+
     @staticmethod
     def _metadata_bytes(attempt: AgentPackageTransferAttempt) -> bytes:
         payload = json.dumps(
@@ -200,9 +210,7 @@ class AgentPackageTransferAttemptStore:
 
     def _write_metadata(self, attempt: AgentPackageTransferAttempt) -> None:
         encoded = self._metadata_bytes(attempt)
-        self._assert_safe_authority_paths()
-        self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        self._assert_safe_authority_paths()
+        self._prepare_authority_parent()
         temp: Path | None = None
         try:
             with NamedTemporaryFile(
@@ -349,37 +357,39 @@ class AgentPackageTransferAttemptStore:
         _require_text(instance_id, "instance_id")
         _require_text(vm_name, "vm_name")
         _require_hex(manifest_sha256, 64, "manifest_sha256")
-        existing = self.load()
-        if existing is not None:
-            if existing.instance_id != instance_id:
-                raise ValueError("transfer attempt belongs to another instance")
-            if existing.vm_name != vm_name:
-                raise ValueError("transfer attempt belongs to another VM")
-            if existing.manifest_sha256 != manifest_sha256:
-                raise ValueError("transfer attempt belongs to another package manifest")
-            return existing
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            existing = self.load()
+            if existing is not None:
+                if existing.instance_id != instance_id:
+                    raise ValueError("transfer attempt belongs to another instance")
+                if existing.vm_name != vm_name:
+                    raise ValueError("transfer attempt belongs to another VM")
+                if existing.manifest_sha256 != manifest_sha256:
+                    raise ValueError("transfer attempt belongs to another package manifest")
+                return existing
 
-        token = secrets.token_hex(24)
-        attempt = AgentPackageTransferAttempt(
-            instance_id=instance_id,
-            vm_name=vm_name,
-            manifest_sha256=manifest_sha256,
-            transfer_id=uuid.uuid4().hex,
-            phase=AgentPackageTransferPhase.PLANNED,
-            guest_service_interface_was_enabled=None,
-            ownership_token=token,
-        )
-        attempt.validate()
-        self._assert_safe_authority_paths()
-        self.secret_store.save_text(token)
-        self._assert_safe_authority_paths()
-        try:
-            self._write_metadata(attempt)
-        except Exception:
-            self._assert_safe_secret_path()
-            self.secret_store.clear()
-            raise
-        return attempt
+            token = secrets.token_hex(24)
+            attempt = AgentPackageTransferAttempt(
+                instance_id=instance_id,
+                vm_name=vm_name,
+                manifest_sha256=manifest_sha256,
+                transfer_id=uuid.uuid4().hex,
+                phase=AgentPackageTransferPhase.PLANNED,
+                guest_service_interface_was_enabled=None,
+                ownership_token=token,
+            )
+            attempt.validate()
+            self._assert_safe_authority_paths()
+            self.secret_store.save_text(token)
+            self._assert_safe_authority_paths()
+            try:
+                self._write_metadata(attempt)
+            except Exception:
+                self._assert_safe_secret_path()
+                self.secret_store.clear()
+                raise
+            return attempt
 
     def bind_guest_service_interface_baseline(
         self,
@@ -387,101 +397,107 @@ class AgentPackageTransferAttemptStore:
     ) -> AgentPackageTransferAttempt:
         if not isinstance(was_enabled, bool):
             raise TypeError("Guest Service Interface baseline must be boolean")
-        current = self.load()
-        if current is None:
-            raise ValueError("Agent package transfer attempt does not exist")
-        if current.phase is not AgentPackageTransferPhase.PLANNED:
-            if current.guest_service_interface_was_enabled is was_enabled:
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            current = self.load()
+            if current is None:
+                raise ValueError("Agent package transfer attempt does not exist")
+            if current.phase is not AgentPackageTransferPhase.PLANNED:
+                if current.guest_service_interface_was_enabled is was_enabled:
+                    return current
+                raise ValueError("cannot change Guest Service Interface baseline after mutation")
+            if current.guest_service_interface_was_enabled is not None:
+                if current.guest_service_interface_was_enabled is not was_enabled:
+                    raise ValueError("Guest Service Interface baseline conflicts with persisted value")
                 return current
-            raise ValueError("cannot change Guest Service Interface baseline after mutation")
-        if current.guest_service_interface_was_enabled is not None:
-            if current.guest_service_interface_was_enabled is not was_enabled:
-                raise ValueError("Guest Service Interface baseline conflicts with persisted value")
-            return current
-        updated = AgentPackageTransferAttempt(
-            instance_id=current.instance_id,
-            vm_name=current.vm_name,
-            manifest_sha256=current.manifest_sha256,
-            transfer_id=current.transfer_id,
-            phase=current.phase,
-            guest_service_interface_was_enabled=was_enabled,
-            ownership_token=current.ownership_token,
-        )
-        self._write_metadata(updated)
-        return updated
+            updated = AgentPackageTransferAttempt(
+                instance_id=current.instance_id,
+                vm_name=current.vm_name,
+                manifest_sha256=current.manifest_sha256,
+                transfer_id=current.transfer_id,
+                phase=current.phase,
+                guest_service_interface_was_enabled=was_enabled,
+                ownership_token=current.ownership_token,
+            )
+            self._write_metadata(updated)
+            return updated
 
     def transition(
         self,
         expected: AgentPackageTransferPhase,
         target: AgentPackageTransferPhase,
     ) -> AgentPackageTransferAttempt:
-        current = self.load()
-        if current is None:
-            raise ValueError("Agent package transfer attempt does not exist")
-        if current.phase is not expected:
-            raise ValueError(
-                f"expected transfer phase {expected.value}, found {current.phase.value}"
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            current = self.load()
+            if current is None:
+                raise ValueError("Agent package transfer attempt does not exist")
+            if current.phase is not expected:
+                raise ValueError(
+                    f"expected transfer phase {expected.value}, found {current.phase.value}"
+                )
+            if target is not AgentPackageTransferPhase.PLANNED and (
+                current.guest_service_interface_was_enabled is None
+            ):
+                raise ValueError(
+                    "Guest Service Interface baseline must be persisted before transfer mutation"
+                )
+            updated = AgentPackageTransferAttempt(
+                instance_id=current.instance_id,
+                vm_name=current.vm_name,
+                manifest_sha256=current.manifest_sha256,
+                transfer_id=current.transfer_id,
+                phase=target,
+                guest_service_interface_was_enabled=current.guest_service_interface_was_enabled,
+                ownership_token=current.ownership_token,
             )
-        if target is not AgentPackageTransferPhase.PLANNED and (
-            current.guest_service_interface_was_enabled is None
-        ):
-            raise ValueError(
-                "Guest Service Interface baseline must be persisted before transfer mutation"
-            )
-        updated = AgentPackageTransferAttempt(
-            instance_id=current.instance_id,
-            vm_name=current.vm_name,
-            manifest_sha256=current.manifest_sha256,
-            transfer_id=current.transfer_id,
-            phase=target,
-            guest_service_interface_was_enabled=current.guest_service_interface_was_enabled,
-            ownership_token=current.ownership_token,
-        )
-        self._write_metadata(updated)
-        return updated
+            self._write_metadata(updated)
+            return updated
 
     def clear_published(self) -> None:
-        current = self.load()
-        if current is None:
-            return
-        if current.phase is not AgentPackageTransferPhase.PUBLISHED:
-            raise ValueError("only a published transfer attempt may be cleared")
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            current = self.load()
+            if current is None:
+                return
+            if current.phase is not AgentPackageTransferPhase.PUBLISHED:
+                raise ValueError("only a published transfer attempt may be cleared")
 
-        expected_bytes = self._metadata_bytes(current)
-        self._assert_safe_authority_paths()
-        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
-        fd: int | None = None
-        try:
-            fd = os.open(self.metadata_path, flags)
-            opened_stat = os.fstat(fd)
+            expected_bytes = self._metadata_bytes(current)
             self._assert_safe_authority_paths()
-            current_stat = self.metadata_path.stat()
-            if not _same_file_identity(opened_stat, current_stat):
-                raise ValueError("Agent package transfer metadata authority changed before clear")
-            with os.fdopen(fd, "r+b", closefd=True) as handle:
-                fd = None
-                raw_bytes = handle.read(_MAX_TRANSFER_ATTEMPT_METADATA_BYTES + 1)
-                if raw_bytes != expected_bytes:
-                    raise ValueError("Agent package transfer metadata changed before clear")
-                handle.seek(0)
-                handle.truncate(0)
-                handle.flush()
-                os.fsync(handle.fileno())
-                if os.fstat(handle.fileno()).st_size != 0:
-                    raise ValueError("Agent package transfer metadata tombstone write failed")
-            self._assert_safe_authority_paths()
-            tombstone_stat = self.metadata_path.stat()
-            if not _same_file_identity(opened_stat, tombstone_stat):
-                raise ValueError("Agent package transfer metadata authority changed during clear")
-            if tombstone_stat.st_size != 0:
-                raise ValueError("Agent package transfer metadata tombstone is not empty")
-        finally:
-            if fd is not None:
-                os.close(fd)
+            flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+            fd: int | None = None
+            try:
+                fd = os.open(self.metadata_path, flags)
+                opened_stat = os.fstat(fd)
+                self._assert_safe_authority_paths()
+                current_stat = self.metadata_path.stat()
+                if not _same_file_identity(opened_stat, current_stat):
+                    raise ValueError("Agent package transfer metadata authority changed before clear")
+                with os.fdopen(fd, "r+b", closefd=True) as handle:
+                    fd = None
+                    raw_bytes = handle.read(_MAX_TRANSFER_ATTEMPT_METADATA_BYTES + 1)
+                    if raw_bytes != expected_bytes:
+                        raise ValueError("Agent package transfer metadata changed before clear")
+                    handle.seek(0)
+                    handle.truncate(0)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    if os.fstat(handle.fileno()).st_size != 0:
+                        raise ValueError("Agent package transfer metadata tombstone write failed")
+                self._assert_safe_authority_paths()
+                tombstone_stat = self.metadata_path.stat()
+                if not _same_file_identity(opened_stat, tombstone_stat):
+                    raise ValueError("Agent package transfer metadata authority changed during clear")
+                if tombstone_stat.st_size != 0:
+                    raise ValueError("Agent package transfer metadata tombstone is not empty")
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
-        # Metadata authority is removed first without unlinking a lexical path.
-        # A crash can leave an orphan secret, but no transfer id remains to
-        # authorize guest staging cleanup. A later begin_or_resume safely
-        # overwrites that orphan secret before publishing new metadata.
-        self._assert_safe_secret_path()
-        self.secret_store.clear()
+            # Metadata authority is removed first without unlinking a lexical path.
+            # A crash can leave an orphan secret, but no transfer id remains to
+            # authorize guest staging cleanup. A later begin_or_resume safely
+            # overwrites that orphan secret before publishing new metadata.
+            self._assert_safe_secret_path()
+            self.secret_store.clear()
