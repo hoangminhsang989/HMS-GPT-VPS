@@ -13,6 +13,14 @@ LOCAL_SERVICE_SID = "S-1-5-19"
 BUILTIN_ADMINISTRATORS_SID = "S-1-5-32-544"
 AGENT_SERVICE_ACCOUNT = r"NT SERVICE\HMSAgent"
 
+# Safe diagnostic codes intentionally describe only which operating-system
+# token fact failed. They never include account secrets, token bytes or paths.
+IDENTITY_FAILURE_NATIVE_INSPECTION = 11
+IDENTITY_FAILURE_NOT_LOCAL_SERVICE = 12
+IDENTITY_FAILURE_SERVICE_SID_ABSENT = 13
+IDENTITY_FAILURE_ADMINISTRATORS_PRESENT = 14
+IDENTITY_FAILURE_ELEVATED = 15
+
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
 _TOKEN_GROUPS = 2
@@ -22,7 +30,13 @@ _MAX_TOKEN_GROUPS = 4096
 
 
 class AgentWindowsIdentityError(RuntimeError):
-    pass
+    safe_service_code = IDENTITY_FAILURE_NATIVE_INSPECTION
+
+
+class AgentWindowsIdentityValidationError(PermissionError):
+    def __init__(self, message: str, *, safe_service_code: int) -> None:
+        super().__init__(message)
+        self.safe_service_code = safe_service_code
 
 
 @dataclass(frozen=True)
@@ -53,29 +67,28 @@ class AgentWindowsTokenInspector(Protocol):
 def validate_agent_service_token(
     snapshot: AgentWindowsTokenSnapshot,
 ) -> AgentRuntimeIdentity:
-    """Convert native Windows token facts into the runtime identity contract.
-
-    The service process must simultaneously prove all of the following:
-    - its primary user is LocalService (S-1-5-19),
-    - the per-service SID `NT SERVICE\\HMSAgent` is present in TokenGroups,
-    - the Builtin Administrators SID is absent from TokenGroups,
-    - the token is not elevated.
-
-    Presence is read directly with GetTokenInformation(TokenGroups). This avoids
-    treating `CheckTokenMembership` as a primary-token enumeration API and also
-    lets this proof reject an Administrators SID even if Windows marked it
-    deny-only or disabled. No value from config, environment, command line, or
-    the health document can substitute for these operating-system token facts.
-    """
+    """Convert native Windows token facts into the runtime identity contract."""
     snapshot.validate_shape()
     if snapshot.user_sid.upper() != LOCAL_SERVICE_SID:
-        raise PermissionError("HMS Agent process token is not LocalService")
+        raise AgentWindowsIdentityValidationError(
+            "HMS Agent process token is not LocalService",
+            safe_service_code=IDENTITY_FAILURE_NOT_LOCAL_SERVICE,
+        )
     if not snapshot.service_sid_present:
-        raise PermissionError("HMS Agent per-service SID is absent from process token")
+        raise AgentWindowsIdentityValidationError(
+            "HMS Agent per-service SID is absent from process token",
+            safe_service_code=IDENTITY_FAILURE_SERVICE_SID_ABSENT,
+        )
     if snapshot.administrators_sid_present:
-        raise PermissionError("HMS Agent process token contains Administrators SID")
+        raise AgentWindowsIdentityValidationError(
+            "HMS Agent process token contains Administrators SID",
+            safe_service_code=IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
+        )
     if snapshot.elevated:
-        raise PermissionError("HMS Agent process token is elevated")
+        raise AgentWindowsIdentityValidationError(
+            "HMS Agent process token is elevated",
+            safe_service_code=IDENTITY_FAILURE_ELEVATED,
+        )
 
     identity = AgentRuntimeIdentity(
         service_identity=AGENT_SERVICE_ACCOUNT,
