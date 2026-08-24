@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import Enum
 import json
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
+
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_MAX_PROVISION_STATE_BYTES = 64 * 1024
 
 
 class ProvisionState(str, Enum):
@@ -57,39 +62,105 @@ class ProvisionRecord:
         return cls(**data)
 
 
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = path.expanduser().absolute()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
+
+
 class ProvisionStateStore:
     SCHEMA_VERSION = 1
 
     def __init__(self, path: Path) -> None:
-        self.path = path
+        # Do not resolve: resolving could canonicalize away symlink/reparse
+        # evidence before the authority-path gate observes it.
+        self.path = path.expanduser().absolute()
+
+    def _assert_safe_authority_path(self) -> None:
+        if _path_chain_has_redirect(self.path):
+            raise ValueError("provision state authority path traverses a link or reparse point")
+        if self.path.exists() and not self.path.is_file():
+            raise ValueError("provision state authority path is not a regular file")
 
     def load(self) -> ProvisionRecord | None:
+        self._assert_safe_authority_path()
         if not self.path.exists():
             return None
+        size = self.path.stat().st_size
+        if size <= 0 or size > _MAX_PROVISION_STATE_BYTES:
+            raise ValueError("provision state size is outside supported bounds")
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("provision state must be a JSON object")
         record = ProvisionRecord.from_dict(raw)
         if record.schema_version != self.SCHEMA_VERSION:
             raise ValueError(f"unsupported provision state schema: {record.schema_version}")
+        if not isinstance(record.instance_id, str) or not record.instance_id.strip():
+            raise ValueError("provision state instance_id is invalid")
+        if not isinstance(record.attempt, int) or isinstance(record.attempt, bool) or record.attempt < 0:
+            raise ValueError("provision state attempt is invalid")
         return record
 
     def save(self, record: ProvisionRecord) -> None:
         if record.schema_version != self.SCHEMA_VERSION:
             raise ValueError("record schema does not match store schema")
+        if not isinstance(record.instance_id, str) or not record.instance_id.strip():
+            raise ValueError("record instance_id is invalid")
+        if not isinstance(record.attempt, int) or isinstance(record.attempt, bool) or record.attempt < 0:
+            raise ValueError("record attempt is invalid")
+
+        # Gate existing ancestors before creating anything, then verify again
+        # after mkdir so an existing redirect is never silently traversed.
+        self._assert_safe_authority_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self.path.parent,
-            prefix=self.path.name + ".",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            json.dump(record.to_dict(), handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            temp_path = Path(handle.name)
-        temp_path.replace(self.path)
+        self._assert_safe_authority_path()
+        if not self.path.parent.is_dir():
+            raise ValueError("provision state parent is not a directory")
+
+        payload = json.dumps(
+            record.to_dict(),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ) + "\n"
+        encoded = payload.encode("utf-8")
+        if len(encoded) > _MAX_PROVISION_STATE_BYTES:
+            raise ValueError("provision state exceeds supported size")
+
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                "wb",
+                dir=self.path.parent,
+                prefix=self.path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            self._assert_safe_authority_path()
+            temp_path.replace(self.path)
+            self._assert_safe_authority_path()
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def transition(
         self,
