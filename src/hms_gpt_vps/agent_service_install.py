@@ -5,14 +5,15 @@ from dataclasses import dataclass
 from pathlib import PureWindowsPath
 
 from .agent_package import AgentPackageManifest
-from .agent_package_powershell import (
-    POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION,
-    package_manifest_ps_literal,
+from .agent_package_manifest_artifact import (
+    canonical_agent_package_manifest_sha256,
+    canonical_agent_package_manifest_size,
+    managed_agent_package_manifest_path,
 )
+from .agent_package_powershell import POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
-from .powershell_sha256 import POWERSHELL_SHA256_FUNCTION
 
 
 @dataclass(frozen=True)
@@ -92,9 +93,9 @@ def build_agent_service_install_script(
 ) -> str:
     """Install/reconcile an exact onedir Agent tree and protected runtime config.
 
-    The complete package tree is verified before any SCM mutation. Runtime
-    config publication and ACL reconciliation happen only after the package has
-    matched its immutable manifest exactly.
+    The canonical manifest artifact and complete package tree are verified before
+    any SCM mutation. The manifest is read from the protected guest Agent root,
+    so PowerShell Direct command size does not grow with package file count.
     """
     config.validate()
     package_manifest.validate()
@@ -108,15 +109,17 @@ def build_agent_service_install_script(
     display_name = ps_literal(config.display_name)
     agent_root = ps_literal(config.agent_root_path)
     package_root = ps_literal(config.package_path)
+    package_manifest_path = ps_literal(managed_agent_package_manifest_path(config.agent_root_path))
     binary_path = ps_literal(config.binary_path)
     runtime_config_path = ps_literal(config.runtime_config_path)
     workspace = ps_literal(config.workspace_path)
     runtime = ps_literal(config.runtime_path)
     state = ps_literal(config.state_path)
     expected_hash = ps_literal(package_manifest.sha256.lower())
+    expected_manifest_hash = ps_literal(canonical_agent_package_manifest_sha256(package_manifest))
+    expected_manifest_size = canonical_agent_package_manifest_size(package_manifest)
     expected_config_hash = ps_literal(runtime_config_hash)
     runtime_config_payload = ps_literal(runtime_config_b64)
-    package_manifest_payload = package_manifest_ps_literal(package_manifest)
 
     return f"""
 $ErrorActionPreference = 'Stop'
@@ -124,15 +127,17 @@ $serviceName = {service_name}
 $displayName = {display_name}
 $agentRoot = {agent_root}
 $packageRoot = {package_root}
+$packageManifestPath = {package_manifest_path}
 $binaryPath = {binary_path}
 $runtimeConfigPath = {runtime_config_path}
 $workspace = {workspace}
 $runtime = {runtime}
 $statePath = {state}
 $expectedHash = {expected_hash}
+$expectedManifestHash = {expected_manifest_hash}
+$expectedManifestSize = [int64]{expected_manifest_size}
 $expectedRuntimeConfigHash = {expected_config_hash}
 $runtimeConfigPayload = {runtime_config_payload}
-$packageManifestPayload = {package_manifest_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 $expectedQuotedCommand = '"' + $binaryPath + '" service'
 $expectedUnquotedCommand = $binaryPath + ' service'
@@ -142,13 +147,29 @@ $expectedUnquotedCommand = $binaryPath + ' service'
 if ((Split-Path -Parent $packageRoot) -ne $agentRoot) {{
   throw 'HMS Agent package root escaped the protected Agent root'
 }}
+if ((Split-Path -Parent $packageManifestPath) -ne $agentRoot) {{
+  throw 'HMS Agent package manifest escaped the protected Agent root'
+}}
 if ((Split-Path -Parent $binaryPath) -ne $packageRoot) {{
   throw 'HMS Agent executable escaped the package root'
 }}
 if ((Split-Path -Parent $runtimeConfigPath) -ne $agentRoot) {{
   throw 'HMS Agent runtime config escaped the protected Agent root'
 }}
-
+if (-not (Test-Path -LiteralPath $packageManifestPath -PathType Leaf)) {{
+  throw 'HMS Agent canonical package manifest is missing inside guest'
+}}
+$manifestItem = Get-Item -LiteralPath $packageManifestPath -Force -ErrorAction Stop
+if (($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
+  throw 'HMS Agent canonical package manifest must not be a reparse point'
+}}
+if ([int64]$manifestItem.Length -ne $expectedManifestSize) {{
+  throw 'HMS Agent canonical package manifest size mismatch inside guest'
+}}
+if ((Get-HmsSha256 $packageManifestPath) -ne $expectedManifestHash) {{
+  throw 'HMS Agent canonical package manifest SHA-256 mismatch inside guest'
+}}
+$packageManifestPayload = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($packageManifestPath))
 $packageProof = Test-HmsAgentPackageTree $packageRoot $packageManifestPayload
 $actualHash = [string]$packageProof.entrypoint_sha256
 if ($actualHash -ne $expectedHash) {{
@@ -237,7 +258,7 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Failed to configure HMS Agent failure recover
 & sc.exe failureflag $serviceName '1' | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw 'Failed to enable HMS Agent non-crash failure recovery' }}
 
-foreach ($path in @($agentRoot, $packageRoot, $workspace, $statePath)) {{
+foreach ($path in @($agentRoot, $packageRoot, $packageManifestPath, $workspace, $statePath)) {{
   if (-not (Test-Path -LiteralPath $path)) {{ throw "Required HMS path missing: $path" }}
 }}
 
@@ -254,6 +275,10 @@ if ($LASTEXITCODE -ne 0 -or $sidInfo -notmatch 'UNRESTRICTED') {{
   throw 'HMS Agent per-service SID verification failed'
 }}
 
+if ((Get-HmsSha256 $packageManifestPath) -ne $expectedManifestHash) {{
+  throw 'HMS Agent canonical package manifest changed after ACL reconciliation'
+}}
+$packageManifestPayload = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($packageManifestPath))
 $packageProof = Test-HmsAgentPackageTree $packageRoot $packageManifestPayload
 if ([string]$packageProof.entrypoint_sha256 -ne $expectedHash) {{
   throw 'HMS Agent package changed after ACL reconciliation'
@@ -274,6 +299,8 @@ $wmi = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction 
   start_name = $wmi.StartName
   agent_root = $agentRoot
   package_root = $packageRoot
+  package_manifest_path = $packageManifestPath
+  package_manifest_sha256 = $expectedManifestHash
   package_file_count = [int]$packageProof.file_count
   package_total_size = [int64]$packageProof.total_size
   binary_path = $binaryPath
@@ -309,6 +336,8 @@ def install_agent_service(
     )
     if not bool(result.get("ready", False)):
         raise RuntimeError("HMS Agent service postcondition failed")
+    if str(result.get("package_manifest_sha256", "")).lower() != canonical_agent_package_manifest_sha256(package_manifest):
+        raise RuntimeError("HMS Agent package manifest postcondition failed")
     if str(result.get("runtime_config_sha256", "")).lower() != runtime_config.sha256():
         raise RuntimeError("HMS Agent runtime config postcondition failed")
     if int(result.get("package_file_count", 0)) != package_manifest.file_count:
