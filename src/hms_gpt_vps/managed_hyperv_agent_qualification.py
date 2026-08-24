@@ -196,9 +196,9 @@ def qualify_managed_hyperv_agent(
             "qualification must start at the managed late-Agent checkpoint"
         )
 
-    # Internal same-package proof hook: every production observe/mutation already
-    # invokes this gate. Calling it here captures the exact persisted/read-back
-    # VMId in the proof and lets us prove that identity stayed stable end-to-end.
+    # Every production observe/mutation invokes this same gate. Capture the
+    # persisted/read-back VMId before and after the bounded reconcile loop so
+    # the proof cannot be detached from the managed Hyper-V identity.
     starting_vm_id = agent_runtime._assert_vm_identity()
     actions: list[str] = []
 
@@ -212,6 +212,13 @@ def qualify_managed_hyperv_agent(
             break
         result = reconcile_runtime.reconcile_once(context, credential)
         actions.append(result.action)
+        post_step_record = reconcile_runtime.orchestrator.store.load()
+        if post_step_record is None:
+            raise ManagedHyperVAgentQualificationError(
+                "qualification provisioning checkpoint disappeared after reconcile"
+            )
+        if post_step_record.state is ProvisionState.AGENT_HEALTHY:
+            break
     else:
         raise ManagedHyperVAgentQualificationError(
             "managed Hyper-V Agent qualification exceeded reconcile step bound"
