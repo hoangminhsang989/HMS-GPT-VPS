@@ -90,6 +90,33 @@ def test_registry_rejects_unknown_record_fields(tmp_path: Path) -> None:
         InstanceRegistry(path).load()
 
 
+@pytest.mark.parametrize(
+    "vm_id",
+    ["vm-id", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"],
+)
+def test_registry_rejects_noncanonical_vm_id(tmp_path: Path, vm_id: str) -> None:
+    record = VMRecord(
+        instance_id="hms-invalid",
+        vm_name="HMS-GPT-VPS-INVALID",
+        backend="hyperv",
+        phase="vm_created",
+        workspace_path=r"C:\HMS-Workspace",
+        vm_id=vm_id,
+    )
+    with pytest.raises(ValueError, match="vm_id"):
+        InstanceRegistry(tmp_path / "instances.json").upsert(record)
+
+
+def test_registry_rejects_noncanonical_vm_id_from_persisted_json(tmp_path: Path) -> None:
+    path = tmp_path / "instances.json"
+    record = dict(RECORD.__dict__)
+    record["vm_id"] = "vm-id"
+    path.write_text(json.dumps({RECORD.instance_id: record}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="vm_id"):
+        InstanceRegistry(path).load()
+
+
 def test_registry_preserves_legacy_missing_optional_fields(tmp_path: Path) -> None:
     path = tmp_path / "instances.json"
     legacy = {
