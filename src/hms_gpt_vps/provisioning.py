@@ -367,10 +367,18 @@ class ProvisioningOrchestrator:
         return TransitionResult(record, "RECONCILE_EXTERNAL_SIGNAL")
 
     def mark_guest_booted(self, instance_id: str) -> ProvisionRecord:
-        return self.store.transition(instance_id=instance_id, state=ProvisionState.GUEST_BOOTED)
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.OS_INSTALLING,
+            state=ProvisionState.GUEST_BOOTED,
+        )
 
     def mark_agent_healthy(self, instance_id: str) -> ProvisionRecord:
-        return self.store.transition(instance_id=instance_id, state=ProvisionState.AGENT_HEALTHY)
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.AGENT_SERVICE_READY,
+            state=ProvisionState.AGENT_HEALTHY,
+        )
 
     def begin_bootstrap_retirement(self, instance_id: str) -> ProvisionRecord:
         return self.store.transition_checked(
@@ -402,4 +410,8 @@ class ProvisioningOrchestrator:
         )
 
     def mark_ready(self, instance_id: str) -> ProvisionRecord:
-        return self.store.transition(instance_id=instance_id, state=ProvisionState.READY)
+        return self.store.transition_checked(
+            instance_id=instance_id,
+            expected_state=ProvisionState.PAIRING_PENDING,
+            state=ProvisionState.READY,
+        )
