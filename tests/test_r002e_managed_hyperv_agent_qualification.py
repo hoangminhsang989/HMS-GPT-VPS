@@ -16,6 +16,7 @@ from hms_gpt_vps.agent_package import (
     build_agent_package_manifest,
     write_agent_package_manifest,
 )
+from hms_gpt_vps.agent_package_manifest_artifact import canonical_agent_package_manifest_sha256
 from hms_gpt_vps.agent_transport_protocol import AgentDeviceCredential
 from hms_gpt_vps.managed_hyperv_agent_qualification import (
     MANAGED_HYPERV_AGENT_QUALIFICATION_NAME,
@@ -122,6 +123,7 @@ def service_evidence(manifest) -> dict[str, object]:  # type: ignore[no-untyped-
         "local_service_account": True,
         "service_sid_unrestricted": True,
         "package_manifest_sha256_ok": True,
+        "package_manifest_sha256": canonical_agent_package_manifest_sha256(manifest),
         "package_tree_ok": True,
         "package_file_count": manifest.file_count,
         "package_total_size": manifest.total_size,
@@ -237,6 +239,7 @@ def test_final_allowed_reconcile_step_may_reach_agent_healthy(tmp_path: Path) ->
     assert proof.device_id == DEVICE_ID
     assert proof.device_enrollment_ready is True
     assert proof.device_protection_scope == GUEST_PROTECTION_SCOPE
+    assert proof.package_manifest_sha256 == canonical_agent_package_manifest_sha256(manifest)
     assert proof.hyperv_guest_proven is True
     assert proof.full_bridge_command_flow_proven is False
     assert proof.bootstrap_retired is False
@@ -279,17 +282,35 @@ def test_vm_id_change_during_qualification_fails_closed(tmp_path: Path) -> None:
         )
 
 
-def test_final_package_evidence_must_match_host_manifest(tmp_path: Path) -> None:
+def test_host_manifest_change_during_reconcile_fails_closed(tmp_path: Path) -> None:
+    package_root, manifest_path, manifest = make_package(tmp_path)
+    orchestrator = orchestrator_at(tmp_path, ProvisionState.AGENT_SERVICE_READY)
+    agent = FakeAgentRuntime(package_root, manifest_path, manifest)
+    runtime = FakeReconcileRuntime(orchestrator, agent)
+    original = runtime.reconcile_once
+
+    def mutate_manifest(context, bootstrap):  # type: ignore[no-untyped-def]
+        result = original(context, bootstrap)
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        return result
+
+    runtime.reconcile_once = mutate_manifest  # type: ignore[method-assign]
+    with pytest.raises(ManagedHyperVAgentQualificationError, match="manifest changed"):
+        qualify_managed_hyperv_agent(
+            runtime,  # type: ignore[arg-type]
+            make_context(),
+            credential(),
+            device_credential(),
+            max_reconcile_steps=1,
+        )
+
+
+def test_final_package_evidence_must_match_pinned_host_manifest(tmp_path: Path) -> None:
     package_root, manifest_path, manifest = make_package(tmp_path)
     orchestrator = orchestrator_at(tmp_path, ProvisionState.AGENT_HEALTHY)
     evidence = service_evidence(manifest)
     evidence["package_file_count"] = manifest.file_count + 1
-    agent = FakeAgentRuntime(
-        package_root,
-        manifest_path,
-        manifest,
-        evidence=evidence,
-    )
+    agent = FakeAgentRuntime(package_root, manifest_path, manifest, evidence=evidence)
     runtime = FakeReconcileRuntime(orchestrator, agent)
 
     with pytest.raises(ManagedHyperVAgentQualificationError, match="file-count"):
@@ -301,15 +322,27 @@ def test_final_package_evidence_must_match_host_manifest(tmp_path: Path) -> None
         )
 
 
+def test_guest_manifest_sha_must_match_pinned_host_manifest(tmp_path: Path) -> None:
+    package_root, manifest_path, manifest = make_package(tmp_path)
+    orchestrator = orchestrator_at(tmp_path, ProvisionState.AGENT_HEALTHY)
+    evidence = service_evidence(manifest)
+    evidence["package_manifest_sha256"] = "0" * 64
+    agent = FakeAgentRuntime(package_root, manifest_path, manifest, evidence=evidence)
+    runtime = FakeReconcileRuntime(orchestrator, agent)
+
+    with pytest.raises(ManagedHyperVAgentQualificationError, match="guest manifest identity"):
+        qualify_managed_hyperv_agent(
+            runtime,  # type: ignore[arg-type]
+            make_context(),
+            credential(),
+            device_credential(),
+        )
+
+
 def test_final_application_health_is_mandatory(tmp_path: Path) -> None:
     package_root, manifest_path, manifest = make_package(tmp_path)
     orchestrator = orchestrator_at(tmp_path, ProvisionState.AGENT_HEALTHY)
-    agent = FakeAgentRuntime(
-        package_root,
-        manifest_path,
-        manifest,
-        healthy=False,
-    )
+    agent = FakeAgentRuntime(package_root, manifest_path, manifest, healthy=False)
     runtime = FakeReconcileRuntime(orchestrator, agent)
 
     with pytest.raises(ManagedHyperVAgentQualificationError, match="final Agent observation"):
@@ -367,6 +400,7 @@ def valid_proof() -> ManagedHyperVAgentQualificationProof:
         package_file_count=2,
         package_total_size=20,
         package_entrypoint_sha256="a" * 64,
+        package_manifest_sha256="b" * 64,
         package_tree_ok=True,
         package_manifest_sha256_ok=True,
         local_service_account=True,
@@ -425,6 +459,7 @@ def test_written_proof_is_non_secret_and_retains_explicit_boundaries(tmp_path: P
     assert payload["device_id"] == DEVICE_ID
     assert payload["device_enrollment_ready"] is True
     assert payload["device_protection_scope"] == GUEST_PROTECTION_SCOPE
+    assert payload["package_manifest_sha256"] == "b" * 64
     assert payload["hyperv_guest_proven"] is True
     assert payload["full_bridge_command_flow_proven"] is False
     assert payload["bootstrap_retired"] is False
