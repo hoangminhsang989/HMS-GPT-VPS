@@ -42,7 +42,10 @@ class AgentPostInstallObservation:
 
     @property
     def service_ready(self) -> bool:
-        return bool(self.service_evidence.get("service_ready", False))
+        # Readiness is security evidence. Never coerce strings/numbers such as
+        # "false"/1 into a positive proof; only a native JSON boolean true may
+        # cross the SCM-readiness boundary.
+        return self.service_evidence.get("service_ready") is True
 
     @property
     def agent_healthy(self) -> bool:
@@ -74,7 +77,7 @@ class AgentPostInstallObserver:
             package_manifest=self.config.package_manifest,
             runtime_config=self.config.runtime,
         )
-        if not bool(service_evidence.get("service_ready", False)):
+        if service_evidence.get("service_ready") is not True:
             return AgentPostInstallObservation(
                 service_evidence=service_evidence,
                 health=None,
