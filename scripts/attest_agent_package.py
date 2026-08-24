@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hms_gpt_vps import __version__
 from hms_gpt_vps.agent_package import (
+    AGENT_PACKAGE_ENTRYPOINT,
     build_agent_package_manifest,
     load_agent_package_manifest,
     require_windows_amd64_pe,
@@ -15,28 +16,28 @@ from hms_gpt_vps.agent_package import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Attest one packaged HMS Agent Windows x64 executable"
+        description="Attest the complete packaged HMS Agent Windows x64 onedir tree"
     )
-    parser.add_argument("executable", type=Path)
+    parser.add_argument("package_root", type=Path)
     parser.add_argument("manifest", type=Path)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    executable = args.executable.resolve()
+    package_root = args.package_root.resolve(strict=True)
     manifest_path = args.manifest.resolve()
+    if not package_root.is_dir():
+        raise ValueError("production Agent package root must be a directory")
 
-    if executable.name != "hms-agent.exe":
-        raise ValueError("production Agent artifact must be named hms-agent.exe")
-
-    require_windows_amd64_pe(executable)
-    manifest = build_agent_package_manifest(executable, version=__version__)
+    entrypoint = package_root / AGENT_PACKAGE_ENTRYPOINT
+    require_windows_amd64_pe(entrypoint)
+    manifest = build_agent_package_manifest(package_root, version=__version__)
     write_agent_package_manifest(manifest_path, manifest)
 
     published = load_agent_package_manifest(manifest_path)
-    verify_agent_package(executable, published)
-    require_windows_amd64_pe(executable)
+    verify_agent_package(package_root, published)
+    require_windows_amd64_pe(package_root / published.entrypoint)
 
     print(published.to_json())
     return 0
