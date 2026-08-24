@@ -75,6 +75,49 @@ def _print_sc(label: str, *args: str) -> subprocess.CompletedProcess[str]:
     return completed
 
 
+def _print_scm_event_tail() -> None:
+    query = (
+        "*[System[Provider[@Name='Service Control Manager'] and "
+        "(EventID=7000 or EventID=7009 or EventID=7011 or EventID=7023 or "
+        "EventID=7024 or EventID=7031 or EventID=7034)]]"
+    )
+    completed = subprocess.run(
+        [
+            "wevtutil.exe",
+            "qe",
+            "System",
+            f"/q:{query}",
+            "/c:8",
+            "/rd:true",
+            "/f:text",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    print(
+        json.dumps(
+            {
+                "label": "scm_event_tail_before_cleanup",
+                "returncode": completed.returncode,
+                "stdout": completed.stdout.strip(),
+                "stderr": completed.stderr.strip(),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _print_failure_context(service_name: str) -> None:
+    _print_sc("queryex_before_cleanup", "queryex", service_name)
+    _print_sc("qc_before_cleanup", "qc", service_name)
+    _print_sc("qsidtype_before_cleanup", "qsidtype", service_name)
+    _print_scm_event_tail()
+
+
 def _service_exists(name: str) -> bool:
     return _run_sc("query", name).returncode == 0
 
@@ -171,14 +214,19 @@ def main() -> int:
 
     ready = False
     try:
-        install = run_powershell_json(
-            build_agent_service_install_script(
-                service,
-                expected_sha256=manifest.sha256,
-                runtime_config=runtime,
-            ),
-            timeout_seconds=180,
-        )
+        try:
+            install = run_powershell_json(
+                build_agent_service_install_script(
+                    service,
+                    expected_sha256=manifest.sha256,
+                    runtime_config=runtime,
+                ),
+                timeout_seconds=180,
+            )
+        except BaseException:
+            _print_failure_context(service.service_name)
+            raise
+
         ready = bool(install.get("ready", False))
         print(
             json.dumps(
