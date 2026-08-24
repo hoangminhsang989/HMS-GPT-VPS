@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import os
 
 import pytest
 
 from hms_gpt_vps.agent_windows_identity import (
     AGENT_SERVICE_ACCOUNT,
+    BUILTIN_ADMINISTRATORS_SID,
     LOCAL_SERVICE_SID,
     AgentWindowsIdentityError,
     AgentWindowsTokenSnapshot,
@@ -115,3 +117,32 @@ def test_snapshot_shape_rejects_empty_sid_and_non_boolean_facts() -> None:
 def test_native_inspector_refuses_non_windows_hosts() -> None:
     with pytest.raises(OSError, match="requires Windows"):
         NativeWindowsTokenInspector()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Win32 proof smoke requires Windows")
+def test_native_windows_token_ffi_smoke_uses_real_process_token() -> None:
+    inspector = NativeWindowsTokenInspector()
+    token = inspector._open_current_token()
+    admin_sid = None
+    try:
+        user_sid = inspector._token_user_sid(token)
+        assert user_sid.startswith("S-")
+
+        local_service_buffer = inspector._lookup_account_sid(
+            r"NT AUTHORITY\LOCAL SERVICE"
+        )
+        local_service_sid = inspector._sid_to_string(
+            ctypes.cast(local_service_buffer, ctypes.c_void_p)
+        )
+        assert local_service_sid == LOCAL_SERVICE_SID
+
+        admin_sid = inspector._sid_from_string(BUILTIN_ADMINISTRATORS_SID)
+        assert isinstance(
+            inspector._token_groups_contain_sid(token, admin_sid),
+            bool,
+        )
+        assert isinstance(inspector._token_is_elevated(token), bool)
+    finally:
+        if admin_sid is not None and admin_sid.value:
+            inspector._kernel32.LocalFree(admin_sid.value)
+        inspector._kernel32.CloseHandle(token)
