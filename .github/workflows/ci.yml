@@ -124,6 +124,12 @@ jobs:
         with:
           name: hms-agent-windows-x64
           path: package
+      - name: Probe packaged Agent SCM start before cleanup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .\scripts\probe_native_agent_service_start.py .\package
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Agent SCM start probe failed' }
       - name: Qualify packaged Agent under Windows SCM
         shell: pwsh
         run: |
