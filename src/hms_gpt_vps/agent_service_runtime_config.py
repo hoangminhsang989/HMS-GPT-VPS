@@ -84,6 +84,10 @@ class AgentServiceRuntimeConfig:
 
         AgentHttpsClientConfig(self.bridge_origin).validate()
         AgentHealthServerConfig(port=self.health_port).validate()
+        if not (1024 <= self.health_port <= 65535):
+            raise AgentServiceRuntimeConfigError(
+                "health_port must be a stable service port between 1024 and 65535"
+            )
         for name, value in (
             ("workspace_root", self.workspace_root),
             ("state_root", self.state_root),
