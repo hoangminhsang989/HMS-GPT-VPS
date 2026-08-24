@@ -44,6 +44,40 @@ _GUEST_SERVICE_INTERFACE_NAME = "Guest Service Interface"
 _MAX_HOST_COPY_SCRIPT_BYTES = 24 * 1024
 
 
+def _require_bool_evidence(
+    evidence: dict[str, object],
+    key: str,
+    *,
+    label: str,
+) -> bool:
+    value = evidence.get(key)
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{label} returned malformed boolean evidence: {key}")
+    return value
+
+
+def _require_true_evidence(
+    evidence: dict[str, object],
+    key: str,
+    *,
+    label: str,
+) -> None:
+    if _require_bool_evidence(evidence, key, label=label) is not True:
+        raise RuntimeError(f"{label} postcondition failed: {key}")
+
+
+def _require_int_evidence(
+    evidence: dict[str, object],
+    key: str,
+    *,
+    label: str,
+) -> int:
+    value = evidence.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RuntimeError(f"{label} returned malformed integer evidence: {key}")
+    return value
+
+
 def normalize_managed_vm_id(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("managed VMId is required")
@@ -122,8 +156,11 @@ $verified = Get-VMIntegrationService -VM $managedVm -Name $integrationName -Erro
 """.strip(),
         timeout_seconds=30,
     )
-    if not bool(result.get("restored", False)):
-        raise RuntimeError("Guest Service Interface VMId-bound restoration failed")
+    _require_true_evidence(
+        result,
+        "restored",
+        label="Guest Service Interface VMId-bound restoration",
+    )
     if result.get("enabled") is not expected_enabled:
         raise RuntimeError("Guest Service Interface readback differs from persisted baseline")
     if str(result.get("vm_id", "")).lower() != normalize_managed_vm_id(vm_id):
@@ -258,8 +295,11 @@ def reset_owned_agent_package_staging_by_id(
         build_reset_owned_agent_package_staging_script(plan),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("reset", False)):
-        raise RuntimeError("owned Agent package staging reset postcondition failed")
+    _require_true_evidence(
+        result,
+        "reset",
+        label="owned Agent package staging reset",
+    )
     return result
 
 
@@ -281,21 +321,34 @@ def transfer_agent_package_to_guest_by_id(
         build_prepare_agent_package_staging_script(plan),
         timeout_seconds=60,
     )
-    if not bool(prepared.get("staging_ready", False)):
-        raise RuntimeError("HMS Agent VMId-bound package staging preparation failed")
+    _require_true_evidence(
+        prepared,
+        "staging_ready",
+        label="HMS Agent VMId-bound package staging preparation",
+    )
 
     copied = run_powershell_json(
         build_copy_agent_package_to_staging_by_id_script(managed_vm_id, vm_name, plan),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(copied.get("copied", False)):
-        raise RuntimeError("HMS Agent VMId-bound Copy-VMFile transfer failed")
+    _require_true_evidence(
+        copied,
+        "copied",
+        label="HMS Agent VMId-bound Copy-VMFile transfer",
+    )
     if str(copied.get("vm_id", "")).lower() != managed_vm_id:
         raise RuntimeError("HMS Agent VMId-bound copy returned wrong VMId")
-    if int(copied.get("copied_files", 0)) != plan.manifest.file_count:
+    if _require_int_evidence(
+        copied,
+        "copied_files",
+        label="HMS Agent VMId-bound Copy-VMFile transfer",
+    ) != plan.manifest.file_count:
         raise RuntimeError("HMS Agent VMId-bound Copy-VMFile count postcondition failed")
-    if not bool(copied.get("manifest_copied", False)):
-        raise RuntimeError("HMS Agent VMId-bound manifest copy postcondition failed")
+    _require_true_evidence(
+        copied,
+        "manifest_copied",
+        label="HMS Agent VMId-bound manifest copy",
+    )
 
     published = run_vm_powershell_json_by_id(
         managed_vm_id,
@@ -304,25 +357,44 @@ def transfer_agent_package_to_guest_by_id(
         build_publish_agent_package_script(plan),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(published.get("published", False)):
-        raise RuntimeError("HMS Agent VMId-bound guest publication failed")
-    if int(published.get("file_count", 0)) != plan.manifest.file_count:
+    _require_true_evidence(
+        published,
+        "published",
+        label="HMS Agent VMId-bound guest publication",
+    )
+    if _require_int_evidence(
+        published,
+        "file_count",
+        label="HMS Agent final package publication",
+    ) != plan.manifest.file_count:
         raise RuntimeError("HMS Agent final package file-count postcondition failed")
-    if int(published.get("total_size", 0)) != plan.manifest.total_size:
+    if _require_int_evidence(
+        published,
+        "total_size",
+        label="HMS Agent final package publication",
+    ) != plan.manifest.total_size:
         raise RuntimeError("HMS Agent final package size postcondition failed")
     if str(published.get("entrypoint_sha256", "")).lower() != plan.manifest.sha256.lower():
         raise RuntimeError("HMS Agent final package entrypoint postcondition failed")
     if str(published.get("manifest_sha256", "")).lower() != plan.manifest_sha256:
         raise RuntimeError("HMS Agent final manifest postcondition failed")
-    if not bool(published.get("staging_removed", False)):
-        raise RuntimeError("HMS Agent package staging cleanup postcondition failed")
+    _require_true_evidence(
+        published,
+        "staging_removed",
+        label="HMS Agent package staging cleanup",
+    )
+    already_published = _require_bool_evidence(
+        published,
+        "already_published",
+        label="HMS Agent final package publication",
+    )
 
     return {
         "staging_prepared": True,
         "copied_files": plan.manifest.file_count,
         "manifest_copied": True,
         "published": True,
-        "already_published": bool(published.get("already_published", False)),
+        "already_published": already_published,
         "file_count": plan.manifest.file_count,
         "total_size": plan.manifest.total_size,
         "entrypoint_sha256": plan.manifest.sha256.lower(),
@@ -350,10 +422,23 @@ def probe_agent_package_ready_by_id(
         build_agent_package_ready_probe_script(service, manifest),
         timeout_seconds=timeout_seconds,
     )
-    if bool(result.get("package_ready", False)):
-        if int(result.get("file_count", 0)) != manifest.file_count:
+    package_ready = _require_bool_evidence(
+        result,
+        "package_ready",
+        label="Agent package-ready probe",
+    )
+    if package_ready:
+        if _require_int_evidence(
+            result,
+            "file_count",
+            label="Agent package-ready probe",
+        ) != manifest.file_count:
             raise RuntimeError("Agent package-ready file-count proof mismatch")
-        if int(result.get("total_size", 0)) != manifest.total_size:
+        if _require_int_evidence(
+            result,
+            "total_size",
+            label="Agent package-ready probe",
+        ) != manifest.total_size:
             raise RuntimeError("Agent package-ready total-size proof mismatch")
         if str(result.get("entrypoint_sha256", "")).lower() != manifest.sha256.lower():
             raise RuntimeError("Agent package-ready entrypoint proof mismatch")
@@ -381,15 +466,26 @@ def install_agent_service_by_id(
         ),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("ready", False)):
-        raise RuntimeError("HMS Agent service postcondition failed")
+    _require_true_evidence(
+        result,
+        "ready",
+        label="HMS Agent service install",
+    )
     if str(result.get("package_manifest_sha256", "")).lower() != canonical_agent_package_manifest_sha256(package_manifest):
         raise RuntimeError("HMS Agent package manifest postcondition failed")
     if str(result.get("runtime_config_sha256", "")).lower() != runtime_config.sha256():
         raise RuntimeError("HMS Agent runtime config postcondition failed")
-    if int(result.get("package_file_count", 0)) != package_manifest.file_count:
+    if _require_int_evidence(
+        result,
+        "package_file_count",
+        label="HMS Agent service install",
+    ) != package_manifest.file_count:
         raise RuntimeError("HMS Agent package file-count postcondition failed")
-    if int(result.get("package_total_size", 0)) != package_manifest.total_size:
+    if _require_int_evidence(
+        result,
+        "package_total_size",
+        label="HMS Agent service install",
+    ) != package_manifest.total_size:
         raise RuntimeError("HMS Agent package size postcondition failed")
     if str(result.get("binary_sha256", "")).lower() != package_manifest.sha256.lower():
         raise RuntimeError("HMS Agent entrypoint postcondition failed")
@@ -417,7 +513,12 @@ def observe_agent_post_install_by_id(
         ),
         timeout_seconds=90,
     )
-    if not bool(service_evidence.get("service_ready", False)):
+    service_ready = _require_bool_evidence(
+        service_evidence,
+        "service_ready",
+        label="HMS Agent service readiness",
+    )
+    if not service_ready:
         return AgentPostInstallObservation(
             service_evidence=service_evidence,
             health=None,
@@ -479,7 +580,11 @@ def probe_agent_device_enrollment_by_id(
         build_agent_device_enrollment_probe_script(config, expected_credential),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("enrollment_ready", False)):
+    if _require_bool_evidence(
+        result,
+        "enrollment_ready",
+        label="managed guest Agent device enrollment",
+    ) is not True:
         raise AgentDeviceEnrollmentProbeError(
             "managed guest Agent device enrollment is not ready"
         )
