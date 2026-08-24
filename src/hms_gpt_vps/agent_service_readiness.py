@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import PureWindowsPath
 
 from .agent_package import AgentPackageManifest
-from .agent_package_powershell import (
-    POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION,
-    package_manifest_ps_literal,
+from .agent_package_manifest_artifact import (
+    canonical_agent_package_manifest_sha256,
+    canonical_agent_package_manifest_size,
+    managed_agent_package_manifest_path,
 )
+from .agent_package_powershell import POWERSHELL_AGENT_PACKAGE_VERIFY_FUNCTION
 from .agent_service_install import AgentServiceConfig
 from .agent_service_runtime_config import AgentServiceRuntimeConfig
 from .powershell import ps_literal
@@ -36,9 +38,9 @@ def build_agent_service_readiness_script(
 ) -> str:
     """Build a read-only guest probe for the Windows service bootstrap boundary.
 
-    The probe re-verifies the entire immutable onedir package tree, SCM
-    configuration, exact runtime config, per-service SID and filesystem ACLs.
-    Application protocol health remains a separate `/healthz` gate.
+    The probe re-verifies the canonical guest manifest, complete immutable onedir
+    package tree, SCM configuration, exact runtime config, per-service SID and
+    filesystem ACLs. Application protocol health remains a separate `/healthz` gate.
     """
     config.validate()
     package_manifest.validate()
@@ -47,26 +49,30 @@ def build_agent_service_readiness_script(
     service_name = ps_literal(config.service_name)
     agent_root = ps_literal(config.agent_root_path)
     package_root = ps_literal(config.package_path)
+    package_manifest_path = ps_literal(managed_agent_package_manifest_path(config.agent_root_path))
     binary_path = ps_literal(config.binary_path)
     runtime_config_path = ps_literal(config.runtime_config_path)
     workspace = ps_literal(config.workspace_path)
     state_path = ps_literal(config.state_path)
     expected_hash = ps_literal(package_manifest.sha256.lower())
+    expected_manifest_hash = ps_literal(canonical_agent_package_manifest_sha256(package_manifest))
+    expected_manifest_size = canonical_agent_package_manifest_size(package_manifest)
     expected_runtime_config_hash = ps_literal(runtime_config.sha256())
-    package_manifest_payload = package_manifest_ps_literal(package_manifest)
 
     return f"""
 $ErrorActionPreference = 'Stop'
 $serviceName = {service_name}
 $agentRoot = {agent_root}
 $packageRoot = {package_root}
+$packageManifestPath = {package_manifest_path}
 $binaryPath = {binary_path}
 $runtimeConfigPath = {runtime_config_path}
 $workspace = {workspace}
 $statePath = {state_path}
 $expectedHash = {expected_hash}
+$expectedManifestHash = {expected_manifest_hash}
+$expectedManifestSize = [int64]{expected_manifest_size}
 $expectedRuntimeConfigHash = {expected_runtime_config_hash}
-$packageManifestPayload = {package_manifest_payload}
 $servicePrincipal = "NT SERVICE\\$serviceName"
 $expectedQuotedCommand = '"' + $binaryPath + '" service'
 $expectedUnquotedCommand = $binaryPath + ' service'
@@ -90,16 +96,34 @@ if ($serviceExists) {{
 
 $agentRootLayoutOk = (
   (Split-Path -Parent $packageRoot) -eq $agentRoot -and
+  (Split-Path -Parent $packageManifestPath) -eq $agentRoot -and
   (Split-Path -Parent $binaryPath) -eq $packageRoot -and
   (Split-Path -Parent $runtimeConfigPath) -eq $agentRoot
 )
+
+$packageManifestExists = Test-Path -LiteralPath $packageManifestPath -PathType Leaf
+$packageManifestHashOk = $false
+$packageManifestSizeOk = $false
+$actualPackageManifestHash = $null
+$packageManifestPayload = $null
+if ($packageManifestExists) {{
+  $manifestItem = Get-Item -LiteralPath $packageManifestPath -Force -ErrorAction Stop
+  if (($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {{
+    $packageManifestSizeOk = [int64]$manifestItem.Length -eq $expectedManifestSize
+    $actualPackageManifestHash = Get-HmsSha256 $packageManifestPath
+    $packageManifestHashOk = $actualPackageManifestHash -eq $expectedManifestHash
+    if ($packageManifestSizeOk -and $packageManifestHashOk) {{
+      $packageManifestPayload = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($packageManifestPath))
+    }}
+  }}
+}}
 
 $packageTreeOk = $false
 $binaryHashOk = $false
 $actualHash = $null
 $packageFileCount = 0
 $packageTotalSize = 0
-if ($agentRootLayoutOk -and (Test-Path -LiteralPath $packageRoot -PathType Container)) {{
+if ($agentRootLayoutOk -and $packageManifestSizeOk -and $packageManifestHashOk -and (Test-Path -LiteralPath $packageRoot -PathType Container)) {{
   $packageProof = Test-HmsAgentPackageTree $packageRoot $packageManifestPayload
   $actualHash = [string]$packageProof.entrypoint_sha256
   $binaryHashOk = $actualHash -eq $expectedHash
@@ -181,6 +205,9 @@ $serviceReady = [bool](
   $startNameOk -and
   $commandOk -and
   $agentRootLayoutOk -and
+  $packageManifestExists -and
+  $packageManifestSizeOk -and
+  $packageManifestHashOk -and
   $packageTreeOk -and
   $binaryHashOk -and
   $runtimeConfigExists -and
@@ -200,6 +227,10 @@ $serviceReady = [bool](
   local_service_account = [bool]$startNameOk
   binary_command_ok = [bool]$commandOk
   agent_root_layout_ok = [bool]$agentRootLayoutOk
+  package_manifest_exists = [bool]$packageManifestExists
+  package_manifest_size_ok = [bool]$packageManifestSizeOk
+  package_manifest_sha256_ok = [bool]$packageManifestHashOk
+  package_manifest_sha256 = $actualPackageManifestHash
   package_tree_ok = [bool]$packageTreeOk
   package_file_count = [int]$packageFileCount
   package_total_size = [int64]$packageTotalSize
