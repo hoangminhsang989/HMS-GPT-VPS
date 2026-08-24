@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import PureWindowsPath
 
 from .agent_device_credential_store import (
     AGENT_DEVICE_CREDENTIAL_SCHEMA_VERSION,
@@ -99,12 +100,19 @@ $fields = @($payload.PSObject.Properties.Name | Sort-Object)
 if (($fields -join ',') -ne 'device_id,instance_id,protection_scope,schema_version,secret_b64') {{
   throw 'Agent device credential fields do not match schema'
 }}
-if ([int]$payload.schema_version -ne $expectedSchema) {{
+$schemaValue = $payload.schema_version
+if (($schemaValue -is [bool]) -or (-not (($schemaValue -is [int]) -or ($schemaValue -is [long])))) {{
+  throw 'Agent device credential schema_version must be an integer'
+}}
+if ([long]$schemaValue -ne $expectedSchema) {{
   throw 'Agent device credential schema mismatch'
 }}
-$instanceId = [string]$payload.instance_id
-$deviceId = [string]$payload.device_id
-$scope = [string]$payload.protection_scope
+if ($payload.instance_id -isnot [string] -or $payload.device_id -isnot [string] -or $payload.protection_scope -isnot [string] -or $payload.secret_b64 -isnot [string]) {{
+  throw 'Agent device credential scalar field types are invalid'
+}}
+$instanceId = $payload.instance_id
+$deviceId = $payload.device_id
+$scope = $payload.protection_scope
 if ($instanceId -cne $expectedInstance) {{
   throw 'Agent device credential instance does not match Bridge authority'
 }}
@@ -115,7 +123,7 @@ if ($scope -cne $expectedScope) {{
   throw 'Agent device credential protection scope is not LocalMachine'
 }}
 try {{
-  $secret = [Convert]::FromBase64String([string]$payload.secret_b64)
+  $secret = [Convert]::FromBase64String($payload.secret_b64)
 }} catch {{
   throw 'Agent device credential secret is not valid base64'
 }}
@@ -150,26 +158,37 @@ $payload.secret_b64 = $null
 """.strip()
 
 
-def probe_agent_device_enrollment(
-    vm_name: str,
-    bootstrap_credential: PowerShellDirectCredential,
+def validate_agent_device_enrollment_probe_result(
+    result: dict[str, object],
     config: AgentDeviceEnrollmentConfig,
     expected_credential: AgentDeviceCredential,
-    *,
-    timeout_seconds: int = 90,
 ) -> dict[str, object]:
-    """Prove the guest DPAPI credential matches the Bridge authority exactly."""
+    """Validate one probe result without truthy/string coercion."""
 
-    bootstrap_credential.validate()
-    result = run_vm_powershell_json(
-        vm_name,
-        bootstrap_credential,
-        build_agent_device_enrollment_probe_script(config, expected_credential),
-        timeout_seconds=timeout_seconds,
-    )
-    if not bool(result.get("enrollment_ready", False)):
+    config.validate()
+    expected_credential.validate()
+    if expected_credential.instance_id != config.instance_id:
+        raise ValueError("expected Agent credential belongs to another instance")
+
+    required_keys = {
+        "enrollment_ready",
+        "credential_exists",
+        "instance_id",
+        "device_id",
+        "protection_scope",
+        "credential_path",
+    }
+    if set(result) != required_keys:
+        raise AgentDeviceEnrollmentProbeError(
+            "managed guest Agent enrollment result fields do not match schema"
+        )
+    if result.get("enrollment_ready") is not True:
         raise AgentDeviceEnrollmentProbeError(
             "managed guest Agent device enrollment is not ready"
+        )
+    if result.get("credential_exists") is not True:
+        raise AgentDeviceEnrollmentProbeError(
+            "managed guest Agent credential existence was not proven"
         )
     if result.get("instance_id") != expected_credential.instance_id:
         raise AgentDeviceEnrollmentProbeError(
@@ -188,4 +207,33 @@ def probe_agent_device_enrollment(
         raise AgentDeviceEnrollmentProbeError(
             "managed guest Agent enrollment returned invalid credential path"
         )
+    expected_path = PureWindowsPath(config.guest_state_path) / GUEST_DEVICE_CREDENTIAL_FILENAME
+    if PureWindowsPath(credential_path) != expected_path:
+        raise AgentDeviceEnrollmentProbeError(
+            "managed guest Agent enrollment returned unexpected credential path"
+        )
     return result
+
+
+def probe_agent_device_enrollment(
+    vm_name: str,
+    bootstrap_credential: PowerShellDirectCredential,
+    config: AgentDeviceEnrollmentConfig,
+    expected_credential: AgentDeviceCredential,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    """Prove the guest DPAPI credential matches the Bridge authority exactly."""
+
+    bootstrap_credential.validate()
+    result = run_vm_powershell_json(
+        vm_name,
+        bootstrap_credential,
+        build_agent_device_enrollment_probe_script(config, expected_credential),
+        timeout_seconds=timeout_seconds,
+    )
+    return validate_agent_device_enrollment_probe_result(
+        result,
+        config,
+        expected_credential,
+    )
