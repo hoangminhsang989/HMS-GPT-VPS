@@ -57,13 +57,12 @@ jobs:
       - name: Install pinned package toolchain
         shell: pwsh
         run: python -m pip install -e '.[package]'
-      - name: Build one-file Windows x64 Agent
+      - name: Build onedir Windows x64 Agent
         shell: pwsh
         run: >-
           python -m PyInstaller
           --noconfirm
           --clean
-          --onefile
           --console
           --name hms-agent
           --paths src
@@ -73,36 +72,62 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $actual = (& .\dist\hms-agent.exe --version | Out-String).Trim()
+          $actual = (& .\dist\hms-agent\hms-agent.exe --version | Out-String).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Packaged hms-agent.exe --version failed' }
           $expected = (python -c "import hms_gpt_vps; print('hms-agent ' + hms_gpt_vps.__version__)" | Out-String).Trim()
           if ($actual -ne $expected) {
             throw "Packaged Agent version mismatch: actual=$actual expected=$expected"
           }
-      - name: Attest PE architecture size and SHA-256
+      - name: Attest complete onedir package tree
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path .\dist\package -Force | Out-Null
-          Copy-Item -LiteralPath .\dist\hms-agent.exe -Destination .\dist\package\hms-agent.exe
-          python .\scripts\attest_agent_package.py .\dist\package\hms-agent.exe .\dist\package\hms-agent.manifest.json
-          if ($LASTEXITCODE -ne 0) { throw 'Agent package attestation failed' }
+          Copy-Item -LiteralPath .\dist\hms-agent -Destination .\dist\package\hms-agent -Recurse
+          python .\scripts\attest_agent_package.py .\dist\package\hms-agent .\dist\package\hms-agent.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Agent onedir package attestation failed' }
 
           $manifest = Get-Content -LiteralPath .\dist\package\hms-agent.manifest.json -Raw | ConvertFrom-Json
-          $artifact = Get-Item -LiteralPath .\dist\package\hms-agent.exe
-          $hash = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $packageRoot = (Get-Item -LiteralPath .\dist\package\hms-agent).FullName.TrimEnd('\')
           $expectedVersion = (python -c "import hms_gpt_vps; print(hms_gpt_vps.__version__)" | Out-String).Trim()
-          if ([int]$manifest.schema_version -ne 1) { throw 'Agent manifest schema mismatch' }
-          if ($manifest.filename -ne 'hms-agent.exe') { throw 'Agent manifest filename mismatch' }
+          if ([int]$manifest.schema_version -ne 2) { throw 'Agent manifest schema mismatch' }
+          if ($manifest.platform -ne 'windows-x64') { throw 'Agent manifest platform mismatch' }
+          if ($manifest.entrypoint -ne 'hms-agent.exe') { throw 'Agent manifest entrypoint mismatch' }
           if ($manifest.version -ne $expectedVersion) { throw 'Agent manifest version mismatch' }
-          if ([int64]$manifest.size -ne [int64]$artifact.Length) { throw 'Agent manifest size mismatch' }
-          if ($manifest.sha256 -ne $hash) { throw 'Agent manifest SHA-256 mismatch' }
+
+          $reparse = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -Force | Where-Object {
+            ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+          })
+          if ($reparse.Count -ne 0) { throw 'Agent package contains a reparse point' }
+
+          $actualFiles = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Force)
+          if ($actualFiles.Count -ne [int]$manifest.file_count) { throw 'Agent manifest file count mismatch' }
+          if (@($manifest.files).Count -ne [int]$manifest.file_count) { throw 'Agent manifest file list count mismatch' }
+
+          [int64]$total = 0
+          $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+          foreach ($entry in @($manifest.files)) {
+            $relative = [string]$entry.path
+            if (-not $seen.Add($relative)) { throw 'Agent manifest contains duplicate/case-colliding paths' }
+            $candidate = Join-Path $packageRoot ($relative.Replace('/', '\'))
+            $file = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+            if ($file.PSIsContainer) { throw 'Manifested package entry is not a file' }
+            $actualRelative = $file.FullName.Substring($packageRoot.Length).TrimStart('\').Replace('\', '/')
+            if ($actualRelative -cne $relative) { throw 'Agent package path casing mismatch' }
+            if ([int64]$file.Length -ne [int64]$entry.size) { throw 'Agent package file size mismatch' }
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne ([string]$entry.sha256).ToLowerInvariant()) { throw 'Agent package SHA-256 mismatch' }
+            $total += [int64]$file.Length
+          }
+          if ($total -ne [int64]$manifest.total_size) { throw 'Agent manifest total size mismatch' }
+          $entrypoint = Get-Item -LiteralPath (Join-Path $packageRoot 'hms-agent.exe')
+          if ($entrypoint.Length -le 0) { throw 'Agent entrypoint is empty' }
       - name: Upload attested Agent package
         uses: actions/upload-artifact@v4
         with:
           name: hms-agent-windows-x64
           path: |
-            dist/package/hms-agent.exe
+            dist/package/hms-agent/**
             dist/package/hms-agent.manifest.json
           if-no-files-found: error
           retention-days: 14
@@ -138,6 +163,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native packaged Agent SCM qualification failed' }
           $proof = Get-Content -LiteralPath .\native-service-proof.json -Raw | ConvertFrom-Json
           if ($proof.qualification -ne 'native_windows_scm_packaged_agent') { throw 'Native proof type mismatch' }
+          if ([int]$proof.package.schema_version -ne 2) { throw 'Native proof package schema mismatch' }
+          if (-not [bool]$proof.readiness.package_tree_ok) { throw 'Native proof did not reverify package tree' }
           if (-not [bool]$proof.cleanup_verified) { throw 'Native qualification cleanup was not verified' }
           if ([bool]$proof.hyperv_guest_proven) { throw 'Native host smoke must not claim Hyper-V guest proof' }
           if ([bool]$proof.full_bridge_command_flow_proven) { throw 'Native host smoke must not claim Bridge command-flow proof' }
