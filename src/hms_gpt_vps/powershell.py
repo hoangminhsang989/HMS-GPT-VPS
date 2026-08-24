@@ -64,9 +64,8 @@ def run_powershell(
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "-",
+            script,
         ],
-        input=script,
         text=True,
         capture_output=True,
         timeout=timeout_seconds,
@@ -93,12 +92,13 @@ def run_powershell_json(
 ) -> dict[str, object]:
     """Run PowerShell and require exactly one JSON object result.
 
-    ``powershell.exe -Command -`` can otherwise return process exit code zero
-    after a terminating error read from stdin. The explicit try/catch and exit
-    below makes script failures observable to the Python caller. An empty
-    result is also invalid: callers of this helper rely on a concrete object
-    for postcondition checks, so silently converting no output to ``{}`` would
-    turn a failed provisioning action into an ambiguous success.
+    The script is passed directly as the ``-Command`` argv rather than through
+    ``-Command -`` stdin mode. On Windows PowerShell 5.1, stdin command mode can
+    report process exit code zero or produce no output for a multi-line wrapper
+    even when the embedded command failed. Direct argv execution preserves the
+    script as one PowerShell command without invoking a shell. The explicit
+    try/catch then makes failures observable, and an empty result remains
+    invalid because callers rely on a concrete postcondition object.
     """
     if not script.strip():
         raise ValueError("PowerShell script is required")
