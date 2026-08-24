@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import uuid
 
 from .provision_state import ProvisionRecord, ProvisionState, ProvisionStateStore
 from .windows_image import WindowsImage
@@ -45,10 +46,19 @@ class ProvisionObservation:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"provision observation must be boolean: {name}")
-        if self.vm_id is not None and (
-            not isinstance(self.vm_id, str) or not self.vm_id.strip()
-        ):
-            raise ValueError("provision observation vm_id must be a non-empty string or null")
+        if self.vm_id is not None:
+            if not isinstance(self.vm_id, str) or not self.vm_id:
+                raise ValueError("provision observation vm_id must be a canonical GUID or null")
+            try:
+                canonical_vm_id = str(uuid.UUID(self.vm_id))
+            except (ValueError, AttributeError) as exc:
+                raise ValueError(
+                    "provision observation vm_id must be a canonical GUID or null"
+                ) from exc
+            if self.vm_id != canonical_vm_id:
+                raise ValueError(
+                    "provision observation vm_id must use canonical lowercase GUID form"
+                )
 
 
 @dataclass(frozen=True)
@@ -91,7 +101,8 @@ class ProvisioningOrchestrator:
     exact state observed at the start of this call. Concurrent reconcilers may
     observe stale state, but a stale writer cannot regress or skip over a newer
     checkpoint. Host and observation evidence are type-exact before any state
-    decision, so truthy strings/numbers cannot satisfy provisioning gates.
+    decision, and VM identity evidence must be a canonical GUID, so coercible
+    values cannot satisfy provisioning gates.
     """
 
     def __init__(self, state_path: Path) -> None:
