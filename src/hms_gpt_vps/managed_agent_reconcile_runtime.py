@@ -97,11 +97,20 @@ class ManagedAgentReconcileRuntime:
 
     @staticmethod
     def _validate_agent_observation(agent: ProvisionObservation) -> None:
-        if agent.agent_service_ready and not agent.agent_package_ready:
+        for name in (
+            "agent_package_ready",
+            "agent_service_ready",
+            "agent_healthy",
+        ):
+            if not isinstance(getattr(agent, name, None), bool):
+                raise ManagedAgentReconcileError(
+                    f"Agent observation returned malformed boolean evidence: {name}"
+                )
+        if agent.agent_service_ready is True and agent.agent_package_ready is not True:
             raise ManagedAgentReconcileError(
                 "Agent observation cannot prove service readiness without package readiness"
             )
-        if agent.agent_healthy and not agent.agent_service_ready:
+        if agent.agent_healthy is True and agent.agent_service_ready is not True:
             raise ManagedAgentReconcileError(
                 "Agent observation cannot prove health without service readiness"
             )
