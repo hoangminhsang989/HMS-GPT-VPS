@@ -81,8 +81,30 @@ def _new_proof_path(raw: str) -> Path:
     return path
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _proof_target_matches_open_fd(target: Path, fd_stat: os.stat_result) -> bool:
+    if _path_chain_has_redirect(target):
+        return False
+    try:
+        target_stat = target.stat()
+    except FileNotFoundError:
+        return False
+    return target.is_file() and _same_file_identity(fd_stat, target_stat)
+
+
 def _write_proof_create_only(path: Path, payload: dict[str, object]) -> None:
-    """Publish exactly one proof without replacing or deleting an unowned path."""
+    """Publish exactly one proof without replacing or deleting an unowned path.
+
+    `O_EXCL` protects the initial create race. The opened file identity is then
+    pinned and compared with the lexical target before/after writing. If a parent
+    directory is renamed/replaced or redirected after the create, publication
+    fails closed. Cleanup is allowed only when the current lexical target still
+    resolves to the exact file descriptor this invocation created; otherwise an
+    inert orphan is safer than deleting an unowned replacement path.
+    """
 
     target = _new_proof_path(str(path))
     data = (
@@ -97,24 +119,38 @@ def _write_proof_create_only(path: Path, payload: dict[str, object]) -> None:
     ).encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd: int | None = None
+    opened_stat: os.stat_result | None = None
     created = False
     published = False
     try:
         fd = os.open(target, flags, 0o600)
+        opened_stat = os.fstat(fd)
         created = True
+        if not _proof_target_matches_open_fd(target, opened_stat):
+            raise RuntimeError("qualification proof authority changed after create-only open")
         with os.fdopen(fd, "wb", closefd=True) as handle:
             fd = None
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+            if os.fstat(handle.fileno()).st_size != len(data):
+                raise RuntimeError("qualification proof write size mismatch")
+        if not _proof_target_matches_open_fd(target, opened_stat):
+            raise RuntimeError("qualification proof authority changed during publication")
+        if target.read_bytes() != data:
+            raise RuntimeError("qualification proof readback differs from published bytes")
+        if not _proof_target_matches_open_fd(target, opened_stat):
+            raise RuntimeError("qualification proof authority changed during readback")
         published = True
     finally:
         if fd is not None:
             os.close(fd)
-        # Destructive cleanup is allowed only for a target this invocation
-        # successfully created with O_EXCL. If another actor won the race, the
-        # open raises before `created` becomes true and their path is untouched.
-        if created and not published:
+        if (
+            created
+            and not published
+            and opened_stat is not None
+            and _proof_target_matches_open_fd(target, opened_stat)
+        ):
             target.unlink(missing_ok=True)
 
 
