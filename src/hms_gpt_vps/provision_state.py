@@ -258,6 +258,33 @@ class ProvisionStateStore:
         with exclusive_authority_lock(self.lock_path):
             self._save_unlocked(record)
 
+    def initialize(
+        self,
+        *,
+        instance_id: str,
+        state: ProvisionState = ProvisionState.IDLE,
+    ) -> ProvisionRecord:
+        """Create the first checkpoint exactly once, or return the existing one."""
+
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            raise ValueError("instance_id is required")
+        if not isinstance(state, ProvisionState):
+            raise ValueError("initial provision state is invalid")
+        self._prepare_authority_parent()
+        with exclusive_authority_lock(self.lock_path):
+            current = self._load_unlocked()
+            if current is not None:
+                if current.instance_id != instance_id:
+                    raise ValueError("provision state belongs to another instance")
+                return current
+            record = ProvisionRecord(
+                schema_version=self.SCHEMA_VERSION,
+                instance_id=instance_id,
+                state=state,
+            )
+            self._save_unlocked(record)
+            return record
+
     def transition(
         self,
         *,
