@@ -43,6 +43,13 @@ class AgentConnectionEpochStore:
     The parent directory is a security boundary managed by guest provisioning
     and must already exist with the intended NTFS ACL. This store never creates
     that directory implicitly.
+
+    The database deliberately uses SQLite's rollback journal rather than
+    switching every newly opened connection into WAL mode. The store contains
+    only one tiny writer row; `BEGIN IMMEDIATE` plus a busy timeout serializes
+    competing writers, while `synchronous=FULL` preserves the durability gate.
+    Avoiding a per-connection journal-mode transition also removes an exclusive
+    locking race when many Agent runtime generations open the store together.
     """
 
     def __init__(self, path: Path) -> None:
@@ -62,29 +69,37 @@ class AgentConnectionEpochStore:
     def _connect(self) -> sqlite3.Connection:
         self._require_parent()
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_connection_epoch (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                instance_id TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                epoch INTEGER NOT NULL CHECK (epoch >= 1)
+        try:
+            # Apply the lock wait policy before any schema or durability PRAGMA
+            # that may need to coordinate with another connection.
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_connection_epoch (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    instance_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL CHECK (epoch >= 1)
+                )
+                """
             )
-            """
-        )
-        return connection
+            return connection
+        except Exception:
+            connection.close()
+            raise
 
     def load(self) -> AgentConnectionEpochRecord | None:
         if not self.path.exists():
             self._require_parent()
             return None
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
             row = connection.execute(
                 "SELECT instance_id, device_id, epoch FROM agent_connection_epoch WHERE singleton = 1"
             ).fetchone()
+        finally:
+            connection.close()
         if row is None:
             return None
         record = AgentConnectionEpochRecord(
@@ -95,7 +110,12 @@ class AgentConnectionEpochStore:
         record.validate()
         return record
 
-    def allocate_next(self, *, instance_id: str, device_id: str) -> AgentConnectionEpochRecord:
+    def allocate_next(
+        self,
+        *,
+        instance_id: str,
+        device_id: str,
+    ) -> AgentConnectionEpochRecord:
         _validate_identifier(instance_id, "instance_id")
         _validate_identifier(device_id, "device_id")
         connection = self._connect()
@@ -123,7 +143,9 @@ class AgentConnectionEpochStore:
                         "connection epoch store belongs to another device"
                     )
                 if not 1 <= stored_epoch < _MAX_SQLITE_EPOCH:
-                    raise AgentConnectionEpochError("connection epoch is exhausted or corrupt")
+                    raise AgentConnectionEpochError(
+                        "connection epoch is exhausted or corrupt"
+                    )
                 epoch = stored_epoch + 1
                 connection.execute(
                     "UPDATE agent_connection_epoch SET epoch = ? WHERE singleton = 1",
