@@ -17,9 +17,9 @@ class PowerShellDirectCredential:
     password: str = field(repr=False)
 
     def validate(self) -> None:
-        if not self.username.strip():
+        if not isinstance(self.username, str) or not self.username.strip():
             raise ValueError("PowerShell Direct username is required")
-        if not self.password:
+        if not isinstance(self.password, str) or not self.password:
             raise ValueError("PowerShell Direct password is required")
 
 
@@ -52,7 +52,7 @@ def build_powershell_direct_host_script(
     name, and invokes PowerShell Direct with ``-VMId`` rather than re-resolving
     a mutable VM name at the guest-execution boundary.
     """
-    if not vm_name.strip():
+    if not isinstance(vm_name, str) or not vm_name.strip():
         raise ValueError("VM name is required")
     vm = ps_literal(vm_name)
     if vm_id is None:
@@ -112,17 +112,22 @@ def _direct_environment(
     secret_payload: bytes | None = None,
 ) -> dict[str, str]:
     credential.validate()
-    if not guest_script.strip():
+    if not isinstance(guest_script, str) or not guest_script.strip():
         raise ValueError("guest PowerShell script is required")
     encoded = guest_script.encode("utf-8")
     if len(encoded) > _MAX_GUEST_SCRIPT_BYTES:
         raise ValueError(
             f"guest PowerShell script exceeds {_MAX_GUEST_SCRIPT_BYTES} byte bootstrap limit"
         )
+    # Always shadow every HMS PowerShell Direct environment key. In particular,
+    # an invocation without a new payload must override any stale parent
+    # HMS_PSDIRECT_PAYLOAD_B64 value with the empty string instead of inheriting
+    # and accidentally forwarding an old secret into the guest.
     environment = {
         "HMS_PSDIRECT_USERNAME": credential.username,
         "HMS_PSDIRECT_PASSWORD": credential.password,
         "HMS_PSDIRECT_SCRIPT_B64": base64.b64encode(encoded).decode("ascii"),
+        "HMS_PSDIRECT_PAYLOAD_B64": "",
     }
     if secret_payload is not None:
         if not isinstance(secret_payload, bytes):
