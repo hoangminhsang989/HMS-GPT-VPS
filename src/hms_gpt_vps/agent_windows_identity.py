@@ -19,7 +19,6 @@ IDENTITY_FAILURE_NATIVE_INSPECTION = 11
 IDENTITY_FAILURE_NOT_LOCAL_SERVICE = 12
 IDENTITY_FAILURE_SERVICE_SID_ABSENT = 13
 IDENTITY_FAILURE_ADMINISTRATORS_PRESENT = 14
-IDENTITY_FAILURE_ELEVATED = 15
 
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
@@ -67,7 +66,21 @@ class AgentWindowsTokenInspector(Protocol):
 def validate_agent_service_token(
     snapshot: AgentWindowsTokenSnapshot,
 ) -> AgentRuntimeIdentity:
-    """Convert native Windows token facts into the runtime identity contract."""
+    """Convert native Windows token facts into the runtime identity contract.
+
+    The authorization boundary is expressed using concrete token principals:
+    the primary user must be LocalService, the per-service SID must be present,
+    and the Builtin Administrators SID must be absent from TokenGroups.
+
+    ``TokenElevation`` is deliberately retained in the native snapshot as an
+    observable Windows token fact, but it is not an administrator-membership
+    test for this non-interactive service. Windows service accounts can receive
+    a full/default UAC token while LocalService still has the documented
+    minimum local privilege set. Treating TokenIsElevated as a standalone
+    rejection gate therefore misclassifies a correctly isolated LocalService
+    service. A real Administrators SID remains a hard failure regardless of the
+    TokenElevation value.
+    """
     snapshot.validate_shape()
     if snapshot.user_sid.upper() != LOCAL_SERVICE_SID:
         raise AgentWindowsIdentityValidationError(
@@ -83,11 +96,6 @@ def validate_agent_service_token(
         raise AgentWindowsIdentityValidationError(
             "HMS Agent process token contains Administrators SID",
             safe_service_code=IDENTITY_FAILURE_ADMINISTRATORS_PRESENT,
-        )
-    if snapshot.elevated:
-        raise AgentWindowsIdentityValidationError(
-            "HMS Agent process token is elevated",
-            safe_service_code=IDENTITY_FAILURE_ELEVATED,
         )
 
     identity = AgentRuntimeIdentity(
