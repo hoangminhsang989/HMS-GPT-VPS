@@ -128,52 +128,48 @@ if ($serviceExists) {{
   }}
 }}
 
-$aclExtensionsType = 'System.IO.FileSystemAclExtensions' -as [type]
-if ($null -eq $aclExtensionsType) {{
-  $aclAssemblyPath = [System.IO.Path]::Combine($PSHOME, 'System.IO.FileSystem.AccessControl.dll')
-  if (-not [System.IO.File]::Exists($aclAssemblyPath)) {{
-    throw 'System.IO.FileSystem.AccessControl.dll is unavailable for ACL readiness verification'
-  }}
-  [System.Reflection.Assembly]::LoadFrom($aclAssemblyPath) | Out-Null
-  $aclExtensionsType = 'System.IO.FileSystemAclExtensions' -as [type]
-}}
-if ($null -eq $aclExtensionsType) {{
-  throw 'System.IO.FileSystemAclExtensions is unavailable after explicit assembly load'
-}}
-
-function Test-HmsAclRight([string]$Path, [System.Security.AccessControl.FileSystemRights]$Required) {{
+function Test-HmsAclRight([string]$Path, [string[]]$AcceptedRights) {{
   if ($null -eq $serviceSid) {{ return $false }}
-
-  $acl = $null
-  if ([System.IO.Directory]::Exists($Path)) {{
-    $directoryInfo = [System.IO.DirectoryInfo]::new($Path)
-    $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($directoryInfo)
-  }} elseif ([System.IO.File]::Exists($Path)) {{
-    $fileInfo = [System.IO.FileInfo]::new($Path)
-    $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($fileInfo)
-  }} else {{
+  if (-not ([System.IO.Directory]::Exists($Path) -or [System.IO.File]::Exists($Path))) {{
     return $false
   }}
 
-  $rules = $acl.GetAccessRules(
-    $true,
-    $true,
-    [System.Security.Principal.SecurityIdentifier]
+  $aclOutput = (& icacls.exe $Path 2>&1 | Out-String)
+  if ($LASTEXITCODE -ne 0) {{
+    throw "icacls.exe failed while reading HMS ACL: $Path"
+  }}
+
+  $identities = @(
+    $servicePrincipal,
+    [string]$serviceSid.Value,
+    ('*' + [string]$serviceSid.Value)
   )
-  foreach ($rule in $rules) {{
-    if (
-      $rule.IdentityReference -eq $serviceSid -and
-      $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-      (($rule.FileSystemRights -band $Required) -eq $Required)
-    ) {{ return $true }}
+  foreach ($line in ($aclOutput -split "`r?`n")) {{
+    $identityMatched = $false
+    foreach ($identity in $identities) {{
+      if ($line.IndexOf($identity, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {{
+        $identityMatched = $true
+        break
+      }}
+    }}
+    if (-not $identityMatched) {{ continue }}
+    if ($line.IndexOf('(DENY)', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {{
+      return $false
+    }}
+    foreach ($right in $AcceptedRights) {{
+      $token = '(' + $right + ')'
+      if ($line.IndexOf($token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {{
+        return $true
+      }}
+    }}
   }}
   return $false
 }}
 
-$agentRootReadExecute = Test-HmsAclRight $agentRoot ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
-$runtimeConfigRead = Test-HmsAclRight $runtimeConfigPath ([System.Security.AccessControl.FileSystemRights]::Read)
-$workspaceModify = Test-HmsAclRight $workspace ([System.Security.AccessControl.FileSystemRights]::Modify)
-$stateModify = Test-HmsAclRight $statePath ([System.Security.AccessControl.FileSystemRights]::Modify)
+$agentRootReadExecute = Test-HmsAclRight $agentRoot @('RX', 'M', 'F')
+$runtimeConfigRead = Test-HmsAclRight $runtimeConfigPath @('R', 'RX', 'M', 'F')
+$workspaceModify = Test-HmsAclRight $workspace @('M', 'F')
+$stateModify = Test-HmsAclRight $statePath @('M', 'F')
 
 $serviceReady = [bool](
   $serviceExists -and
