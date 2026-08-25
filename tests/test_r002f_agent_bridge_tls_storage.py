@@ -97,6 +97,7 @@ def test_storage_script_pins_content_directory_and_exact_acl(
     assert "DirectorySecurity" in script
     assert "FileSecurity" in script
     assert "Get-FileHash" in script
+    assert "FileSystemRights]::Synchronize" in script
     assert "S-1-5-18" in script
     assert "S-1-5-32-544" in script
     assert _SERVICE_SID in script

@@ -70,6 +70,8 @@ def _require_service_sid(value: object, name: str) -> str:
         raise AgentBridgeTlsStorageError(
             f"{name} must not be a broad Windows principal"
         )
+    # HMS Bridge is intended to run under a dedicated Windows service SID.
+    # S-1-5-80 is the NT SERVICE SID authority.
     if not value.startswith("S-1-5-80-"):
         raise AgentBridgeTlsStorageError(
             f"{name} must be a dedicated NT SERVICE SID"
@@ -243,11 +245,17 @@ $readerSid = New-Sid $readerSidText
 $expectedDirectory = @{{}}
 $expectedDirectory[$systemSidText] = @{{ rights = [System.Security.AccessControl.FileSystemRights]::FullControl }}
 $expectedDirectory[$administratorsSidText] = @{{ rights = [System.Security.AccessControl.FileSystemRights]::FullControl }}
-$expectedDirectory[$readerSidText] = @{{ rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute }}
+$expectedDirectory[$readerSidText] = @{{ rights = (
+  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+  [System.Security.AccessControl.FileSystemRights]::Synchronize
+) }}
 $expectedFile = @{{}}
 $expectedFile[$systemSidText] = @{{ rights = [System.Security.AccessControl.FileSystemRights]::FullControl }}
 $expectedFile[$administratorsSidText] = @{{ rights = [System.Security.AccessControl.FileSystemRights]::FullControl }}
-$expectedFile[$readerSidText] = @{{ rights = [System.Security.AccessControl.FileSystemRights]::Read }}
+$expectedFile[$readerSidText] = @{{ rights = (
+  [System.Security.AccessControl.FileSystemRights]::Read -bor
+  [System.Security.AccessControl.FileSystemRights]::Synchronize
+) }}
 
 $changed = $false
 $rootAcl = Get-Acl -LiteralPath $storageRoot -ErrorAction Stop
