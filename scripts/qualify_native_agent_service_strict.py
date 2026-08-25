@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import secrets
 import shutil
@@ -16,7 +15,7 @@ from hms_gpt_vps.agent_device_credential_store import (
 )
 from hms_gpt_vps.agent_package import (
     AgentPackageManifest,
-    load_agent_package_manifest,
+    MAX_AGENT_MANIFEST_BYTES,
     require_windows_amd64_pe,
     verify_agent_package,
 )
@@ -46,9 +45,37 @@ from hms_gpt_vps.native_scm_qualification_evidence import (
     validate_single_true_result,
 )
 from hms_gpt_vps.powershell import ps_literal, run_powershell_json
+from hms_gpt_vps.qualification_file_authority import (
+    read_file_pinned,
+    require_existing_directory,
+    require_new_file_target,
+    write_bytes_create_only,
+    write_json_create_only,
+)
 
 
 _RESULT_MAX_BYTES = 1024 * 1024
+
+
+def _load_canonical_manifest_pinned(path: Path) -> tuple[AgentPackageManifest, bytes]:
+    data = read_file_pinned(
+        path,
+        max_bytes=MAX_AGENT_MANIFEST_BYTES,
+        label="native qualification Agent manifest",
+    )
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "native qualification Agent manifest must be valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ValueError("native qualification Agent manifest must be a JSON object")
+    manifest = AgentPackageManifest.from_mapping(raw)
+    canonical = canonical_agent_package_manifest_bytes(manifest)
+    if data != canonical:
+        raise ValueError("native qualification Agent manifest is not canonical")
+    return manifest, canonical
 
 
 def _service_exists(service_name: str) -> bool:
@@ -193,28 +220,12 @@ def _cleanup_owned_paths(service: AgentServiceConfig, *, ownership_token: str) -
 
 
 def _write_result_create_only(path: Path, result: dict[str, object]) -> None:
-    data = (
-        json.dumps(
-            result,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        + "\n"
-    ).encode("utf-8")
-    if len(data) > _RESULT_MAX_BYTES:
-        raise RuntimeError("native SCM proof exceeds publication bound")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb", closefd=False) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if path.read_bytes() != data:
-            raise RuntimeError("native SCM proof readback mismatch")
-    finally:
-        os.close(fd)
+    write_json_create_only(
+        path,
+        result,
+        max_bytes=_RESULT_MAX_BYTES,
+        label="native SCM proof",
+    )
 
 
 def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
@@ -222,14 +233,19 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     service = AgentServiceConfig()
     service.validate()
 
-    source_package = package_dir / "hms-agent"
-    source_manifest_path = (package_dir / "hms-agent.manifest.json").resolve(strict=True)
-    manifest: AgentPackageManifest = load_agent_package_manifest(source_manifest_path)
-    canonical_manifest = canonical_agent_package_manifest_bytes(manifest)
-    if source_manifest_path.read_bytes() != canonical_manifest:
-        raise ValueError("native qualification source manifest is not canonical")
+    package_dir = require_existing_directory(
+        package_dir,
+        label="native qualification package directory",
+    )
+    source_package = require_existing_directory(
+        package_dir / "hms-agent",
+        label="native qualification Agent package",
+    )
+    source_manifest_path = package_dir / "hms-agent.manifest.json"
+    manifest, canonical_manifest = _load_canonical_manifest_pinned(source_manifest_path)
     verify_agent_package(source_package, manifest)
     require_windows_amd64_pe(source_package / manifest.entrypoint)
+    result_path = require_new_file_target(result_path, label="native SCM proof")
 
     runtime_root = Path(service.runtime_path)
     workspace_root = Path(service.workspace_path)
@@ -237,8 +253,6 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
         raise RuntimeError("HMSAgent service already exists on qualification runner")
     if runtime_root.exists() or workspace_root.exists():
         raise RuntimeError("managed HMS qualification paths already exist on runner")
-    if result_path.exists():
-        raise FileExistsError("native SCM proof target already exists")
 
     ownership_token = secrets.token_hex(24)
     agent_root = Path(service.agent_root_path)
@@ -255,10 +269,14 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
     )
 
     shutil.copytree(source_package, target_package)
-    target_manifest.write_bytes(canonical_manifest)
-    if target_manifest.read_bytes() != canonical_manifest:
-        raise RuntimeError("native qualification canonical manifest publication failed")
-    if load_agent_package_manifest(target_manifest) != manifest:
+    write_bytes_create_only(
+        target_manifest,
+        canonical_manifest,
+        max_bytes=MAX_AGENT_MANIFEST_BYTES,
+        label="native qualification published Agent manifest",
+    )
+    published_manifest, published_canonical = _load_canonical_manifest_pinned(target_manifest)
+    if published_manifest != manifest or published_canonical != canonical_manifest:
         raise RuntimeError("native qualification published manifest identity mismatch")
     verify_agent_package(target_package, manifest)
     require_windows_amd64_pe(Path(service.binary_path))
@@ -337,7 +355,14 @@ def qualify(package_dir: Path, result_path: Path) -> dict[str, object]:
         )
 
         verify_agent_package(target_package, manifest)
-        if target_manifest.read_bytes() != canonical_manifest:
+        if (
+            read_file_pinned(
+                target_manifest,
+                max_bytes=MAX_AGENT_MANIFEST_BYTES,
+                label="native qualification published Agent manifest",
+            )
+            != canonical_manifest
+        ):
             raise RuntimeError("canonical Agent manifest changed during native qualification")
         result = {
             "schema_version": 1,
@@ -417,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    result = qualify(args.package_dir.resolve(), args.result.resolve())
+    result = qualify(args.package_dir, args.result)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 

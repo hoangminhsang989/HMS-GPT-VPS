@@ -5,15 +5,18 @@ import json
 from pathlib import Path
 
 from hms_gpt_vps.native_scm_qualification_evidence import validate_native_scm_proof
+from hms_gpt_vps.qualification_file_authority import read_file_pinned
 
 
 _MAX_PROOF_BYTES = 1024 * 1024
 
 
 def verify(path: Path) -> dict[str, object]:
-    payload = path.read_bytes()
-    if len(payload) > _MAX_PROOF_BYTES:
-        raise RuntimeError("native SCM proof exceeds verification bound")
+    payload = read_file_pinned(
+        path,
+        max_bytes=_MAX_PROOF_BYTES,
+        label="native SCM proof",
+    )
     try:
         raw = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -29,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    proof = verify(args.proof.resolve(strict=True))
+    proof = verify(args.proof)
     print(json.dumps(proof, sort_keys=True, separators=(",", ":")))
     return 0
 
