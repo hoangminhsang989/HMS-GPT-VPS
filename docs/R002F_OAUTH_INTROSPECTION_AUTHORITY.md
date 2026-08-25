@@ -94,7 +94,7 @@ An introspection response is accepted only when all relevant authority facts
 hold:
 
 - `active` is exactly JSON boolean `true`;
-- `iss` exactly equals the configured issuer;
+- issuer authority comes from the exact RFC 8414 metadata plus machine-credential binding;
 - `client_id` is present and bounded;
 - `sub` is present and bounded;
 - `scope` is a valid unique OAuth scope list containing `hms.vps.control`;
@@ -103,9 +103,14 @@ hold:
 - optional `exp`, when present, is a future integer epoch;
 - optional `nbf`, when present, is not in the future.
 
+RFC 7662 does not require an `iss` member in the introspection response, and the
+MCP Python SDK reference introspection server does not emit one. HMSBridge
+therefore publishes `claims.iss` from the already exact-matched RFC 8414
+metadata rather than requiring a non-standard response member.
+
 Only then is an MCP SDK `AccessToken` published. Network, TLS, discovery,
-introspection, malformed-response, audience, issuer, subject, scope or expiry
-failures return no authenticated token.
+introspection, malformed-response, audience, issuer-authority, subject, scope
+or expiry failures return no authenticated token.
 
 ## Entrypoint ordering
 
@@ -118,7 +123,7 @@ accepted on the `hms-bridge service` command line.
 
 ## Validation boundary
 
-Scratch/synthetic execution before publication:
+Scratch/synthetic execution before publication and compatibility remediation:
 
 - split OAuth credential/storage/HTTP/verifier suite: 11/11 PASS;
 - service-entrypoint integration suite: 5/5 PASS;
