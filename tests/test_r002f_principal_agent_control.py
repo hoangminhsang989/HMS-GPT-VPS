@@ -7,7 +7,6 @@ import sqlite3
 import pytest
 
 from hms_gpt_vps.agent_bridge_service import AgentBridgeService
-from hms_gpt_vps.agent_command_exact_status import get_exact_agent_command_status
 from hms_gpt_vps.agent_command_store import AgentCommandStore
 from hms_gpt_vps.agent_connection_registry import AgentConnectionRegistry, AgentPresence
 from hms_gpt_vps.agent_transport_protocol import (
@@ -36,9 +35,7 @@ from hms_gpt_vps.principal_agent_control_service import (
     PrincipalAgentControlUnavailableError,
     PrincipalControlState,
 )
-from hms_gpt_vps.principal_dispatch_intent import (
-    PrincipalDispatchIntentStore,
-)
+from hms_gpt_vps.principal_dispatch_intent import PrincipalDispatchIntentStore
 from hms_gpt_vps.principal_pairing_service import (
     PrincipalSessionBindingStore,
     PrincipalPairingService,
@@ -177,9 +174,7 @@ def build_stack(tmp_path: Path):
     )
     idempotency = IdempotencyStore(tmp_path / "idempotency.sqlite3")
     gateway = ControlGateway(session_store, idempotency)
-    intent_root = tmp_path / "dispatch-intents"
-    intent_root.mkdir()
-    intent_store = PrincipalDispatchIntentStore(intent_root)
+    intent_store = PrincipalDispatchIntentStore(idempotency)
     control = PrincipalAgentControlService(
         pairing,
         gateway,
@@ -192,7 +187,7 @@ def build_stack(tmp_path: Path):
         "pairing": pairing,
         "gateway": gateway,
         "agent_bridge": agent_bridge,
-        "intent_root": intent_root,
+        "idempotency": idempotency,
         "clock": clock,
         "presence_reader": presence_reader,
         "principal": who,
@@ -204,6 +199,19 @@ def keep_fresh(stack: dict, seconds: int) -> None:
     clock.value = NOW + timedelta(seconds=seconds)
     reader: PresenceReader = stack["presence_reader"]
     reader.presence = fresh_presence(clock.value)
+
+
+def authority_counts(stack: dict, request_id: str) -> tuple[int, int]:
+    with sqlite3.connect(stack["idempotency"].path) as connection:
+        idem = connection.execute(
+            "SELECT COUNT(*) FROM idempotency_records WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0]
+        dispatch = connection.execute(
+            "SELECT COUNT(*) FROM principal_agent_dispatch_claims WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0]
+    return idem, dispatch
 
 
 def test_pending_retry_completion_and_digest_only_replay(tmp_path: Path) -> None:
@@ -219,6 +227,7 @@ def test_pending_retry_completion_and_digest_only_replay(tmp_path: Path) -> None
         path="hello.txt",
     )
     assert first.state is PrincipalControlState.PENDING
+    assert authority_counts(stack, "req-read-01") == (1, 1)
 
     second = control.read_file(
         who,
@@ -227,6 +236,7 @@ def test_pending_retry_completion_and_digest_only_replay(tmp_path: Path) -> None
         path="hello.txt",
     )
     assert second.state is PrincipalControlState.PENDING
+    assert authority_counts(stack, "req-read-01") == (1, 1)
 
     secret_content = "guest-file-content-must-not-enter-idempotency"
     result = AgentCommandResult(
@@ -266,17 +276,27 @@ def test_pending_retry_completion_and_digest_only_replay(tmp_path: Path) -> None
     )
     assert replay == completed
 
-    with sqlite3.connect(stack["gateway"].idempotency_store.path) as connection:
+    with sqlite3.connect(stack["idempotency"].path) as connection:
         cached = connection.execute(
             "SELECT response_json FROM idempotency_records WHERE request_id = ?",
             ("req-read-01",),
         ).fetchone()[0]
+        dispatch_row = connection.execute(
+            """
+            SELECT principal_sha256, request_sha256, command_sha256
+            FROM principal_agent_dispatch_claims
+            WHERE request_id = ?
+            """,
+            ("req-read-01",),
+        ).fetchone()
     assert secret_content not in cached
     assert "result_sha256" in cached
     assert "command_sha256" in cached
+    assert dispatch_row is not None
+    assert secret_content not in "|".join(dispatch_row)
 
 
-def test_crash_after_claim_before_enqueue_resumes_from_older_intent(
+def test_crash_after_atomic_claim_before_enqueue_resumes_exact_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -299,6 +319,10 @@ def test_crash_after_claim_before_enqueue_resumes_from_older_intent(
             content="hello",
         )
 
+    # Both authorities were committed in one transaction before enqueue.
+    assert authority_counts(stack, "req-write-crash") == (1, 1)
+    assert bridge.get_command_status(INSTANCE_ID, "req-write-crash") is None
+
     monkeypatch.setattr(bridge, "enqueue_command", original_enqueue)
     keep_fresh(stack, 1)
     resumed = control.write_file(
@@ -310,9 +334,10 @@ def test_crash_after_claim_before_enqueue_resumes_from_older_intent(
     )
     assert resumed.state is PrincipalControlState.PENDING
     assert bridge.get_command_status(INSTANCE_ID, "req-write-crash") is not None
+    assert authority_counts(stack, "req-write-crash") == (1, 1)
 
 
-def test_unresolved_claim_that_predates_intent_fails_closed_without_enqueue(
+def test_foreign_unresolved_claim_is_permanently_ambiguous_without_dispatch(
     tmp_path: Path,
 ) -> None:
     stack = build_stack(tmp_path)
@@ -335,22 +360,24 @@ def test_unresolved_claim_that_predates_intent_fails_closed_without_enqueue(
         binding.session_token,
         now=NOW,
     ).should_execute
+    assert authority_counts(stack, "req-cross-path") == (1, 0)
 
-    with pytest.raises(
-        PrincipalAgentControlAmbiguousError,
-        match="predates Agent dispatch intent",
-    ):
-        control.read_file(
-            who,
-            instance_id=INSTANCE_ID,
-            request_id="req-cross-path",
-            path="README.md",
-        )
+    for _ in range(2):
+        with pytest.raises(
+            PrincipalAgentControlAmbiguousError,
+            match="not owned by Agent dispatch",
+        ):
+            control.read_file(
+                who,
+                instance_id=INSTANCE_ID,
+                request_id="req-cross-path",
+                path="README.md",
+            )
+        assert authority_counts(stack, "req-cross-path") == (1, 0)
+        assert bridge.get_command_status(INSTANCE_ID, "req-cross-path") is None
 
-    assert bridge.get_command_status(INSTANCE_ID, "req-cross-path") is None
 
-
-def test_stale_agent_rejected_before_intent_or_idempotency_claim(tmp_path: Path) -> None:
+def test_stale_agent_rejected_before_atomic_dispatch_claim(tmp_path: Path) -> None:
     stack = build_stack(tmp_path)
     control: PrincipalAgentControlService = stack["control"]
     reader: PresenceReader = stack["presence_reader"]
@@ -368,16 +395,12 @@ def test_stale_agent_rejected_before_intent_or_idempotency_claim(tmp_path: Path)
             path="README.md",
         )
 
-    assert list(stack["intent_root"].iterdir()) == []
-    with sqlite3.connect(stack["gateway"].idempotency_store.path) as connection:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM idempotency_records WHERE request_id = ?",
-            ("req-stale",),
-        ).fetchone()[0]
-    assert count == 0
+    assert authority_counts(stack, "req-stale") == (0, 0)
 
 
-def test_replace_requires_separate_approval_and_never_stages_command(tmp_path: Path) -> None:
+def test_replace_requires_separate_approval_and_never_claims_dispatch(
+    tmp_path: Path,
+) -> None:
     stack = build_stack(tmp_path)
     control: PrincipalAgentControlService = stack["control"]
     bridge: AgentBridgeService = stack["agent_bridge"]
@@ -400,5 +423,5 @@ def test_replace_requires_separate_approval_and_never_stages_command(tmp_path: P
             },
         )
 
-    assert list(stack["intent_root"].iterdir()) == []
+    assert authority_counts(stack, "req-replace") == (0, 0)
     assert bridge.get_command_status(INSTANCE_ID, "req-replace") is None

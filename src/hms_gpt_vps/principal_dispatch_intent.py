@@ -2,36 +2,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
-import json
-import os
-from pathlib import Path
+from enum import Enum
+from typing import Any
 
-from .qualification_file_authority import (
-    path_chain_has_redirect,
-    read_file_pinned,
-    require_existing_directory,
-    write_json_create_only,
+from .idempotency_store import (
+    IdempotencyError,
+    IdempotencyState,
+    IdempotencyStore,
+    _utc_iso,
 )
 
 
 PRINCIPAL_DISPATCH_INTENT_SCHEMA_VERSION = 1
-MAX_PRINCIPAL_DISPATCH_INTENT_BYTES = 16 * 1024
 _HEX_LOWER = frozenset("0123456789abcdef")
-_INTENT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "principal_sha256",
-        "pair_id",
-        "session_id",
-        "session_epoch",
-        "instance_id",
-        "request_id",
-        "request_sha256",
-        "command_sha256",
-        "expires_at",
-    }
-)
+_DISPATCH_ROW_FIELDS = {
+    "schema_version",
+    "principal_sha256",
+    "pair_id",
+    "session_id",
+    "session_epoch",
+    "instance_id",
+    "request_id",
+    "request_sha256",
+    "command_sha256",
+    "expires_at",
+}
 
 
 class PrincipalDispatchIntentError(RuntimeError):
@@ -42,8 +37,35 @@ class PrincipalDispatchIntentConflictError(PrincipalDispatchIntentError):
     pass
 
 
-def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
-    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+class PrincipalDispatchIntentAmbiguousError(PrincipalDispatchIntentError):
+    pass
+
+
+class PrincipalDispatchClaimState(str, Enum):
+    NEW = "new"
+    RESUME = "resume"
+    REPLAY = "replay"
+
+
+@dataclass(frozen=True)
+class PrincipalDispatchClaim:
+    state: PrincipalDispatchClaimState
+    replay_response: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, PrincipalDispatchClaimState):
+            raise PrincipalDispatchIntentError(
+                "dispatch claim state is invalid"
+            )
+        if self.state is PrincipalDispatchClaimState.REPLAY:
+            if not isinstance(self.replay_response, dict):
+                raise PrincipalDispatchIntentError(
+                    "replay dispatch claim requires a cached response"
+                )
+        elif self.replay_response is not None:
+            raise PrincipalDispatchIntentError(
+                "non-replay dispatch claim must not contain a response"
+            )
 
 
 def _canonical_sha256(value: object, name: str) -> str:
@@ -124,47 +146,6 @@ def _parse_iso(value: object) -> datetime:
     return parsed
 
 
-def _strict_json_object(data: bytes) -> dict[str, object]:
-    if not isinstance(data, bytes) or not data:
-        raise PrincipalDispatchIntentError(
-            "dispatch intent must contain JSON bytes"
-        )
-    if len(data) > MAX_PRINCIPAL_DISPATCH_INTENT_BYTES:
-        raise PrincipalDispatchIntentError(
-            "dispatch intent exceeds size bound"
-        )
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise PrincipalDispatchIntentError(
-            "dispatch intent is not UTF-8"
-        ) from exc
-
-    def no_duplicates(
-        pairs: list[tuple[str, object]],
-    ) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise PrincipalDispatchIntentError(
-                    f"dispatch intent has duplicate JSON key: {key}"
-                )
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(text, object_pairs_hook=no_duplicates)
-    except json.JSONDecodeError as exc:
-        raise PrincipalDispatchIntentError(
-            "dispatch intent is not valid JSON"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise PrincipalDispatchIntentError(
-            "dispatch intent must be a JSON object"
-        )
-    return payload
-
-
 @dataclass(frozen=True)
 class PrincipalDispatchIntent:
     schema_version: int
@@ -204,172 +185,242 @@ class PrincipalDispatchIntent:
         _canonical_sha256(self.command_sha256, "command_sha256")
         _aware_utc(self.expires_at, "expires_at")
 
-    def to_mapping(self) -> dict[str, object]:
+    def to_row(self) -> tuple[object, ...]:
         self.validate()
-        return {
-            "schema_version": self.schema_version,
-            "principal_sha256": self.principal_sha256,
-            "pair_id": self.pair_id,
-            "session_id": self.session_id,
-            "session_epoch": self.session_epoch,
-            "instance_id": self.instance_id,
-            "request_id": self.request_id,
-            "request_sha256": self.request_sha256,
-            "command_sha256": self.command_sha256,
-            "expires_at": _iso(self.expires_at),
-        }
+        return (
+            self.schema_version,
+            self.principal_sha256,
+            self.pair_id,
+            self.session_id,
+            self.session_epoch,
+            self.instance_id,
+            self.request_id,
+            self.request_sha256,
+            self.command_sha256,
+            _iso(self.expires_at),
+        )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "PrincipalDispatchIntent":
-        payload = _strict_json_object(data)
-        if frozenset(payload.keys()) != _INTENT_FIELDS:
+    def from_row(cls, row: object) -> "PrincipalDispatchIntent":
+        if not hasattr(row, "keys"):
             raise PrincipalDispatchIntentError(
-                "dispatch intent fields do not match schema"
+                "dispatch binding row is invalid"
             )
-        schema = payload["schema_version"]
-        epoch = payload["session_epoch"]
+        keys = set(row.keys())  # type: ignore[union-attr]
+        if keys != _DISPATCH_ROW_FIELDS:
+            raise PrincipalDispatchIntentError(
+                "dispatch binding row fields do not match schema"
+            )
+        schema = row["schema_version"]  # type: ignore[index]
+        epoch = row["session_epoch"]  # type: ignore[index]
         if isinstance(schema, bool) or not isinstance(schema, int):
             raise PrincipalDispatchIntentError(
-                "dispatch intent schema_version must be an integer"
+                "dispatch binding schema_version must be an integer"
             )
         if isinstance(epoch, bool) or not isinstance(epoch, int):
             raise PrincipalDispatchIntentError(
-                "dispatch intent session_epoch must be an integer"
+                "dispatch binding session_epoch must be an integer"
             )
         intent = cls(
             schema_version=schema,
             principal_sha256=_canonical_sha256(
-                payload["principal_sha256"],
-                "principal_sha256",
+                row["principal_sha256"], "principal_sha256"  # type: ignore[index]
             ),
-            pair_id=_identifier(payload["pair_id"], "pair_id"),
-            session_id=_identifier(payload["session_id"], "session_id"),
+            pair_id=_identifier(row["pair_id"], "pair_id"),  # type: ignore[index]
+            session_id=_identifier(row["session_id"], "session_id"),  # type: ignore[index]
             session_epoch=epoch,
-            instance_id=_instance_id(payload["instance_id"]),
-            request_id=_identifier(payload["request_id"], "request_id"),
+            instance_id=_instance_id(row["instance_id"]),  # type: ignore[index]
+            request_id=_identifier(row["request_id"], "request_id"),  # type: ignore[index]
             request_sha256=_canonical_sha256(
-                payload["request_sha256"],
-                "request_sha256",
+                row["request_sha256"], "request_sha256"  # type: ignore[index]
             ),
             command_sha256=_canonical_sha256(
-                payload["command_sha256"],
-                "command_sha256",
+                row["command_sha256"], "command_sha256"  # type: ignore[index]
             ),
-            expires_at=_parse_iso(payload["expires_at"]),
+            expires_at=_parse_iso(row["expires_at"]),  # type: ignore[index]
         )
         intent.validate()
         return intent
-
-
-@dataclass(frozen=True)
-class PrincipalDispatchStage:
-    intent: PrincipalDispatchIntent
-    is_new: bool
 
 
 class PrincipalDispatchIntentStore:
-    """Create-only, digest-only authority proving Agent-dispatch ownership.
+    """Atomically bind one idempotency claim to the Agent-dispatch path.
 
-    One immutable file is retained per session/request id. It contains no raw
-    session token, pairing token, principal subject, request parameters or file
-    content. Publication always precedes the idempotency claim so a later
-    unresolved claim can be resumed only when an exact older dispatch intent is
-    already durable.
+    The binding lives in the exact hardened IdempotencyStore SQLite database.
+    A NEW claim inserts both the ordinary idempotency CLAIMED row and the exact
+    dispatch binding in one BEGIN IMMEDIATE transaction. Therefore a later
+    unresolved idempotency claim is resumable only when the matching dispatch
+    binding was committed in the same transaction; a claim from any other path
+    remains permanently ambiguous and can never become resumable merely because
+    the caller retries.
+
+    The binding is digest-only: it never stores request parameters, file content,
+    pairing/session tokens, Agent credentials, or the raw principal subject.
     """
 
-    def __init__(self, root: Path) -> None:
-        self.root = require_existing_directory(
-            root,
-            label="principal dispatch intent root",
-        )
-        self._root_identity = self.root.stat()
+    def __init__(self, idempotency_store: IdempotencyStore) -> None:
+        if not isinstance(idempotency_store, IdempotencyStore):
+            raise TypeError(
+                "idempotency_store must be an IdempotencyStore"
+            )
+        self.idempotency_store = idempotency_store
+        self._initialize()
 
-    def _assert_root(self) -> None:
-        current = require_existing_directory(
-            self.root,
-            label="principal dispatch intent root",
-        ).stat()
-        if not _same_file_identity(self._root_identity, current):
-            raise PrincipalDispatchIntentError(
-                "principal dispatch intent root identity changed"
+    @staticmethod
+    def _rollback(connection) -> None:  # type: ignore[no-untyped-def]
+        try:
+            connection.execute("ROLLBACK")
+        except Exception:
+            pass
+
+    def _initialize(self) -> None:
+        with self.idempotency_store._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS principal_agent_dispatch_claims (
+                    schema_version INTEGER NOT NULL,
+                    principal_sha256 TEXT NOT NULL,
+                    pair_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    session_epoch INTEGER NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    command_sha256 TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id, request_id)
+                ) WITHOUT ROWID
+                """
             )
 
     @staticmethod
-    def _filename(intent: PrincipalDispatchIntent) -> str:
-        intent.validate()
-        identity = b"\x00".join(
-            (
-                intent.session_id.encode("ascii"),
-                intent.request_id.encode("ascii"),
-                intent.instance_id.encode("utf-8"),
+    def _load_dispatch_row(
+        connection,
+        intent: PrincipalDispatchIntent,
+    ):  # type: ignore[no-untyped-def]
+        return connection.execute(
+            """
+            SELECT schema_version, principal_sha256, pair_id, session_id,
+                   session_epoch, instance_id, request_id, request_sha256,
+                   command_sha256, expires_at
+            FROM principal_agent_dispatch_claims
+            WHERE session_id = ? AND request_id = ?
+            """,
+            (intent.session_id, intent.request_id),
+        ).fetchone()
+
+    @staticmethod
+    def _require_exact_dispatch_row(
+        row: object,
+        intent: PrincipalDispatchIntent,
+    ) -> None:
+        stored = PrincipalDispatchIntent.from_row(row)
+        if stored != intent:
+            raise PrincipalDispatchIntentConflictError(
+                "idempotency key is bound to a different Agent dispatch authority"
             )
-        )
-        return "dispatch-" + hashlib.sha256(identity).hexdigest() + ".json"
 
-    def _path(self, intent: PrincipalDispatchIntent) -> Path:
-        return self.root / self._filename(intent)
-
-    def _load_path(self, path: Path) -> PrincipalDispatchIntent:
-        self._assert_root()
-        if path_chain_has_redirect(path):
-            raise PrincipalDispatchIntentError(
-                "dispatch intent path traverses a link or reparse point"
-            )
-        try:
-            data = read_file_pinned(
-                path,
-                max_bytes=MAX_PRINCIPAL_DISPATCH_INTENT_BYTES,
-                label="principal dispatch intent",
-            )
-        except (PermissionError, RuntimeError, ValueError) as exc:
-            raise PrincipalDispatchIntentError(
-                "dispatch intent authority could not be read safely"
-            ) from exc
-        intent = PrincipalDispatchIntent.from_bytes(data)
-        self._assert_root()
-        return intent
-
-    def load(
-        self,
-        template: PrincipalDispatchIntent,
-    ) -> PrincipalDispatchIntent | None:
-        template.validate()
-        path = self._path(template)
-        try:
-            return self._load_path(path)
-        except FileNotFoundError:
-            return None
-
-    def stage(
+    def begin(
         self,
         intent: PrincipalDispatchIntent,
-    ) -> PrincipalDispatchStage:
+        *,
+        now: datetime | None = None,
+    ) -> PrincipalDispatchClaim:
         intent.validate()
-        self._assert_root()
-        path = self._path(intent)
-        existing = self.load(intent)
-        if existing is not None:
-            if existing != intent:
-                raise PrincipalDispatchIntentConflictError(
-                    "dispatch intent already exists with different authority"
+        checked_at = _aware_utc(
+            now or datetime.now(timezone.utc),
+            "dispatch claim timestamp",
+        )
+        if checked_at >= intent.expires_at:
+            raise PrincipalDispatchIntentError(
+                "dispatch intent is already expired"
+            )
+        claimed_at = _utc_iso(checked_at)
+
+        with self.idempotency_store._connection() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                idempotency_row = connection.execute(
+                    """
+                    SELECT request_sha256, state, response_json, response_sha256,
+                           claimed_at, completed_at
+                    FROM idempotency_records
+                    WHERE session_id = ? AND request_id = ?
+                    """,
+                    (intent.session_id, intent.request_id),
+                ).fetchone()
+                dispatch_row = self._load_dispatch_row(connection, intent)
+
+                if idempotency_row is None:
+                    if dispatch_row is not None:
+                        raise PrincipalDispatchIntentError(
+                            "dispatch binding exists without idempotency authority"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO idempotency_records(
+                            session_id, request_id, request_sha256,
+                            state, claimed_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            intent.session_id,
+                            intent.request_id,
+                            intent.request_sha256,
+                            IdempotencyState.CLAIMED.value,
+                            claimed_at,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO principal_agent_dispatch_claims(
+                            schema_version, principal_sha256, pair_id,
+                            session_id, session_epoch, instance_id,
+                            request_id, request_sha256, command_sha256,
+                            expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        intent.to_row(),
+                    )
+                    connection.execute("COMMIT")
+                    return PrincipalDispatchClaim(
+                        state=PrincipalDispatchClaimState.NEW
+                    )
+
+                try:
+                    state, replay = self.idempotency_store._validate_row(
+                        idempotency_row,
+                        expected_request_sha256=intent.request_sha256,
+                    )
+                except IdempotencyError as exc:
+                    raise PrincipalDispatchIntentConflictError(
+                        "idempotency authority conflicts with Agent dispatch request"
+                    ) from exc
+
+                if dispatch_row is None:
+                    raise PrincipalDispatchIntentAmbiguousError(
+                        "idempotency claim is not atomically bound to Agent dispatch"
+                    )
+                self._require_exact_dispatch_row(dispatch_row, intent)
+
+                if state is IdempotencyState.CLAIMED:
+                    connection.execute("COMMIT")
+                    return PrincipalDispatchClaim(
+                        state=PrincipalDispatchClaimState.RESUME
+                    )
+                if state is IdempotencyState.COMPLETED:
+                    if replay is None:
+                        raise PrincipalDispatchIntentError(
+                            "completed idempotency authority lost replay receipt"
+                        )
+                    connection.execute("COMMIT")
+                    return PrincipalDispatchClaim(
+                        state=PrincipalDispatchClaimState.REPLAY,
+                        replay_response=replay,
+                    )
+                raise PrincipalDispatchIntentError(
+                    f"unsupported idempotency state: {state.value}"
                 )
-            return PrincipalDispatchStage(intent=existing, is_new=False)
-
-        try:
-            write_json_create_only(
-                path,
-                intent.to_mapping(),
-                max_bytes=MAX_PRINCIPAL_DISPATCH_INTENT_BYTES,
-                label="principal dispatch intent",
-            )
-            created = True
-        except FileExistsError:
-            created = False
-
-        published = self._load_path(path)
-        if published != intent:
-            raise PrincipalDispatchIntentConflictError(
-                "published dispatch intent differs from requested authority"
-            )
-        self._assert_root()
-        return PrincipalDispatchStage(intent=published, is_new=created)
+            except Exception:
+                self._rollback(connection)
+                raise

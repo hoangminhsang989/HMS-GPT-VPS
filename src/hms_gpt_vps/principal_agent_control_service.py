@@ -21,10 +21,11 @@ from .control_request import (
     ControlRequest,
     authorize_control_request,
 )
-from .idempotency_store import IdempotencyInProgressError
 from .principal_dispatch_intent import (
     PRINCIPAL_DISPATCH_INTENT_SCHEMA_VERSION,
+    PrincipalDispatchClaimState,
     PrincipalDispatchIntent,
+    PrincipalDispatchIntentAmbiguousError,
     PrincipalDispatchIntentStore,
 )
 from .principal_pairing_service import (
@@ -231,9 +232,10 @@ class PrincipalAgentControlService:
     """Principal-bound Bridge façade that dispatches only to the managed Agent.
 
     Raw pairing/session bearer credentials remain inside PrincipalPairingService.
-    This service never executes ControlActionRuntime on the Bridge host. It binds
-    an authenticated control request to an immutable digest-only dispatch intent,
-    claims idempotency, then enqueues the exact command for outbound Agent poll.
+    This service never executes ControlActionRuntime on the Bridge host. It first
+    authorizes the exact principal-bound session, then atomically binds the
+    idempotency key to one exact Agent dispatch before the command can become
+    pollable by the managed guest.
     """
 
     def __init__(
@@ -260,6 +262,10 @@ class PrincipalAgentControlService:
         if gateway.session_store is not principal_pairing.exchange.session_store:
             raise PrincipalAgentControlError(
                 "principal control requires gateway and pairing to share exact ControlSessionStore"
+            )
+        if intent_store.idempotency_store is not gateway.idempotency_store:
+            raise PrincipalAgentControlError(
+                "principal control requires dispatch and gateway to share exact IdempotencyStore"
             )
         self.principal_pairing = principal_pairing
         self.gateway = gateway
@@ -325,9 +331,20 @@ class PrincipalAgentControlService:
         _verify_completed_receipt(receipt, command, status.result)
         return self._status_from_result(status.result)
 
-    def _resume_gate(
+    @staticmethod
+    def _reject_unapproved_destructive_request(request: ControlRequest) -> None:
+        if request.action != "workspace.write":
+            return
+        mode = request.params.get("mode", "create")
+        if mode == "replace":
+            raise PrincipalAgentControlApprovalRequiredError(
+                "workspace.write replace requires a separate explicit approval flow"
+            )
+
+    def _gate(
         self,
         request: ControlRequest,
+        *,
         session_epoch: int,
     ) -> ControlGate:
         return ControlGate(
@@ -340,15 +357,26 @@ class PrincipalAgentControlService:
             replay_response=None,
         )
 
-    @staticmethod
-    def _reject_unapproved_destructive_request(request: ControlRequest) -> None:
-        if request.action != "workspace.write":
-            return
-        mode = request.params.get("mode", "create")
-        if mode == "replace":
-            raise PrincipalAgentControlApprovalRequiredError(
-                "workspace.write replace requires a separate explicit approval flow"
-            )
+    def _audit_dispatch_claim(
+        self,
+        request: ControlRequest,
+        *,
+        request_sha256: str,
+        session_epoch: int,
+        state: PrincipalDispatchClaimState,
+    ) -> None:
+        if state is PrincipalDispatchClaimState.NEW:
+            outcome = "authorized"
+        elif state is PrincipalDispatchClaimState.RESUME:
+            outcome = "idempotency_resume"
+        else:
+            outcome = "replay"
+        self.gateway._audit(
+            request,
+            outcome,
+            request_sha256=request_sha256,
+            session_epoch=session_epoch,
+        )
 
     def submit(
         self,
@@ -374,14 +402,25 @@ class PrincipalAgentControlService:
         )
         request.validate()
         self._reject_unapproved_destructive_request(request)
+        request_sha256 = request.request_sha256()
 
-        # Authorization precedes any durable dispatch intent or Agent command.
-        session = authorize_control_request(
-            request,
-            binding.session_token,
-            self.gateway.session_store,
-            now=now,
-        )
+        # Authorization precedes any dispatch/idempotency mutation and keeps the
+        # same denial-audit semantics as ControlGateway.begin().
+        try:
+            session = authorize_control_request(
+                request,
+                binding.session_token,
+                self.gateway.session_store,
+                now=now,
+            )
+        except Exception as exc:
+            self.gateway._audit(
+                request,
+                "denied",
+                request_sha256=request_sha256,
+                error=type(exc).__name__,
+            )
+            raise
         if session.epoch != binding.epoch:
             raise PrincipalAgentControlConflictError(
                 "principal binding epoch differs from authorized session"
@@ -398,7 +437,6 @@ class PrincipalAgentControlService:
             approved_command_sha256=None,
         )
         command.validate()
-        request_sha256 = request.request_sha256()
         intent = PrincipalDispatchIntent(
             schema_version=PRINCIPAL_DISPATCH_INTENT_SCHEMA_VERSION,
             principal_sha256=binding.principal_sha256,
@@ -411,36 +449,34 @@ class PrincipalAgentControlService:
             command_sha256=_command_sha256(command),
             expires_at=binding.expires_at,
         )
-        staged = self.intent_store.stage(intent)
-
         try:
-            gate = self.gateway.begin(
+            claim = self.intent_store.begin(intent, now=now)
+        except PrincipalDispatchIntentAmbiguousError as exc:
+            self.gateway._audit(
                 request,
-                binding.session_token,
-                now=now,
+                "idempotency_blocked",
+                request_sha256=request_sha256,
+                session_epoch=session.epoch,
+                error=type(exc).__name__,
             )
-        except IdempotencyInProgressError:
-            if staged.is_new:
-                # The unresolved claim pre-dates this Agent-dispatch intent. It
-                # could belong to another execution path, so never enqueue.
-                raise PrincipalAgentControlAmbiguousError(
-                    "unresolved idempotency claim predates Agent dispatch intent"
-                ) from None
-            gate = self._resume_gate(request, session.epoch)
-        else:
-            if not gate.should_execute:
-                if staged.is_new:
-                    raise PrincipalAgentControlConflictError(
-                        "completed idempotency authority predates Agent dispatch intent"
-                    )
-                assert gate.replay_response is not None
-                return self._replay_completed(
-                    command,
-                    gate.replay_response,
-                )
+            raise PrincipalAgentControlAmbiguousError(
+                "idempotency claim is not owned by Agent dispatch"
+            ) from exc
+
+        self._audit_dispatch_claim(
+            request,
+            request_sha256=request_sha256,
+            session_epoch=session.epoch,
+            state=claim.state,
+        )
+        gate = self._gate(request, session_epoch=session.epoch)
+
+        if claim.state is PrincipalDispatchClaimState.REPLAY:
+            assert claim.replay_response is not None
+            return self._replay_completed(command, claim.replay_response)
 
         # Re-observe immediately before making the command pollable. If this
-        # fails after the claim, the exact older intent permits a safe retry.
+        # fails after the atomic NEW claim, a later RESUME can safely continue.
         self._require_fresh_pairing(binding)
         status: AgentCommandStatus | None = get_exact_agent_command_status(
             self.agent_bridge.commands,
@@ -464,9 +500,6 @@ class PrincipalAgentControlService:
             self.gateway.complete(gate, receipt, now=now)
             return self._status_from_result(status.result)
         if status.state is AgentCommandState.EXPIRED:
-            # A previously-pollable command may have executed before its result
-            # was durably accepted. Do not convert this into a completed/no-op
-            # claim; preserve ambiguity for operator reconciliation.
             return PrincipalControlStatus(
                 instance_id=command.instance_id,
                 request_id=command.request_id,

@@ -3,7 +3,6 @@
 Status: **STAGED_NOT_EXECUTED**
 
 Branch: `r002f-pairing-readiness-runtime`
-Parent authority when staged: `798cf930c9b3cbd13d925452b3e1d96e79db22dc`
 
 ## Purpose
 
@@ -18,7 +17,49 @@ The intended model-facing sequence is now representable as:
 No raw pairing token, control-session token or Agent device credential is
 returned by the façade.
 
-## Dispatch ordering
+## Atomic dispatch ownership
+
+Agent dispatch ownership and idempotency must be one authority decision. A prior
+revision staged a create-only filesystem intent before the idempotency claim.
+Independent committed-byte review rejected that design: if a foreign unresolved
+claim already existed, the first façade call would fail ambiguous but leave the
+new intent behind; a later retry could then mistake that older intent for proof
+that the foreign claim belonged to Agent dispatch. A crash after intent creation
+but before claim creation had the same ambiguity.
+
+The corrected design uses `PrincipalDispatchIntentStore` as an atomic SQLite
+claim binder over the **exact same hardened IdempotencyStore database** used by
+ControlGateway. Its `BEGIN IMMEDIATE` transaction is authoritative:
+
+- if no idempotency record exists, it inserts both the ordinary `CLAIMED` row
+  and the exact `principal_agent_dispatch_claims` row, then commits once;
+- if an unresolved idempotency row exists, resume is allowed only when the exact
+  dispatch-binding row already exists and matches all authority fields;
+- if a claim exists without a dispatch-binding row, it is permanently ambiguous
+  for this façade and no binding row is created retroactively;
+- completed replay also requires the exact dispatch binding before a cached
+  receipt may be considered.
+
+Therefore there is no durable state in which this façade has published dispatch
+ownership without the corresponding idempotency claim, or vice versa.
+
+## Dispatch binding contents
+
+The atomic dispatch-binding row contains only:
+
+- schema version;
+- principal SHA-256;
+- pair_id;
+- exact session_id and session epoch;
+- instance_id and request_id;
+- canonical control request SHA-256;
+- exact full Agent command SHA-256;
+- session expiry.
+
+It does not contain request parameters, file content, raw principal subject,
+pairing/session tokens or Agent credentials.
+
+## Control ordering
 
 A control call uses the following authority order:
 
@@ -27,57 +68,46 @@ A control call uses the following authority order:
 3. require fresh authenticated pairing readiness for the same pair_id;
 4. build one exact AgentCommandEnvelope whose deadline is the bound session
    expiry and whose destructive approval field is null;
-5. publish an immutable digest-only PrincipalDispatchIntent;
-6. claim the existing ControlGateway idempotency key;
-7. re-observe fresh pairing readiness;
-8. read the Agent queue for the exact command, or enqueue it if absent;
-9. if pending, leave idempotency CLAIMED and return pending;
-10. if completed, verify the exact Agent result and complete idempotency with a
-    small digest receipt;
-11. on later replay, verify that receipt against the exact completed Agent queue
+5. atomically create/resume/replay the idempotency + Agent-dispatch binding;
+6. re-observe fresh pairing readiness;
+7. read the Agent queue for the exact command, or enqueue it if absent;
+8. if pending, leave the atomic idempotency claim unresolved and return pending;
+9. if completed, verify the exact Agent result and complete idempotency with a
+   small digest receipt;
+10. on later replay, verify that receipt against the exact completed Agent queue
     result before returning model-visible data.
 
 The Bridge never invokes ControlActionRuntime in this path. The guest
 AgentPolicyCommandExecutor remains the execution/policy boundary.
 
-## Crash recovery rule
+## Crash recovery
 
-The immutable dispatch intent is deliberately published before the idempotency
-claim and contains no request parameters or content. It binds:
-
-- principal SHA-256;
-- pair_id;
-- exact session_id and epoch;
-- instance_id and request_id;
-- canonical control request SHA-256;
-- exact full Agent command SHA-256;
-- session expiry.
-
-This ordering distinguishes two cases after a Bridge crash:
-
-- **older intent + unresolved claim**: the request was already assigned to the
-  Agent-dispatch path, so the exact command may be safely reconciled/enqueued;
-- **new intent + older unresolved claim**: the claim may belong to another
-  execution path, so the façade fails closed as ambiguous and does not enqueue.
-
-A crash after the intent but before the claim is also safe: retry finds the
-older exact intent, creates the claim, then proceeds. A crash after enqueue is
-safe because AgentCommandStore and the guest idempotency journal bind request_id
-to the exact command/result authority.
+- crash before the atomic transaction commits: neither idempotency nor dispatch
+  ownership exists, so retry may begin normally;
+- crash after atomic claim commit but before enqueue: both exact authorities
+  exist, so retry resumes the same Agent command;
+- crash after enqueue: the exact queue request-id/command binding and Agent-side
+  idempotency journal preserve side-effect identity;
+- foreign/direct-path claim: no dispatch binding exists and repeated calls remain
+  ambiguous forever unless an explicit reconciliation process resolves it;
+- crash after Agent completion but before idempotency completion: retry loads the
+  exact completed Agent result and finalizes the same digest receipt;
+- crash after idempotency completion but before response delivery: replay verifies
+  the receipt against the exact completed Agent result.
 
 ## Exact queue read
 
-`agent_command_exact_status.py` adds a read-only package-internal adapter over
-AgentCommandStore's already hardened connection and row validators. It compares
-the exact stored Agent command body to the requested AgentCommandEnvelope and
-never creates, expires, completes or otherwise mutates a queue row.
+`agent_command_exact_status.py` is a read-only package-internal adapter over
+AgentCommandStore's hardened connection and row validators. It compares the
+exact stored Agent command body to the requested AgentCommandEnvelope and never
+creates, expires, completes or otherwise mutates a queue row.
 
 This avoids using `enqueue_command()` merely as a read/verification primitive.
 
 ## Replay privacy
 
 The idempotency database does not cache the full Agent result for this façade.
-Instead it stores only a small receipt containing:
+Instead the completed idempotency response is a small receipt containing:
 
 - receipt schema/kind;
 - instance_id/request_id;
@@ -86,18 +116,18 @@ Instead it stores only a small receipt containing:
 
 On replay the façade loads the completed result from AgentCommandStore and
 verifies both digests before returning it. Therefore a `workspace.read` result
-may return file content to the authenticated caller without duplicating that
-content into IdempotencyStore.
+may return file content to the authenticated caller without copying that content
+into either `idempotency_records.response_json` or the dispatch-binding table.
 
-AgentCommandStore still necessarily contains the durable Agent result needed for
-reliable delivery/replay.
+AgentCommandStore still necessarily contains the durable Agent result required
+for reliable delivery/replay.
 
 ## Destructive operations
 
 This tranche deliberately does not invent an approval mechanism.
 
-`workspace.write` with `mode=replace` is rejected at the Bridge façade before a
-dispatch intent is published. The command therefore cannot become pollable
+`workspace.write` with `mode=replace` is rejected at the Bridge façade before an
+atomic dispatch claim is created. The command therefore cannot become pollable
 without a future explicit approval flow that binds approval to the exact command
 SHA-256.
 
@@ -107,25 +137,26 @@ applies all path/workspace restrictions. `read_file()` maps only to
 
 ## Fresh Agent requirement
 
-A new/resumed dispatch requires PairingReadinessRuntime to prove fresh
-Agent presence, `pairing_ready=true`, `paired=true`, and the exact bound pair_id
-both before intent publication and immediately before enqueue.
+A new/resumed dispatch requires PairingReadinessRuntime to prove fresh Agent
+presence, `pairing_ready=true`, `paired=true`, and the exact bound pair_id both
+before the atomic claim and immediately before enqueue.
 
-If freshness is lost after an idempotency claim, no command is enqueued; the
-older exact intent permits a later safe retry after Agent health recovers.
+If freshness is lost after an atomic claim, no command is enqueued; the exact
+claim+dispatch binding permits a later safe retry after Agent health recovers.
 
 ## Staged regression
 
 `tests/test_r002f_principal_agent_control.py` covers:
 
 - pending submission and exact retry without duplicate command creation;
+- atomic creation of one idempotency row plus one dispatch-binding row;
 - durable Agent completion followed by idempotency finalization and replay;
 - digest-only replay receipt that excludes returned file content;
-- simulated crash after idempotency claim but before enqueue, then safe resume;
-- unresolved claim that predates the dispatch intent failing closed with no
-  Agent command;
-- stale Agent rejection before intent or idempotency mutation;
-- replace-mode rejection before intent/queue mutation.
+- simulated crash after atomic claim commit but before enqueue, then safe resume;
+- a foreign unresolved claim remaining ambiguous across repeated façade calls,
+  with zero dispatch-binding rows and zero Agent commands;
+- stale Agent rejection before idempotency/dispatch mutation;
+- replace-mode rejection before idempotency/dispatch/queue mutation.
 
 These are source/regression artifacts only until an actual project test runner
 executes them.
