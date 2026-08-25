@@ -110,3 +110,33 @@ Therefore project authority remains:
 - `pairing_ready=false`
 
 No R002E merge gate is weakened by R002F staging.
+
+## Control-session and exchange authority hardening
+
+Before HTTP assembly, R002F also treats the initial control session as credential
+authority rather than trusting legacy coercive SQLite reads.
+
+The staged revision requires:
+
+- `ControlSessionRecord` exact field/type parsing, canonical lowercase token
+  digests and exact integer TTL/epoch semantics;
+- `ControlSessionStore` lexical main-database authority with
+  symlink/junction/reparse rejection, startup file-identity pinning, bounded
+  timeout configuration, duplicate-JSON rejection and guaranteed connection
+  close even when SQLite setup fails;
+- exact agreement between duplicated SQLite identity columns and the canonical
+  stored session record;
+- `PairingSessionExchange` to stop opening an independent unchecked SQLite
+  connection. Exchange transactions reuse PairingStore's hardened connection
+  authority and cross-check that PairingStore and ControlSessionStore refer to
+  the exact same startup database object;
+- exchange recovery rows to use exact pair/session identities and canonical
+  nonce SHA-256 text, without `str()` coercion.
+
+This still does not make the HTTP pairing endpoint production-ready. The next
+bounded tranche is the HTTP adapter itself, including bounded request bodies,
+exact path/JSON contracts, generic non-secret error responses and one-time
+pairing-to-session exchange semantics.
+
+All source and regression checks performed while staging this revision are
+static/synthetic unless an actual project CI run is cited separately.

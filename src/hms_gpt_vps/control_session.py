@@ -14,6 +14,22 @@ SESSION_SCHEMA_VERSION = 1
 SESSION_TOKEN_BYTES = 32
 DEFAULT_SESSION_TTL_SECONDS = 3600
 MAX_SESSION_TTL_SECONDS = 86400
+_CONTROL_SESSION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "session_id",
+        "family_id",
+        "instance_id",
+        "token_sha256",
+        "scopes",
+        "issued_at",
+        "expires_at",
+        "epoch",
+        "rotated_from",
+        "revoked_at",
+        "revocation_reason",
+    }
+)
 
 
 class ControlSessionError(ValueError):
@@ -45,6 +61,8 @@ def utc_now() -> datetime:
 
 
 def _aware_utc(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise ControlSessionError(f"{name} must be a datetime")
     if value.tzinfo is None or value.utcoffset() is None:
         raise ControlSessionError(f"{name} must be timezone-aware")
     return value.astimezone(timezone.utc)
@@ -71,16 +89,25 @@ def _parse_iso(value: object, name: str, *, required: bool = False) -> datetime 
     return _aware_utc(parsed, name)
 
 
-def _validate_identifier(value: str, name: str) -> None:
-    if not value or len(value) > 128:
+def _validate_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 128:
         raise ControlSessionError(f"{name} is invalid")
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
     if any(char not in allowed for char in value):
         raise ControlSessionError(f"{name} contains unsupported characters")
+    return value
 
 
 def _normalize_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
-    values = tuple(sorted(set(scopes)))
+    if isinstance(scopes, (str, bytes)):
+        raise ControlSessionScopeError("session scopes must be an iterable of scope strings")
+    try:
+        raw = tuple(scopes)
+    except TypeError as exc:
+        raise ControlSessionScopeError("session scopes must be iterable") from exc
+    if not all(isinstance(scope, str) for scope in raw):
+        raise ControlSessionScopeError("session scopes must contain only strings")
+    values = tuple(sorted(set(raw)))
     if not values:
         raise ControlSessionScopeError("at least one session scope is required")
     for scope in values:
@@ -90,7 +117,7 @@ def _normalize_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
 
 
 def _digest(token: str) -> str:
-    if not token:
+    if not isinstance(token, str) or not token:
         raise ControlSessionTokenMismatchError("session token is required")
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -111,18 +138,26 @@ class ControlSessionRecord:
     revocation_reason: str | None = None
 
     def validate(self) -> None:
-        if self.schema_version != SESSION_SCHEMA_VERSION:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != SESSION_SCHEMA_VERSION
+        ):
             raise ControlSessionError(f"unsupported session schema: {self.schema_version}")
         _validate_identifier(self.session_id, "session_id")
         _validate_identifier(self.family_id, "family_id")
-        if not self.instance_id.strip():
+        if not isinstance(self.instance_id, str) or not self.instance_id.strip():
             raise ControlSessionError("instance_id is required")
-        if len(self.token_sha256) != 64:
+        if not isinstance(self.token_sha256, str) or len(self.token_sha256) != 64:
             raise ControlSessionError("token_sha256 must contain 64 hex characters")
+        if self.token_sha256 != self.token_sha256.lower():
+            raise ControlSessionError("token_sha256 must use canonical lowercase hex")
         try:
             int(self.token_sha256, 16)
         except ValueError as exc:
             raise ControlSessionError("token_sha256 must be hexadecimal") from exc
+        if not isinstance(self.scopes, tuple):
+            raise ControlSessionScopeError("session scopes must be a tuple")
         normalized = _normalize_scopes(self.scopes)
         if normalized != self.scopes:
             raise ControlSessionScopeError("session scopes must be unique and sorted")
@@ -132,8 +167,8 @@ class ControlSessionRecord:
             raise ControlSessionError("expires_at must be after issued_at")
         if (expires - issued).total_seconds() > MAX_SESSION_TTL_SECONDS:
             raise ControlSessionError("session TTL exceeds maximum")
-        if self.epoch < 1:
-            raise ControlSessionError("session epoch must be positive")
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < 1:
+            raise ControlSessionError("session epoch must be a positive integer")
         if self.rotated_from is not None:
             _validate_identifier(self.rotated_from, "rotated_from")
             if self.epoch <= 1:
@@ -142,7 +177,7 @@ class ControlSessionRecord:
             revoked = _aware_utc(self.revoked_at, "revoked_at")
             if revoked < issued:
                 raise ControlSessionError("revoked_at must not precede issued_at")
-            if not self.revocation_reason:
+            if not isinstance(self.revocation_reason, str) or not self.revocation_reason:
                 raise ControlSessionError("revoked sessions require a revocation_reason")
         elif self.revocation_reason is not None:
             raise ControlSessionError("revocation_reason requires revoked_at")
@@ -166,36 +201,44 @@ class ControlSessionRecord:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ControlSessionRecord":
-        scopes_raw = payload.get("scopes")
-        if not isinstance(scopes_raw, list) or not all(isinstance(item, str) for item in scopes_raw):
+        if not isinstance(payload, dict) or frozenset(payload) != _CONTROL_SESSION_FIELDS:
+            raise ControlSessionError("control session fields do not match schema")
+        schema_version = payload["schema_version"]
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ControlSessionError("session schema_version must be an integer")
+        for name in ("session_id", "family_id", "instance_id", "token_sha256"):
+            if not isinstance(payload[name], str):
+                raise ControlSessionError(f"{name} must be a string")
+        scopes_raw = payload["scopes"]
+        if not isinstance(scopes_raw, list) or not all(
+            isinstance(item, str) for item in scopes_raw
+        ):
             raise ControlSessionError("session scopes must be a list of strings")
-        issued_at = _parse_iso(payload.get("issued_at"), "issued_at", required=True)
-        expires_at = _parse_iso(payload.get("expires_at"), "expires_at", required=True)
+        issued_at = _parse_iso(payload["issued_at"], "issued_at", required=True)
+        expires_at = _parse_iso(payload["expires_at"], "expires_at", required=True)
         assert issued_at is not None and expires_at is not None
-        epoch_raw = payload.get("epoch")
+        epoch_raw = payload["epoch"]
         if not isinstance(epoch_raw, int) or isinstance(epoch_raw, bool):
             raise ControlSessionError("session epoch must be an integer")
+        rotated_from = payload["rotated_from"]
+        if rotated_from is not None and not isinstance(rotated_from, str):
+            raise ControlSessionError("rotated_from must be a string or null")
+        revocation_reason = payload["revocation_reason"]
+        if revocation_reason is not None and not isinstance(revocation_reason, str):
+            raise ControlSessionError("revocation_reason must be a string or null")
         record = cls(
-            schema_version=int(payload.get("schema_version", -1)),
-            session_id=str(payload.get("session_id", "")),
-            family_id=str(payload.get("family_id", "")),
-            instance_id=str(payload.get("instance_id", "")),
-            token_sha256=str(payload.get("token_sha256", "")),
+            schema_version=schema_version,
+            session_id=payload["session_id"],
+            family_id=payload["family_id"],
+            instance_id=payload["instance_id"],
+            token_sha256=payload["token_sha256"],
             scopes=tuple(scopes_raw),
             issued_at=issued_at,
             expires_at=expires_at,
             epoch=epoch_raw,
-            rotated_from=(
-                str(payload["rotated_from"])
-                if payload.get("rotated_from") is not None
-                else None
-            ),
-            revoked_at=_parse_iso(payload.get("revoked_at"), "revoked_at"),
-            revocation_reason=(
-                str(payload["revocation_reason"])
-                if payload.get("revocation_reason") is not None
-                else None
-            ),
+            rotated_from=rotated_from,
+            revoked_at=_parse_iso(payload["revoked_at"], "revoked_at"),
+            revocation_reason=revocation_reason,
         )
         record.validate()
         return record
@@ -213,6 +256,15 @@ class ControlSessionRotation:
     grant: ControlSessionGrant
 
 
+def _validate_ttl(ttl_seconds: int) -> None:
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or not 60 <= ttl_seconds <= MAX_SESSION_TTL_SECONDS
+    ):
+        raise ControlSessionError("session TTL must be an integer between 60 and 86400 seconds")
+
+
 def issue_control_session(
     pairing: PairingRecord,
     *,
@@ -225,8 +277,7 @@ def issue_control_session(
         raise PairingError("pairing record must be consumed before issuing a session")
     if pairing.revoked_at is not None:
         raise PairingError("revoked pairing record cannot issue a session")
-    if not (60 <= ttl_seconds <= MAX_SESSION_TTL_SECONDS):
-        raise ControlSessionError("session TTL must be between 60 and 86400 seconds")
+    _validate_ttl(ttl_seconds)
     issued_at = _aware_utc(now or utc_now(), "now")
     if issued_at < pairing.consumed_at:
         raise ControlSessionError("session cannot be issued before pairing consumption")
@@ -257,6 +308,10 @@ def verify_control_session(
     now: datetime | None = None,
 ) -> None:
     record.validate()
+    if not isinstance(instance_id, str) or not instance_id:
+        raise ControlSessionTokenMismatchError("session instance mismatch")
+    if not isinstance(required_scope, str) or not required_scope:
+        raise ControlSessionScopeError("required session scope is invalid")
     checked_at = _aware_utc(now or utc_now(), "now")
     if instance_id != record.instance_id:
         raise ControlSessionTokenMismatchError("session instance mismatch")
@@ -289,8 +344,7 @@ def rotate_control_session(
         required_scope=record.scopes[0],
         now=rotated_at,
     )
-    if not (60 <= ttl_seconds <= MAX_SESSION_TTL_SECONDS):
-        raise ControlSessionError("session TTL must be between 60 and 86400 seconds")
+    _validate_ttl(ttl_seconds)
     next_scopes = _normalize_scopes(scopes if scopes is not None else record.scopes)
     if not set(next_scopes).issubset(record.scopes):
         raise ControlSessionScopeError("rotation cannot expand session scopes")
@@ -330,7 +384,7 @@ def revoke_control_session(
     record.validate()
     if record.revoked_at is not None:
         return record
-    if not reason.strip() or len(reason) > 128:
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 128:
         raise ControlSessionError("revocation reason is invalid")
     revoked = replace(
         record,
