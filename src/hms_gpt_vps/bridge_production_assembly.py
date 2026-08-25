@@ -32,11 +32,11 @@ from .pairing_readiness_runtime import (
 )
 from .pairing_store import PairingStore
 from .principal_agent_control_service import PrincipalAgentControlService
-from .principal_dispatch_intent import PrincipalDispatchIntentStore
-from .principal_pairing_service import (
-    DpapiPrincipalBindingRegistry,
-    PrincipalPairingService,
+from .principal_binding_registry_authority import (
+    PinnedDpapiPrincipalBindingRegistry,
 )
+from .principal_dispatch_intent import PrincipalDispatchIntentStore
+from .principal_pairing_service import PrincipalPairingService
 from .provision_state import ProvisionStateStore
 from .qualification_file_authority import (
     lexical_absolute,
@@ -61,9 +61,10 @@ def _require_identifier(value: object, name: str) -> str:
         or len(value) > 128
     ):
         raise BridgeProductionAssemblyError(f"{name} is invalid")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if any(char not in allowed for char in value):
         raise BridgeProductionAssemblyError(
-            f"{name} contains control characters"
+            f"{name} contains unsupported characters"
         )
     return value
 
@@ -312,7 +313,7 @@ def assemble_production_bridge(
     principal_pairing = PrincipalPairingService(
         readiness,
         pairing_exchange,
-        DpapiPrincipalBindingRegistry(
+        PinnedDpapiPrincipalBindingRegistry(
             layout.principal_bindings_dir
         ),
         layout.principal_pairing_lock_path,

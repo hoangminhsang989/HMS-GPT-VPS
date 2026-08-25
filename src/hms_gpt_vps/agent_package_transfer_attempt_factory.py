@@ -40,25 +40,42 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 class TransferTokenDpapiStore(DpapiSecretStore):
-    """DPAPI token store that never deletes through a mutable lexical path.
+    """DPAPI store with pinned file and parent-directory authority.
 
-    Transfer metadata is the authority that binds a token to a transfer id. Once
-    metadata is tombstoned, an old protected token blob is inert: it contains no
-    transfer id and cannot authorize guest cleanup by itself. Therefore `clear`
-    deliberately leaves the ciphertext in place. A later attempt overwrites the
-    same owned inode (or creates it with O_EXCL) before publishing new metadata.
+    Reads and writes pin the lexical token file identity during each operation.
+    The parent directory identity is also pinned across the lifetime of this
+    store, so a normal-directory rename/substitution between operations cannot
+    silently redirect later DPAPI reads or writes.
 
-    Reads and writes pin the lexical token file identity so a substituted target
-    cannot be silently consumed or overwritten between path validation and I/O.
+    ``clear`` remains deliberately non-destructive for the transfer-attempt
+    use-case: transfer metadata, not this ciphertext, owns cleanup authority.
+    Other users may safely overwrite the same pinned lexical file with a new
+    encrypted value.
     """
 
     def __init__(self, path: Path) -> None:
         super().__init__(path.expanduser().absolute())
+        self._parent_identity: os.stat_result | None = None
+        _assert_path_chain_not_reparse(self.path.parent)
+        if self.path.parent.exists():
+            if not self.path.parent.is_dir():
+                raise ValueError("transfer token parent must be a directory")
+            self._parent_identity = self.path.parent.stat()
+
+    def _assert_parent_authority(self) -> os.stat_result:
+        _assert_path_chain_not_reparse(self.path.parent)
+        if not self.path.parent.is_dir():
+            raise ValueError("transfer token parent must be an existing directory")
+        current = self.path.parent.stat()
+        if self._parent_identity is None:
+            self._parent_identity = current
+        elif not _same_file_identity(self._parent_identity, current):
+            raise ValueError("transfer token parent authority changed")
+        return current
 
     def _assert_authority(self) -> None:
         _assert_path_chain_not_reparse(self.path)
-        if not self.path.parent.is_dir():
-            raise ValueError("transfer token parent must be an existing directory")
+        self._assert_parent_authority()
         if self.path.exists() and not self.path.is_file():
             raise ValueError("transfer token authority path is not a regular file")
 
@@ -103,7 +120,7 @@ class TransferTokenDpapiStore(DpapiSecretStore):
                 raise ValueError("transfer token authority changed during write")
         finally:
             os.close(fd)
-        _ = created  # The file intentionally persists even if later metadata publication fails.
+        _ = created
 
     def load_text(self) -> str:
         self._assert_authority()
@@ -140,25 +157,13 @@ class TransferTokenDpapiStore(DpapiSecretStore):
         return unprotect_bytes(protected).decode("utf-8")
 
     def clear(self) -> None:
-        # Deliberately non-destructive. Transfer authority disappears when the
-        # metadata file is absent/tombstoned, not when this ciphertext is unlinked.
-        # Leaving an inert DPAPI orphan is safer than deleting a lexical path that
-        # could be substituted after the outer authority check.
         return None
 
 
 def create_dpapi_agent_package_transfer_attempt_store(
     instance_runtime_dir: Path,
 ) -> AgentPackageTransferAttemptStore:
-    """Create the production current-user-DPAPI transfer-attempt store.
-
-    The caller supplies an instance-scoped host runtime directory. Every existing
-    path component is required to be a normal directory path rather than a
-    symlink/reparse redirect because the DPAPI token authorizes cleanup of one
-    ownership-marked guest staging root. The returned store also receives the
-    lexical DPAPI token path so it can revalidate both authority paths on every
-    later read/write/delete instead of trusting only this factory-time check.
-    """
+    """Create the production current-user-DPAPI transfer-attempt store."""
     runtime_dir = instance_runtime_dir.expanduser().absolute()
     _assert_path_chain_not_reparse(runtime_dir)
     if runtime_dir.exists() and not runtime_dir.is_dir():
