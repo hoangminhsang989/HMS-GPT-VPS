@@ -29,19 +29,23 @@ from .bridge_service_identity import (
 
 BRIDGE_SERVICE_FAILURE_IDENTITY = 110
 BRIDGE_SERVICE_FAILURE_RUNTIME_CONSTRUCTION = 120
+BRIDGE_SERVICE_FAILURE_RUNTIME_STARTUP = 125
 BRIDGE_SERVICE_FAILURE_RUNTIME_EXECUTION = 130
+BRIDGE_SERVICE_FAILURE_RUNTIME_SHUTDOWN = 140
 BRIDGE_SERVICE_FAILURE_HOST_LIFECYCLE = 190
 
 
 class BridgeServiceRuntime(Protocol):
-    def run(self, stop: Event) -> None: ...
+    def start(self, stop: Event) -> bool: ...
+    def wait(self, stop: Event) -> None: ...
+    def shutdown(self) -> None: ...
 
 
 BridgeRuntimeFactory = Callable[[], BridgeServiceRuntime]
 
 
 class HmsBridgeWindowsServiceHost:
-    """SCM lifecycle shell that proves low privilege before runtime construction."""
+    """SCM lifecycle shell that proves low privilege and runtime readiness."""
 
     def __init__(
         self,
@@ -68,18 +72,24 @@ class HmsBridgeWindowsServiceHost:
             self.backend.set_service_status(self._status_handle, status)
             self._last_status = status
 
+    def _report_stop_pending(self, *, checkpoint: int) -> None:
+        last = self._last_status
+        if last is not None and last.current_state == SERVICE_STOP_PENDING:
+            return
+        self._report(
+            AgentServiceStatus(
+                current_state=SERVICE_STOP_PENDING,
+                checkpoint=checkpoint,
+                wait_hint_ms=30_000,
+            )
+        )
+
     def _handle_control(self, control: int) -> int:
         if control in {SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN}:
             self.stop.set()
             if self._status_handle is not None:
                 try:
-                    self._report(
-                        AgentServiceStatus(
-                            current_state=SERVICE_STOP_PENDING,
-                            checkpoint=1,
-                            wait_hint_ms=30_000,
-                        )
-                    )
+                    self._report_stop_pending(checkpoint=1)
                 except Exception:
                     return ERROR_CALL_NOT_IMPLEMENTED
             return NO_ERROR
@@ -94,6 +104,7 @@ class HmsBridgeWindowsServiceHost:
 
     def _service_main(self) -> None:
         failure_code = BRIDGE_SERVICE_FAILURE_HOST_LIFECYCLE
+        runtime: BridgeServiceRuntime | None = None
         try:
             self._status_handle = self.backend.register_control_handler(
                 HMS_BRIDGE_SERVICE_NAME,
@@ -107,38 +118,62 @@ class HmsBridgeWindowsServiceHost:
                 )
             )
             # The identity proof MUST precede any runtime factory call because
-            # the factory is where production secret/TLS reads will eventually occur.
+            # the factory loads production service secrets.
             failure_code = BRIDGE_SERVICE_FAILURE_IDENTITY
             prove_hms_bridge_runtime_identity(self.expected_service_sid)
 
             failure_code = BRIDGE_SERVICE_FAILURE_RUNTIME_CONSTRUCTION
             runtime = self.runtime_factory()
-            if not callable(getattr(runtime, "run", None)):
-                raise TypeError("runtime_factory returned an invalid Bridge runtime")
+            for name in ("start", "wait", "shutdown"):
+                if not callable(getattr(runtime, name, None)):
+                    raise TypeError(
+                        "runtime_factory returned an invalid Bridge runtime"
+                    )
 
             if self.stop.is_set():
-                failure_code = BRIDGE_SERVICE_FAILURE_HOST_LIFECYCLE
-                self._report(
-                    AgentServiceStatus(
-                        current_state=SERVICE_STOP_PENDING,
-                        checkpoint=2,
-                        wait_hint_ms=30_000,
-                    )
-                )
+                self._report_stop_pending(checkpoint=2)
             else:
-                self._report(
-                    AgentServiceStatus(
-                        current_state=SERVICE_RUNNING,
-                        controls_accepted=SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+                # start() returns True only after every listener owned by the
+                # runtime has proved readiness. False means SCM stop won the
+                # race before readiness and SERVICE_RUNNING must never publish.
+                failure_code = BRIDGE_SERVICE_FAILURE_RUNTIME_STARTUP
+                ready = runtime.start(self.stop)
+                if not isinstance(ready, bool):
+                    raise TypeError("Bridge runtime start() must return bool readiness")
+                if ready and not self.stop.is_set():
+                    self._report(
+                        AgentServiceStatus(
+                            current_state=SERVICE_RUNNING,
+                            controls_accepted=(
+                                SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+                            ),
+                        )
                     )
-                )
-                failure_code = BRIDGE_SERVICE_FAILURE_RUNTIME_EXECUTION
-                runtime.run(self.stop)
+                    failure_code = BRIDGE_SERVICE_FAILURE_RUNTIME_EXECUTION
+                    runtime.wait(self.stop)
+                    if not self.stop.is_set():
+                        raise RuntimeError(
+                            "Bridge runtime wait() returned before SCM stop"
+                        )
+                self._report_stop_pending(checkpoint=2)
+
+            failure_code = BRIDGE_SERVICE_FAILURE_RUNTIME_SHUTDOWN
+            runtime.shutdown()
+
             failure_code = BRIDGE_SERVICE_FAILURE_HOST_LIFECYCLE
             self._report(AgentServiceStatus(current_state=SERVICE_STOPPED))
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+            if runtime is not None:
+                try:
+                    self._report_stop_pending(checkpoint=3)
+                except Exception:
+                    pass
+                try:
+                    runtime.shutdown()
+                except Exception:
+                    pass
             if self._status_handle is not None:
                 try:
                     self._report(
