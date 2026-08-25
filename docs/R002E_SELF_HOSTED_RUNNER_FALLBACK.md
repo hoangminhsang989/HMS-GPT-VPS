@@ -1,68 +1,63 @@
-# R002E Self-Hosted Windows Runner Fallback
+# R002E Self-Hosted Runner Fallback
 
 Status: `STAGED_NOT_EXECUTED` on branch `r002e-self-hosted-runner-fallback`. This branch is not part of PR #11 and does not change the existing merge gate.
 
 ## Purpose
 
-PR #11 exact head `1fc5ad20068444446f154f72ed44eb7ec5a0ee5f` is blocked by GitHub Actions jobs failing before runner step 1 (`steps=null`, no log blob). Issue #12 tracks the infrastructure blocker. This fallback prepares a temporary repository-level Windows self-hosted runner on the same Windows/Hyper-V host without consuming GitHub-hosted private-repository minutes.
+PR #11 exact head `1fc5ad20068444446f154f72ed44eb7ec5a0ee5f` is blocked by GitHub Actions jobs failing before runner step 1 (`steps=null`, no log blob). Issue #12 tracks the infrastructure blocker.
+
+This branch stages transient self-hosted runner bootstraps so the existing Windows and Linux CI matrices can still be executed if GitHub-hosted private-repository minutes/allocation remain unavailable.
 
 A self-hosted runner does **not** by itself prove the HMS managed Hyper-V guest, Bridge command flow, bootstrap retirement, or pairing readiness.
 
 ## Critical security boundary
 
-A self-hosted runner executes workflow code directly on the host. The intended host also controls Hyper-V, so runner access is a material trust boundary.
+Self-hosted runners execute workflow code directly on their host. The Windows host also controls Hyper-V, so runner access is a material trust boundary.
 
-Therefore:
+Rules:
 
 - Do **not** convert the ordinary `pull_request` workflow into an always-online self-hosted workflow.
-- Do **not** treat the custom runner label as an authorization boundary.
-- Do **not** leave the runner online between qualification windows.
-- Freeze the exact PR head first, review the workflow blob that will run, then connect the runner only for that known qualification attempt.
-- Stop/remove the runner after the required jobs complete.
-- Never accept an unreviewed commit while the physical runner is online.
+- Do **not** treat custom runner labels as authorization boundaries.
+- Do **not** leave either runner online between qualification windows.
+- Freeze the exact PR head first, review the workflow blob that will run, then connect runners only for that known qualification attempt.
+- Never accept an unreviewed commit while a physical/self-hosted runner is online.
+- Stop/remove runner registrations after the required jobs complete.
 
-GitHub's own self-hosted-runner security guidance warns that self-hosted runner environments can be compromised by workflow code; private repositories reduce public-fork exposure but do not make the machine isolated.
+GitHub's self-hosted-runner security guidance explicitly warns that workflow code can compromise the self-hosted environment. Private repositories reduce public-fork exposure but do not provide VM isolation.
 
-## Bootstrap authority
+## Windows runner authority
 
-The Windows setup script is intentionally narrow:
+Files:
+
+- `scripts/setup_self_hosted_runner.ps1`
+- `scripts/start_self_hosted_runner.ps1`
+
+Bootstrap properties:
 
 - exact repository: `https://github.com/hoangminhsang989/HMS-GPT-VPS`;
 - fixed install root: `C:\ProgramData\HMS-GPT-VPS\GitHubRunner`;
 - custom label: `hms-gpt-vps-windows`;
-- requires elevated Windows PowerShell;
-- rejects symlink/junction/reparse redirects in the install path and runner state;
-- refuses to replace a non-empty/previous runner directory;
-- registration token is accepted only from process environment variable `HMS_GITHUB_RUNNER_TOKEN`, removed from the parent process environment before configuration, and never written to repository files by the bootstrap;
-- release metadata comes from the official `actions/runner` latest-release endpoint;
-- release tag, exact Windows x64 asset name, positive asset size, exact release download namespace, SHA-256 digest and downloaded byte length are validated before extraction;
-- PowerShell 5.1 is forced to TLS 1.2 for the official GitHub requests;
-- automatic runner update is disabled for deterministic qualification, which creates an operator obligation to refresh the runner within GitHub's supported update window;
-- the runner is **not installed as a Windows service**.
+- elevated Windows PowerShell required;
+- install path/runner state reject symlink/junction/reparse redirects;
+- non-empty previous runner directories are never replaced;
+- registration token is accepted only from process environment variable `HMS_GITHUB_RUNNER_TOKEN`, removed from the parent process environment before configuration, and not written to repository files;
+- official `actions/runner` release tag, exact Windows x64 asset name, positive asset size, exact release download namespace, SHA-256 digest and downloaded byte length are validated before extraction;
+- PowerShell 5.1 uses TLS 1.2 for official GitHub requests;
+- automatic update is disabled for deterministic qualification;
+- runner is **foreground only**, not a Windows service.
 
-The foreground choice is deliberate. The native Windows SCM gate needs administrator privileges, while a long-lived runner service materially increases persistence and blast radius. The runner must instead be started from an elevated PowerShell only for the qualification window.
+Foreground mode is deliberate. The native Windows SCM gate needs administrator privileges, while a long-lived privileged runner service increases persistence and blast radius.
 
-## Activation prerequisites
+### Register Windows runner
 
-1. Confirm Issue #12 is still the active CI blocker.
-2. Prefer first checking GitHub Billing / Metered usage / Budgets for Actions quota or budget exhaustion.
-3. Freeze PR #11 at the exact head intended for qualification; no further pushes while the runner is online.
-4. Review `.github/workflows/ci.yml` at that exact head before activation.
-5. In repository Settings → Actions → Runners, create a fresh repository-level Windows x64 runner registration token.
-6. Use an elevated Windows PowerShell on the intended dedicated runner host.
-
-Registration tokens are time-limited. Do not save one in a `.ps1`, `.env`, GitHub issue, commit, shell history file, or reusable document.
-
-## Register the temporary Windows runner
-
-From a checkout of this fallback branch, in elevated Windows PowerShell:
+In elevated Windows PowerShell from this fallback branch:
 
 ```powershell
 $env:HMS_GITHUB_RUNNER_TOKEN = '<fresh repository runner registration token>'
 .\scripts\setup_self_hosted_runner.ps1
 ```
 
-Expected registration result includes:
+Expected registration evidence includes:
 
 ```text
 registered = True
@@ -70,11 +65,7 @@ foreground_required = True
 custom_label = hms-gpt-vps-windows
 ```
 
-A successful registration is still not a proof that GitHub sees the runner as Online/Idle. Confirm the runner entry in repository Settings before routing any job to it.
-
-## Preflight and foreground start
-
-Before connecting the runner for the qualification window:
+### Windows preflight/start
 
 ```powershell
 .\scripts\start_self_hosted_runner.ps1 -CheckOnly
@@ -88,48 +79,134 @@ foreground = True
 service_mode = False
 ```
 
-Then, only after the exact head/workflow is frozen and reviewed:
+Then, only during the frozen qualification window:
 
 ```powershell
 .\scripts\start_self_hosted_runner.ps1
 ```
 
-Keep that elevated console open only while the intended qualification jobs execute.
+## Linux runner authority
+
+Files:
+
+- `scripts/setup_self_hosted_runner_linux.sh`
+- `scripts/start_self_hosted_runner_linux.sh`
+
+The Linux fallback is generic and does **not** install WSL, a Linux VM, packages, or a distribution. It must run inside an already-existing, separately reviewed Linux x64 environment.
+
+Reviewed GitHub-supported distro floor:
+
+- Ubuntu 20.04+
+- Debian 10+
+- RHEL/CentOS/Oracle Linux 8+
+- Fedora 29+
+- Linux Mint 20+
+- openSUSE Leap 15.2+
+- SLES 15.2+
+
+Bootstrap properties:
+
+- x64 Linux only;
+- must run as a non-root user;
+- requires existing `curl`, `python3`, `tar`, `sha256sum`, and `stat`;
+- fixed per-user install root: `~/.local/share/hms-gpt-vps/github-runner-linux`;
+- symlink redirects in HOME/install state are rejected;
+- exact repository: `https://github.com/hoangminhsang989/HMS-GPT-VPS`;
+- custom label: `hms-gpt-vps-linux`;
+- registration token comes only from process environment variable `HMS_GITHUB_RUNNER_TOKEN` and is unset before external runner execution;
+- official `actions/runner` latest release is parsed with Python stdlib JSON;
+- exact Linux x64 asset name, official release namespace, positive size and SHA-256 digest are validated before extraction;
+- runner is foreground only and never installed as a service.
+
+WSL is **not automatically treated as qualified Linux** by this branch. If WSL is chosen later, the actual distro/version/runtime must independently meet the Linux runner requirements and project acceptance criteria.
+
+### Register Linux runner
+
+Inside the reviewed Linux x64 environment:
+
+```bash
+export HMS_GITHUB_RUNNER_TOKEN='<fresh repository runner registration token>'
+bash scripts/setup_self_hosted_runner_linux.sh
+```
+
+Expected registration evidence includes:
+
+```text
+registered=True
+foreground_required=True
+custom_label=hms-gpt-vps-linux
+```
+
+### Linux preflight/start
+
+```bash
+bash scripts/start_self_hosted_runner_linux.sh --check-only
+```
+
+Then, only during the frozen qualification window:
+
+```bash
+bash scripts/start_self_hosted_runner_linux.sh
+```
+
+## Activation prerequisites
+
+Before either runner is connected:
+
+1. Confirm Issue #12 remains the active blocker.
+2. Prefer first checking GitHub Billing / Metered usage / Budgets.
+3. Freeze PR #11 at the exact head intended for qualification; no further pushes while runners are online.
+4. Review `.github/workflows/ci.yml` at that exact head.
+5. Confirm the required Windows **and** Linux runner environments exist and are healthy.
+6. Create fresh repository-level registration tokens only when each runner is ready to register.
+
+Registration tokens are time-limited. Never place one in a script, `.env`, issue, commit, reusable document, or shell history file.
 
 ## Workflow activation policy
 
 Do **not** weaken `.github/workflows/ci.yml` merely to obtain a green badge.
 
-Do not commit a self-hosted selector to PR #11 until the required runners are confirmed available. When activation is actually possible, the workflow change must be one reviewed batched commit and must retain the existing test/package/native-service semantics.
+Do not commit self-hosted selectors to PR #11 until the corresponding runners are confirmed available. Any activation change must be one reviewed batched commit and must retain the existing semantics:
 
-Candidate Windows selector:
+- Linux Python 3.11 / 3.12 / 3.13
+- Windows Python 3.11 / 3.12 / 3.13
+- Windows package build + complete-tree attestation
+- native Windows SCM qualification
+
+Candidate selectors:
 
 ```yaml
-runs-on: [self-hosted, Windows, X64, hms-gpt-vps-windows]
+linux-test:
+  runs-on: [self-hosted, Linux, X64, hms-gpt-vps-linux]
+
+windows-test:
+  runs-on: [self-hosted, Windows, X64, hms-gpt-vps-windows]
 ```
 
-The current full gate also requires Linux Python 3.11/3.12/3.13. A Windows self-hosted runner alone does **not** satisfy that Linux requirement. If GitHub-hosted Linux remains unavailable because of account quota/budget, a separately reviewed Linux self-hosted execution environment is required. Do not silently drop the Linux matrix and do not treat Windows WSL as equivalent unless it is explicitly qualified as the Linux runner environment.
+The dependent Windows package/native-service jobs must use the same reviewed Windows self-hosted runner label if GitHub-hosted Windows is unavailable.
 
-No automatic WSL/Hyper-V/Linux-runner installation is performed by this fallback branch.
+Custom labels route jobs; they do not authorize code. The runner must remain offline except for the exact frozen qualification attempt.
 
 ## Failure / cleanup policy
 
-If registration fails part-way, do not rerun over the same non-empty directory. Preserve diagnostics, remove the partially registered runner through GitHub's normal runner-removal procedure if registration reached GitHub, clean only the dedicated runner root after confirming ownership, obtain a fresh registration token, then retry.
+If registration fails part-way, do not rerun over the same non-empty directory. Preserve diagnostics, remove any partially registered runner using GitHub's normal runner-removal procedure if registration reached GitHub, and clean only the dedicated runner root after confirming ownership.
 
 After qualification:
 
-1. stop the foreground runner;
-2. remove its repository registration through the normal GitHub runner-removal procedure;
-3. confirm it is no longer Online in repository Settings;
+1. stop both foreground runners;
+2. remove both repository registrations;
+3. confirm neither runner is Online in repository Settings;
 4. only then consider local runner-directory cleanup.
 
-## Real Hyper-V proof remains separate
+## Current proof boundary
 
-Even after CI runs successfully on self-hosted infrastructure, project authority remains false until a real managed Hyper-V qualification artifact proves it:
+Fallback infrastructure status remains `STAGED_NOT_EXECUTED` until the scripts are actually run on suitable Windows/Linux hosts and GitHub reports the runners Online/Idle.
+
+Even after CI succeeds, project authority remains false until a real managed Hyper-V qualification artifact proves it:
 
 - `hyperv_guest_proven=false`
 - `full_bridge_command_flow_proven=false`
 - `bootstrap_retired=false`
 - `pairing_ready=false`
 
-PR #11 must remain Draft / DO NOT MERGE until both the required CI execution and the later real guest proof gates are satisfied.
+PR #11 remains Draft / DO NOT MERGE until both the required CI execution and the later real guest proof gates are satisfied.
