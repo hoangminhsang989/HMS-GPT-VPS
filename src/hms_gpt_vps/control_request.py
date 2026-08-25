@@ -18,18 +18,48 @@ CONTROL_ACTION_SCOPES = {
     "git.status": "git.status",
     "audit.read": "audit.read",
 }
+_CONTROL_REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "request_id",
+        "instance_id",
+        "session_id",
+        "action",
+        "params",
+    }
+)
 
 
 class ControlRequestError(ValueError):
     pass
 
 
-def _validate_identifier(value: str, name: str) -> None:
-    if not value or len(value) > 128:
+def _validate_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 128:
         raise ControlRequestError(f"{name} is invalid")
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
     if any(char not in allowed for char in value):
         raise ControlRequestError(f"{name} contains unsupported characters")
+    return value
+
+
+def _validate_instance_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or len(value) > 128
+    ):
+        raise ControlRequestError("instance_id is invalid")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ControlRequestError("instance_id contains control characters")
+    return value
+
+
+def _validate_action(value: object) -> str:
+    if not isinstance(value, str) or value not in CONTROL_ACTION_SCOPES:
+        raise ControlRequestError(f"unsupported control action: {value!r}")
+    return value
 
 
 def _canonical_json(value: object) -> bytes:
@@ -58,26 +88,26 @@ class ControlRequest:
     params: Mapping[str, Any]
 
     def validate(self) -> None:
-        if self.schema_version != CONTROL_REQUEST_SCHEMA_VERSION:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != CONTROL_REQUEST_SCHEMA_VERSION
+        ):
             raise ControlRequestError(
-                f"unsupported control request schema: {self.schema_version}"
+                f"unsupported control request schema: {self.schema_version!r}"
             )
         _validate_identifier(self.request_id, "request_id")
-        if not self.instance_id.strip() or len(self.instance_id) > 128:
-            raise ControlRequestError("instance_id is invalid")
+        _validate_instance_id(self.instance_id)
         _validate_identifier(self.session_id, "session_id")
-        if self.action not in CONTROL_ACTION_SCOPES:
-            raise ControlRequestError(f"unsupported control action: {self.action}")
+        _validate_action(self.action)
         if not isinstance(self.params, Mapping):
             raise ControlRequestError("control request params must be an object")
         _canonical_json(self.to_dict(validate=False))
 
     @property
     def required_scope(self) -> str:
-        try:
-            return CONTROL_ACTION_SCOPES[self.action]
-        except KeyError as exc:
-            raise ControlRequestError(f"unsupported control action: {self.action}") from exc
+        action = _validate_action(self.action)
+        return CONTROL_ACTION_SCOPES[action]
 
     def to_dict(self, *, validate: bool = True) -> dict[str, Any]:
         if validate:
@@ -93,22 +123,36 @@ class ControlRequest:
 
     def request_sha256(self) -> str:
         self.validate()
-        return hashlib.sha256(_canonical_json(self.to_dict(validate=False))).hexdigest()
+        return hashlib.sha256(
+            _canonical_json(self.to_dict(validate=False))
+        ).hexdigest()
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ControlRequest":
-        params = payload.get("params")
+        if not isinstance(payload, Mapping):
+            raise ControlRequestError("control request must be an object")
+        if frozenset(payload.keys()) != _CONTROL_REQUEST_FIELDS:
+            raise ControlRequestError(
+                "control request fields do not match schema"
+            )
+        schema_version = payload["schema_version"]
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ControlRequestError(
+                "control request schema_version must be an integer"
+            )
+        request_id = _validate_identifier(payload["request_id"], "request_id")
+        instance_id = _validate_instance_id(payload["instance_id"])
+        session_id = _validate_identifier(payload["session_id"], "session_id")
+        action = _validate_action(payload["action"])
+        params = payload["params"]
         if not isinstance(params, Mapping):
             raise ControlRequestError("control request params must be an object")
-        schema_version = payload.get("schema_version")
-        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
-            raise ControlRequestError("control request schema_version must be an integer")
         request = cls(
             schema_version=schema_version,
-            request_id=str(payload.get("request_id", "")),
-            instance_id=str(payload.get("instance_id", "")),
-            session_id=str(payload.get("session_id", "")),
-            action=str(payload.get("action", "")),
+            request_id=request_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            action=action,
             params=dict(params),
         )
         request.validate()
