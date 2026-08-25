@@ -4,17 +4,23 @@ from collections.abc import Callable
 
 from mcp.server.auth.provider import TokenVerifier
 
+from .bridge_oauth_introspection_credential import (
+    load_protected_bridge_oauth_introspection_credential,
+)
+from .bridge_oauth_introspection_verifier import (
+    build_bridge_oauth_introspection_verifier_sync,
+)
 from .bridge_production_service_runtime import (
     BridgeProductionServiceRuntime,
     build_bridge_production_service_runtime,
-)
-from .bridge_service_config_storage import (
-    load_protected_bridge_service_runtime_config,
 )
 from .bridge_service_identity import (
     HMS_BRIDGE_SERVICE_ACCOUNT,
     prove_hms_bridge_runtime_identity,
     require_hms_bridge_service_sid,
+)
+from .bridge_service_config_storage import (
+    load_protected_bridge_service_runtime_config,
 )
 from .bridge_service_runtime_config import BridgeServiceRuntimeConfig
 from .bridge_windows_service_host import run_hms_bridge_windows_service
@@ -22,10 +28,6 @@ from .powershell import ps_literal, run_powershell_json
 
 
 class BridgeServiceEntrypointError(RuntimeError):
-    pass
-
-
-class BridgeOAuthVerifierAuthorityUnavailableError(BridgeServiceEntrypointError):
     pass
 
 
@@ -73,13 +75,17 @@ $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
 def _default_oauth_verifier_loader(
     config: BridgeServiceRuntimeConfig,
 ) -> TokenVerifier:
-    """Fail closed until a reviewed production OAuth verifier authority exists."""
+    """Load the fixed machine credential and discover the RFC 7662 verifier."""
 
     if not isinstance(config, BridgeServiceRuntimeConfig):
         raise TypeError("config must be a BridgeServiceRuntimeConfig")
     config.validate()
-    raise BridgeOAuthVerifierAuthorityUnavailableError(
-        "production OAuth token verifier authority is not provisioned"
+    credential = load_protected_bridge_oauth_introspection_credential(
+        config.mcp_issuer_url,
+    )
+    return build_bridge_oauth_introspection_verifier_sync(
+        credential,
+        config.mcp_resource_server_url,
     )
 
 
