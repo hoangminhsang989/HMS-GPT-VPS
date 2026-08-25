@@ -28,13 +28,39 @@ The service runtime config is fixed to:
 Schema version: `1`
 Maximum size: `64 KiB`
 
-The loader uses pinned regular-file reading and rejects link/reparse traversal,
-file-identity races, oversize input, invalid UTF-8, duplicate JSON keys, missing
-fields, and unknown fields.
+The parser rejects invalid UTF-8, duplicate JSON keys, missing fields, unknown
+fields, noncanonical hashes, invalid pairing/readiness bounds and path traversal
+segments.
 
 The config contains runtime identities, paths, ports and hashes only. It does
 not contain Agent HMAC secrets, the pairing-exchange key, OAuth bearer tokens,
 PowerShell Direct credentials, or the TLS private-key bytes.
+
+## Exact config storage ACL authority
+
+The service entrypoint does not use the raw parser/reader directly. Its default
+loader is `load_protected_bridge_service_runtime_config(...)`.
+
+The fixed ProgramData Bridge directory and `bridge-runtime.json` must have
+protected, non-inherited ACLs owned by `BUILTIN\Administrators` with exactly:
+
+- `SYSTEM`: FullControl;
+- `BUILTIN\Administrators`: FullControl;
+- exact `NT SERVICE\HMSBridge` SID: ReadAndExecute on the directory and Read on
+  the config file (with the canonical Windows Synchronize bit).
+
+No broad Users/Authenticated Users write path is accepted. Reparse points are
+rejected.
+
+The read-only service loader performs:
+
+`ACL/SHA proof -> pinned exact-byte read -> SHA comparison -> strict parse -> ACL/SHA re-proof`
+
+If config bytes, ACLs, owner, path authority or service SID differ across that
+boundary, startup fails closed. A separate privileged
+`provision_bridge_service_runtime_config_storage(...)` reconciler exists for
+the provisioning/controller phase; the low-privilege service path uses proof
+only.
 
 ## Network authority is not configurable
 
@@ -61,13 +87,13 @@ the deterministic `NT SERVICE\HMSBridge` SID before entering the SCM host. It
 passes a lazy runtime factory to `HmsBridgeWindowsServiceHost`.
 
 The SCM host proves the effective low-privilege service token before invoking
-that factory. The factory then re-proves identity, loads the fixed runtime
-config, loads the production OAuth verifier, converts config to the already
+that factory. The factory then re-proves identity, performs the protected fixed
+config load, loads the production OAuth verifier, converts config to the already
 reviewed production runtime types, and assembles the Bridge runtime.
 
 This preserves the authority ordering:
 
-`service SID resolve -> SCM identity proof -> fixed config -> OAuth verifier -> machine secrets -> production assembly -> listener readiness`
+`service SID resolve -> SCM identity proof -> config ACL/SHA proof -> fixed config -> OAuth verifier -> machine secrets -> production assembly -> listener readiness`
 
 ## OAuth verifier gate remains closed
 
@@ -93,10 +119,14 @@ PyInstaller entry source for the future pinned `hms-bridge.exe` artifact.
 
 ## Validation boundary
 
-Synthetic/scratch validation before publication: 9/9 focused tests PASS and
-direct Python syntax compilation PASS. These checks are not repository pytest,
-GitHub Actions, packaging execution, native Windows SCM execution, or real
-Hyper-V qualification.
+The pre-publication entrypoint/config candidate passed 9/9 synthetic focused
+checks plus direct Python syntax compilation. Additional regression tests for
+the exact config ACL/SHA sandwich are committed with this checkpoint.
+
+A later attempt to obtain an independent repository checkout for full pytest
+could not resolve `github.com` from the execution container. Therefore this
+checkpoint does **not** claim repository pytest, GitHub Actions, packaging
+execution, native Windows SCM execution, or real Hyper-V qualification.
 
 The following remain false:
 
