@@ -17,6 +17,10 @@ hms-agent = "hms_gpt_vps.cli:main"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3",
+  "mcp>=2,<3",
+]
+bridge = [
+  "mcp>=2,<3",
 ]
 package = [
   "pyinstaller==6.22.2",
