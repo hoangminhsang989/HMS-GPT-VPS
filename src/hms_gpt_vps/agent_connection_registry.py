@@ -169,9 +169,9 @@ class AgentConnectionRegistry:
             timeout=self.timeout_seconds,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 5000")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 5000")
             after_open = self._assert_authority()
             if not _same_file_identity(before, after_open):
                 raise AgentConnectionRegistryError(

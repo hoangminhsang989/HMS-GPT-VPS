@@ -145,10 +145,10 @@ class PairingStore:
             timeout=self.timeout_seconds,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
             after_open = self._assert_authority()
             if not _same_file_identity(before, after_open):
                 raise PairingStoreError("pairing-store authority changed during SQLite open")

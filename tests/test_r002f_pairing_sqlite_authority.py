@@ -7,6 +7,8 @@ import sqlite3
 
 import pytest
 
+import hms_gpt_vps.agent_connection_registry as agent_connection_registry_module
+import hms_gpt_vps.pairing_store as pairing_store_module
 from hms_gpt_vps.agent_connection_registry import (
     AgentConnectionRegistry,
     AgentConnectionRegistryError,
@@ -208,3 +210,49 @@ def test_agent_registry_path_replacement_is_rejected_between_operations(tmp_path
 
     with pytest.raises(AgentConnectionRegistryError, match="startup authority"):
         registry.get_presence("hms-01")
+
+
+class _ExplodingPragmaConnection:
+    def __init__(self) -> None:
+        self.row_factory: object | None = None
+        self.closed = False
+
+    def execute(self, statement: str, *args: object) -> object:
+        raise RuntimeError(f"forced setup failure: {statement}")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_pairing_store_closes_connection_when_pragma_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ExplodingPragmaConnection()
+    monkeypatch.setattr(
+        pairing_store_module.sqlite3,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(RuntimeError, match="forced setup failure"):
+        PairingStore(tmp_path / "pairing-cleanup.sqlite3")
+
+    assert connection.closed is True
+
+
+def test_agent_registry_closes_connection_when_pragma_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ExplodingPragmaConnection()
+    monkeypatch.setattr(
+        agent_connection_registry_module.sqlite3,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(RuntimeError, match="forced setup failure"):
+        AgentConnectionRegistry(tmp_path / "agent-cleanup.sqlite3")
+
+    assert connection.closed is True
