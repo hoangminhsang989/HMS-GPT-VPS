@@ -8,15 +8,15 @@ from .bridge_production_service_runtime import (
     BridgeProductionServiceRuntime,
     build_bridge_production_service_runtime,
 )
+from .bridge_service_config_storage import (
+    load_protected_bridge_service_runtime_config,
+)
 from .bridge_service_identity import (
     HMS_BRIDGE_SERVICE_ACCOUNT,
     prove_hms_bridge_runtime_identity,
     require_hms_bridge_service_sid,
 )
-from .bridge_service_runtime_config import (
-    BridgeServiceRuntimeConfig,
-    load_bridge_service_runtime_config,
-)
+from .bridge_service_runtime_config import BridgeServiceRuntimeConfig
 from .bridge_windows_service_host import run_hms_bridge_windows_service
 from .powershell import ps_literal, run_powershell_json
 
@@ -86,7 +86,7 @@ def _default_oauth_verifier_loader(
 def build_hms_bridge_runtime_factory(
     expected_service_sid: str,
     *,
-    config_loader: RuntimeConfigLoader = load_bridge_service_runtime_config,
+    config_loader: RuntimeConfigLoader = load_protected_bridge_service_runtime_config,
     verifier_loader: OAuthVerifierLoader = _default_oauth_verifier_loader,
 ) -> Callable[[], BridgeProductionServiceRuntime]:
     """Build a lazy factory so SCM identity proof precedes config/secret access."""
@@ -124,7 +124,7 @@ def build_hms_bridge_runtime_factory(
 def run_hms_bridge_service_entrypoint(
     *,
     sid_resolver: Callable[[], str] = resolve_hms_bridge_service_sid,
-    config_loader: RuntimeConfigLoader = load_bridge_service_runtime_config,
+    config_loader: RuntimeConfigLoader = load_protected_bridge_service_runtime_config,
     verifier_loader: OAuthVerifierLoader = _default_oauth_verifier_loader,
 ) -> None:
     """Enter SCM without accepting config paths, secrets, or auth material on argv."""
