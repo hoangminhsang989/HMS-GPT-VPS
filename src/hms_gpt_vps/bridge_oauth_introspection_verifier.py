@@ -102,7 +102,7 @@ class BridgeOAuthIntrospectionTokenVerifier(TokenVerifier):
             return None
 
     def _map_active(self, token: str, raw: Mapping[str, Any]) -> AccessToken | None:
-        if raw.get("active") is not True or raw.get("iss") != self.metadata.issuer_url:
+        if raw.get("active") is not True:
             return None
         client_id, subject = raw.get("client_id"), raw.get("sub")
         if not isinstance(client_id, str) or not client_id or len(client_id) > 512 or not isinstance(subject, str) or not subject or len(subject) > 1024:
