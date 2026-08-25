@@ -117,8 +117,6 @@ class HmsBridgeWindowsServiceHost:
                     wait_hint_ms=30_000,
                 )
             )
-            # The identity proof MUST precede any runtime factory call because
-            # the factory loads production service secrets.
             failure_code = BRIDGE_SERVICE_FAILURE_IDENTITY
             prove_hms_bridge_runtime_identity(self.expected_service_sid)
 
@@ -133,9 +131,6 @@ class HmsBridgeWindowsServiceHost:
             if self.stop.is_set():
                 self._report_stop_pending(checkpoint=2)
             else:
-                # start() returns True only after every listener owned by the
-                # runtime has proved readiness. False means SCM stop won the
-                # race before readiness and SERVICE_RUNNING must never publish.
                 failure_code = BRIDGE_SERVICE_FAILURE_RUNTIME_STARTUP
                 ready = runtime.start(self.stop)
                 if not isinstance(ready, bool):
@@ -163,8 +158,7 @@ class HmsBridgeWindowsServiceHost:
             failure_code = BRIDGE_SERVICE_FAILURE_HOST_LIFECYCLE
             self._report(AgentServiceStatus(current_state=SERVICE_STOPPED))
         except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
+            fatal_control_exception = isinstance(exc, (KeyboardInterrupt, SystemExit))
             if runtime is not None:
                 try:
                     self._report_stop_pending(checkpoint=3)
@@ -174,6 +168,8 @@ class HmsBridgeWindowsServiceHost:
                     runtime.shutdown()
                 except Exception:
                     pass
+            if fatal_control_exception:
+                raise
             if self._status_handle is not None:
                 try:
                     self._report(
