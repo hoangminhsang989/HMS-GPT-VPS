@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path, PureWindowsPath
+import stat
 import uuid
 
 from .agent_package import (
+    MAX_AGENT_MANIFEST_BYTES,
     AgentPackageManifest,
-    load_agent_package_manifest,
     verify_agent_package,
 )
 from .agent_package_manifest_artifact import (
@@ -67,6 +70,94 @@ def _path_chain_has_redirect(path: Path) -> bool:
         if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             return True
     return False
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _manifest_target_matches_opened_file(
+    path: Path,
+    opened_stat: os.stat_result,
+) -> bool:
+    if _path_chain_has_redirect(path):
+        return False
+    try:
+        current = path.stat()
+    except FileNotFoundError:
+        return False
+    return (
+        path.is_file()
+        and stat.S_ISREG(current.st_mode)
+        and _same_file_identity(opened_stat, current)
+    )
+
+
+def _load_agent_package_manifest_pinned(
+    path: Path,
+) -> tuple[AgentPackageManifest, bytes]:
+    """Read one manifest from a pinned regular file and return its exact bytes."""
+    authority = path.expanduser().absolute()
+    if _path_chain_has_redirect(authority):
+        raise ManagedAgentProvisioningError(
+            "approved Agent package manifest authority path traverses a link or reparse point"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(authority, flags)
+    except FileNotFoundError as exc:
+        raise ManagedAgentProvisioningError(
+            "approved Agent package manifest disappeared"
+        ) from exc
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest must be a regular file"
+            )
+        if not 0 < opened_stat.st_size <= MAX_AGENT_MANIFEST_BYTES:
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest size is outside supported bounds"
+            )
+        if not _manifest_target_matches_opened_file(authority, opened_stat):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest authority changed before read"
+            )
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(MAX_AGENT_MANIFEST_BYTES + 1)
+            after_read = os.fstat(handle.fileno())
+        if not _same_file_identity(opened_stat, after_read):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest opened-file identity changed"
+            )
+        if len(data) > MAX_AGENT_MANIFEST_BYTES or len(data) != after_read.st_size:
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest size changed during read"
+            )
+        if not _manifest_target_matches_opened_file(authority, opened_stat):
+            raise ManagedAgentProvisioningError(
+                "approved Agent package manifest authority changed during read"
+            )
+    finally:
+        os.close(fd)
+
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManagedAgentProvisioningError(
+            "approved Agent package manifest must be valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ManagedAgentProvisioningError(
+            "approved Agent package manifest must be a JSON object"
+        )
+    try:
+        manifest = AgentPackageManifest.from_mapping(raw)
+    except ValueError as exc:
+        raise ManagedAgentProvisioningError(
+            "approved Agent package manifest schema is invalid"
+        ) from exc
+    return manifest, data
 
 
 def _normalize_vm_id(value: object, label: str) -> str:
@@ -228,14 +319,14 @@ if ($vm.Name -ine $expectedVmName) {{
         if not self.config.package_manifest_path.is_file():
             raise ManagedAgentProvisioningError("approved Agent package manifest disappeared")
 
-        manifest = load_agent_package_manifest(self.config.package_manifest_path)
+        manifest, manifest_bytes = _load_agent_package_manifest_pinned(
+            self.config.package_manifest_path
+        )
         canonical = canonical_agent_package_manifest_bytes(manifest)
-        if self.config.package_manifest_path.read_bytes() != canonical:
+        if manifest_bytes != canonical:
             raise ManagedAgentProvisioningError(
                 "approved Agent package manifest is not canonical"
             )
-        # Check again around the reads so a redirect introduced concurrently is
-        # detected before the package can authorize a managed guest mutation.
         if _path_chain_has_redirect(self.config.package_source_root) or _path_chain_has_redirect(
             self.config.package_manifest_path
         ):
