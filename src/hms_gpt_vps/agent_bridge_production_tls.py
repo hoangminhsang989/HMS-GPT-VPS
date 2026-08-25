@@ -120,23 +120,18 @@ class AgentBridgeProductionTlsRuntime:
         self.shutdown()
 
 
-def start_agent_bridge_production_tls(
-    boundary: AgentBridgeHttpBoundary,
+def provision_agent_bridge_production_tls_prerequisites(
     config: AgentBridgeProductionTlsConfig,
     credential: PowerShellDirectCredential,
     trust_root_certificate_pem: bytes,
-) -> AgentBridgeProductionTlsRuntime:
-    """Start and qualify the exact private Hyper-V Agent Bridge TLS path.
+) -> dict[str, object]:
+    """Privileged host/guest provisioning; never starts or owns the TLS listener.
 
-    This is a fail-closed production orchestration boundary. It secures the
-    dedicated private-key storage before reading the key, verifies the exact
-    firewall authority, starts the TLS listener, publishes the pinned trust root
-    to the VMId-bound managed guest, and proves a trusted live TLS handshake from
-    that guest. It does not claim authenticated Agent transport or pairing.
+    This function is intentionally separate from the long-lived HMSBridge service.
+    It may require local administrator / Hyper-V administrator authority to reconcile
+    ACLs and firewall state and to use PowerShell Direct. It does not prove the
+    runtime service identity and it never returns a live listener object.
     """
-
-    if not isinstance(boundary, AgentBridgeHttpBoundary):
-        raise TypeError("boundary must be an AgentBridgeHttpBoundary")
     if not isinstance(config, AgentBridgeProductionTlsConfig):
         raise TypeError("config must be an AgentBridgeProductionTlsConfig")
     if not isinstance(credential, PowerShellDirectCredential):
@@ -145,6 +140,70 @@ def start_agent_bridge_production_tls(
         raise TypeError("trust_root_certificate_pem must be bytes")
     config.validate()
     credential.validate()
+
+    storage_evidence = ensure_agent_bridge_private_key_storage(config.storage)
+    if storage_evidence.get("ready") is not True:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "private-key storage provisioning did not prove readiness"
+        )
+
+    material = load_agent_bridge_tls_material(config.material)
+    material.validate()
+
+    firewall_evidence = ensure_agent_bridge_firewall(config.firewall)
+    if firewall_evidence.get("ready") is not True:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "firewall provisioning did not prove readiness"
+        )
+
+    trust_evidence = install_managed_guest_bridge_trust_root_by_id(
+        config.guest,
+        credential,
+        trust_root_certificate_pem,
+    )
+    if trust_evidence.get("present") is not True:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "managed guest trust-root provisioning did not prove readiness"
+        )
+    if trust_evidence.get("sha256") != config.guest.trust_root_der_sha256:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "managed guest trust-root provisioning returned the wrong identity"
+        )
+
+    return {
+        "private_key_storage_ready": True,
+        "private_key_storage_changed": storage_evidence["changed"],
+        "firewall_ready": True,
+        "firewall_created": firewall_evidence["created"],
+        "guest_trust_root_present": True,
+        "guest_trust_root_changed": trust_evidence["changed"],
+        "guest_trust_root_sha256": trust_evidence["sha256"],
+        "tls_material_preflight_ready": True,
+        "runtime_listener_started": False,
+        "live_managed_guest_tls_proven": False,
+        "authenticated_agent_transport_proven": False,
+        "full_bridge_command_flow_proven": False,
+        "bootstrap_retired": False,
+        "pairing_ready": False,
+    }
+
+
+def start_agent_bridge_production_tls(
+    boundary: AgentBridgeHttpBoundary,
+    config: AgentBridgeProductionTlsConfig,
+) -> AgentBridgeProductionTlsRuntime:
+    """Low-privilege HMSBridge service startup path.
+
+    No firewall mutation, PowerShell Direct, guest trust-store mutation, or guest
+    credential is accepted here. The service must already have an exact dedicated
+    service SID and an already-converged key-storage authority before it can read
+    TLS material and bind the private listener.
+    """
+    if not isinstance(boundary, AgentBridgeHttpBoundary):
+        raise TypeError("boundary must be an AgentBridgeHttpBoundary")
+    if not isinstance(config, AgentBridgeProductionTlsConfig):
+        raise TypeError("config must be an AgentBridgeProductionTlsConfig")
+    config.validate()
 
     identity_evidence = prove_agent_bridge_process_reader_identity(config.storage)
 
@@ -155,18 +214,11 @@ def start_agent_bridge_production_tls(
         )
     if storage_evidence.get("changed") is not False:
         raise AgentBridgeProductionTlsRuntimeError(
-            "production Bridge runtime must not reconcile private-key ACLs"
+            "HMSBridge service runtime must not reconcile private-key ACLs"
         )
 
     material = load_agent_bridge_tls_material(config.material)
     material.validate()
-
-    firewall_evidence = ensure_agent_bridge_firewall(config.firewall)
-    if firewall_evidence.get("ready") is not True:
-        raise AgentBridgeProductionTlsRuntimeError(
-            "firewall gate did not prove readiness"
-        )
-
     server = build_agent_bridge_tls_server(boundary, material)
     started = False
     try:
@@ -180,65 +232,21 @@ def start_agent_bridge_production_tls(
             raise AgentBridgeProductionTlsRuntimeError(
                 "production TLS listener started on the wrong authority"
             )
-
-        trust_evidence = install_managed_guest_bridge_trust_root_by_id(
-            config.guest,
-            credential,
-            trust_root_certificate_pem,
-        )
-        if trust_evidence.get("present") is not True:
-            raise AgentBridgeProductionTlsRuntimeError(
-                "managed guest trust-root gate did not prove readiness"
-            )
-
-        tls_evidence = probe_managed_guest_bridge_tls_by_id(
-            config.guest,
-            credential,
-        )
-        if tls_evidence.get("live_managed_guest_tls_proven") is not True:
-            raise AgentBridgeProductionTlsRuntimeError(
-                "live managed-guest TLS gate did not prove readiness"
-            )
-
-        # Re-read the server's own runtime bind state after the guest proof.
         current_address = getattr(server, "bound_address", None)
         if current_address != expected_address:
             raise AgentBridgeProductionTlsRuntimeError(
-                "production TLS listener authority changed during qualification"
+                "production TLS listener lost exact authority after startup"
             )
-
-        if trust_evidence.get("sha256") != config.guest.trust_root_der_sha256:
-            raise AgentBridgeProductionTlsRuntimeError(
-                "managed guest trust-root identity changed during orchestration"
-            )
-        if (
-            tls_evidence.get("server_certificate_sha256")
-            != config.material.certificate_der_sha256
-        ):
-            raise AgentBridgeProductionTlsRuntimeError(
-                "managed guest observed the wrong production TLS certificate"
-            )
-
         evidence: dict[str, object] = {
             "bridge_process_sid_proven": True,
             "bridge_process_sid": identity_evidence["process_sid"],
             "private_key_storage_ready": True,
-            "private_key_storage_changed": storage_evidence["changed"],
-            "firewall_ready": True,
-            "firewall_created": firewall_evidence["created"],
+            "private_key_storage_changed": False,
             "tls_listener_started": True,
             "tls_listener_host": expected_address[0],
             "tls_listener_port": expected_address[1],
-            "guest_trust_root_present": True,
-            "guest_trust_root_changed": trust_evidence["changed"],
-            "guest_trust_root_sha256": trust_evidence["sha256"],
-            "live_managed_guest_tls_proven": True,
-            "server_certificate_sha256": tls_evidence[
-                "server_certificate_sha256"
-            ],
-            "vm_id": tls_evidence["vm_id"],
-            "bridge_origin": tls_evidence["bridge_origin"],
-            # R002F proof boundary remains closed until later tranches.
+            "privileged_provisioning_performed_by_runtime": False,
+            "live_managed_guest_tls_proven": False,
             "authenticated_agent_transport_proven": False,
             "full_bridge_command_flow_proven": False,
             "bootstrap_retired": False,
@@ -255,6 +263,82 @@ def start_agent_bridge_production_tls(
                 server.shutdown()
             except Exception as shutdown_exc:
                 raise AgentBridgeProductionTlsRuntimeError(
-                    "production TLS qualification failed and listener shutdown also failed"
+                    "production TLS startup failed and listener shutdown also failed"
                 ) from shutdown_exc
         raise
+
+
+def qualify_agent_bridge_production_tls(
+    config: AgentBridgeProductionTlsConfig,
+    credential: PowerShellDirectCredential,
+    trust_root_certificate_pem: bytes,
+) -> dict[str, object]:
+    """Privileged live qualification of an already-running HMSBridge listener.
+
+    The caller is an external provisioning/qualification controller, not the
+    low-privilege service process. It re-proves the firewall and exact guest trust
+    root, then performs the VMId-bound trusted TLS handshake against the running
+    listener.
+    """
+    if not isinstance(config, AgentBridgeProductionTlsConfig):
+        raise TypeError("config must be an AgentBridgeProductionTlsConfig")
+    if not isinstance(credential, PowerShellDirectCredential):
+        raise TypeError("credential must be a PowerShellDirectCredential")
+    if not isinstance(trust_root_certificate_pem, bytes):
+        raise TypeError("trust_root_certificate_pem must be bytes")
+    config.validate()
+    credential.validate()
+
+    firewall_evidence = ensure_agent_bridge_firewall(config.firewall)
+    if firewall_evidence.get("ready") is not True:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "qualification firewall gate did not prove readiness"
+        )
+
+    trust_evidence = install_managed_guest_bridge_trust_root_by_id(
+        config.guest,
+        credential,
+        trust_root_certificate_pem,
+    )
+    if trust_evidence.get("present") is not True:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "qualification guest trust-root gate did not prove readiness"
+        )
+    if trust_evidence.get("sha256") != config.guest.trust_root_der_sha256:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "qualification guest trust-root identity differs from authority"
+        )
+
+    tls_evidence = probe_managed_guest_bridge_tls_by_id(
+        config.guest,
+        credential,
+    )
+    if tls_evidence.get("live_managed_guest_tls_proven") is not True:
+        raise AgentBridgeProductionTlsRuntimeError(
+            "live managed-guest TLS qualification did not prove readiness"
+        )
+    if (
+        tls_evidence.get("server_certificate_sha256")
+        != config.material.certificate_der_sha256
+    ):
+        raise AgentBridgeProductionTlsRuntimeError(
+            "managed guest observed the wrong production TLS certificate"
+        )
+
+    return {
+        "firewall_ready": True,
+        "firewall_created": firewall_evidence["created"],
+        "guest_trust_root_present": True,
+        "guest_trust_root_changed": trust_evidence["changed"],
+        "guest_trust_root_sha256": trust_evidence["sha256"],
+        "live_managed_guest_tls_proven": True,
+        "server_certificate_sha256": tls_evidence[
+            "server_certificate_sha256"
+        ],
+        "vm_id": tls_evidence["vm_id"],
+        "bridge_origin": tls_evidence["bridge_origin"],
+        "authenticated_agent_transport_proven": False,
+        "full_bridge_command_flow_proven": False,
+        "bootstrap_retired": False,
+        "pairing_ready": False,
+    }
