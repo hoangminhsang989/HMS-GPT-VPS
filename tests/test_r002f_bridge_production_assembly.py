@@ -131,6 +131,7 @@ def test_production_assembly_wires_exact_shared_authorities(
     assert assembly.principal_pairing.exchange is assembly.pairing_exchange
     assert assembly.agent_bridge.registry is assembly.presence_registry
     assert assembly.agent_bridge.commands is assembly.command_store
+    assert assembly.agent_http.service is assembly.agent_bridge
     assert assembly.gateway.session_store is assembly.session_store
     assert assembly.gateway.idempotency_store is assembly.idempotency_store
     assert (

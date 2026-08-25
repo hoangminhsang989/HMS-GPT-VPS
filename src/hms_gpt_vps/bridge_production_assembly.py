@@ -7,6 +7,7 @@ from pathlib import Path
 from mcp.server import MCPServer
 from mcp.server.auth.provider import TokenVerifier
 
+from .agent_bridge_http_boundary import AgentBridgeHttpBoundary
 from .agent_bridge_service import (
     AgentBridgeService,
     CommandCredentialResolver,
@@ -245,6 +246,7 @@ class BridgeProductionAssembly:
     presence_registry: AgentConnectionRegistry
     command_store: AgentCommandStore
     agent_bridge: AgentBridgeService
+    agent_http: AgentBridgeHttpBoundary
     readiness: PairingReadinessRuntime
     principal_pairing: PrincipalPairingService
     idempotency_store: IdempotencyStore
@@ -293,6 +295,7 @@ def assemble_production_bridge(
         dependencies.request_credential_resolver,
         dependencies.command_credential_resolver,
     )
+    agent_http = AgentBridgeHttpBoundary(agent_bridge)
 
     readiness = PairingReadinessRuntime(
         PairingReadinessConfig(
@@ -351,6 +354,7 @@ def assemble_production_bridge(
         presence_registry=presence_registry,
         command_store=command_store,
         agent_bridge=agent_bridge,
+        agent_http=agent_http,
         readiness=readiness,
         principal_pairing=principal_pairing,
         idempotency_store=idempotency_store,
