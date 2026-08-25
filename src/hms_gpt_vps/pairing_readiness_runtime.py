@@ -326,6 +326,7 @@ class PairingReadinessRuntime:
         )
 
     def current_pairing_link(self) -> str:
+        self._require_pairing_state()
         now = self._now()
         self._presence(now)
         lease = self.lease_store.load()

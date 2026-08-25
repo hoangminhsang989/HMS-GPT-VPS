@@ -280,3 +280,11 @@ def test_pairing_issue_requires_post_secret_cleanup_state(tmp_path: Path) -> Non
     provision.transition(instance_id="hms-01", state=ProvisionState.AGENT_HEALTHY)
     with pytest.raises(Exception, match="INSTALL_SECRETS_CLEARED|PAIRING_PENDING"):
         runtime.issue()
+
+
+def test_current_copy_link_is_hidden_outside_pairing_states(tmp_path: Path) -> None:
+    runtime, provision, _pairing, _lease, _secret = build_runtime(tmp_path)
+    runtime.issue()
+    provision.transition(instance_id="hms-01", state=ProvisionState.READY)
+    with pytest.raises(Exception, match="INSTALL_SECRETS_CLEARED|PAIRING_PENDING"):
+        runtime.current_pairing_link()
