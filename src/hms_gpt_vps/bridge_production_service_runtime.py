@@ -290,9 +290,7 @@ class BridgeProductionServiceRuntime:
 
             self._started = True
             return True
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
+        except BaseException:
             try:
                 self.shutdown()
             except Exception as shutdown_exc:
@@ -350,6 +348,9 @@ class BridgeProductionServiceRuntime:
                 self._stop_mcp_server(server, thread)
             except BaseException as exc:
                 first_error = exc
+
+        if self._mcp_error and first_error is None:
+            first_error = self._mcp_error[0]
 
         try:
             if tls_runtime is not None:
