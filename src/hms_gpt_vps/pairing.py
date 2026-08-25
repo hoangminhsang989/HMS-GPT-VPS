@@ -22,6 +22,19 @@ PAIRABLE_SCOPES = frozenset(
         "audit.read",
     }
 )
+_PAIRING_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "pair_id",
+        "instance_id",
+        "token_sha256",
+        "scopes",
+        "issued_at",
+        "expires_at",
+        "consumed_at",
+        "revoked_at",
+    }
+)
 
 
 class PairingError(ValueError):
@@ -53,7 +66,7 @@ def utc_now() -> datetime:
 
 
 def _require_aware_utc(value: datetime, name: str) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise PairingError(f"{name} must be timezone-aware")
     return value.astimezone(timezone.utc)
 
@@ -78,27 +91,35 @@ def _parse_iso(value: object, name: str) -> datetime | None:
 
 
 def _validate_scope(scope: str) -> None:
-    if scope not in PAIRABLE_SCOPES:
+    if not isinstance(scope, str) or scope not in PAIRABLE_SCOPES:
         raise PairingError(f"unsupported pairing scope: {scope}")
 
 
 def _normalize_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
-    values = tuple(sorted(set(scopes)))
-    if not values:
+    if isinstance(scopes, (str, bytes)):
+        raise PairingError("pairing scopes must be an iterable of scope strings")
+    try:
+        supplied = tuple(scopes)
+    except TypeError as exc:
+        raise PairingError("pairing scopes must be iterable") from exc
+    if not supplied:
         raise PairingError("at least one pairing scope is required")
+    if any(not isinstance(scope, str) for scope in supplied):
+        raise PairingError("pairing scopes must contain only strings")
+    values = tuple(sorted(set(supplied)))
     for scope in values:
         _validate_scope(scope)
     return values
 
 
 def _token_digest(token: str) -> str:
-    if not token:
+    if not isinstance(token, str) or not token:
         raise PairingTokenMismatchError("pairing token is required")
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _validate_pair_id(pair_id: str) -> None:
-    if not pair_id or len(pair_id) > 128:
+    if not isinstance(pair_id, str) or not pair_id or len(pair_id) > 128:
         raise PairingError("pair_id is invalid")
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
     if any(char not in allowed for char in pair_id):
@@ -106,6 +127,8 @@ def _validate_pair_id(pair_id: str) -> None:
 
 
 def _validate_bridge_base_url(base_url: str) -> str:
+    if not isinstance(base_url, str) or not base_url:
+        raise PairingError("pairing bridge URL is required")
     parsed = urlsplit(base_url)
     if parsed.scheme != "https":
         raise PairingError("pairing bridge URL must use HTTPS")
@@ -132,17 +155,25 @@ class PairingRecord:
     revoked_at: datetime | None = None
 
     def validate(self) -> None:
-        if self.schema_version != PAIRING_SCHEMA_VERSION:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != PAIRING_SCHEMA_VERSION
+        ):
             raise PairingError(f"unsupported pairing schema: {self.schema_version}")
         _validate_pair_id(self.pair_id)
-        if not self.instance_id.strip():
+        if not isinstance(self.instance_id, str) or not self.instance_id.strip():
             raise PairingError("instance_id is required")
-        if len(self.token_sha256) != 64:
-            raise PairingError("token_sha256 must contain 64 hex characters")
-        try:
-            int(self.token_sha256, 16)
-        except ValueError as exc:
-            raise PairingError("token_sha256 must be hexadecimal") from exc
+        if (
+            not isinstance(self.token_sha256, str)
+            or len(self.token_sha256) != 64
+            or self.token_sha256 != self.token_sha256.lower()
+        ):
+            raise PairingError("token_sha256 must be canonical lowercase SHA-256")
+        if any(char not in "0123456789abcdef" for char in self.token_sha256):
+            raise PairingError("token_sha256 must be canonical lowercase SHA-256")
+        if not isinstance(self.scopes, tuple):
+            raise PairingError("pairing scopes must be a tuple")
         normalized = _normalize_scopes(self.scopes)
         if normalized != self.scopes:
             raise PairingError("pairing scopes must be unique and sorted")
@@ -184,23 +215,45 @@ class PairingRecord:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PairingRecord":
-        scopes_raw = payload.get("scopes")
-        if not isinstance(scopes_raw, list) or not all(isinstance(item, str) for item in scopes_raw):
-            raise PairingError("pairing scopes must be a list of strings")
-        issued_at = _parse_iso(payload.get("issued_at"), "issued_at")
-        expires_at = _parse_iso(payload.get("expires_at"), "expires_at")
+        if not isinstance(payload, dict):
+            raise PairingError("pairing record must be a JSON object")
+        if any(not isinstance(key, str) for key in payload):
+            raise PairingError("pairing record keys must be strings")
+        if frozenset(payload) != _PAIRING_RECORD_FIELDS:
+            raise PairingError("pairing record fields do not match schema")
+
+        schema_version = payload["schema_version"]
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise PairingError("schema_version must be a JSON integer")
+        pair_id = payload["pair_id"]
+        instance_id = payload["instance_id"]
+        token_sha256 = payload["token_sha256"]
+        if not isinstance(pair_id, str):
+            raise PairingError("pair_id must be a JSON string")
+        if not isinstance(instance_id, str):
+            raise PairingError("instance_id must be a JSON string")
+        if not isinstance(token_sha256, str):
+            raise PairingError("token_sha256 must be a JSON string")
+        scopes_raw = payload["scopes"]
+        if not isinstance(scopes_raw, list) or not scopes_raw or any(
+            not isinstance(item, str) for item in scopes_raw
+        ):
+            raise PairingError("pairing scopes must be a non-empty list of strings")
+
+        issued_at = _parse_iso(payload["issued_at"], "issued_at")
+        expires_at = _parse_iso(payload["expires_at"], "expires_at")
         if issued_at is None or expires_at is None:
             raise PairingError("issued_at and expires_at are required")
         record = cls(
-            schema_version=int(payload.get("schema_version", -1)),
-            pair_id=str(payload.get("pair_id", "")),
-            instance_id=str(payload.get("instance_id", "")),
-            token_sha256=str(payload.get("token_sha256", "")),
+            schema_version=schema_version,
+            pair_id=pair_id,
+            instance_id=instance_id,
+            token_sha256=token_sha256,
             scopes=tuple(scopes_raw),
             issued_at=issued_at,
             expires_at=expires_at,
-            consumed_at=_parse_iso(payload.get("consumed_at"), "consumed_at"),
-            revoked_at=_parse_iso(payload.get("revoked_at"), "revoked_at"),
+            consumed_at=_parse_iso(payload["consumed_at"], "consumed_at"),
+            revoked_at=_parse_iso(payload["revoked_at"], "revoked_at"),
         )
         record.validate()
         return record
@@ -221,12 +274,17 @@ def issue_pairing_grant(
     now: datetime | None = None,
     ttl_seconds: int = DEFAULT_PAIR_TTL_SECONDS,
 ) -> PairingGrant:
-    if not instance_id.strip():
+    if not isinstance(instance_id, str) or not instance_id.strip():
         raise PairingError("instance_id is required")
-    if not (60 <= ttl_seconds <= MAX_PAIR_TTL_SECONDS):
-        raise PairingError("pairing TTL must be between 60 and 1800 seconds")
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or not 60 <= ttl_seconds <= MAX_PAIR_TTL_SECONDS
+    ):
+        raise PairingError("pairing TTL must be an integer between 60 and 1800 seconds")
     issued_at = _require_aware_utc(now or utc_now(), "now")
     normalized_scopes = _normalize_scopes(scopes)
+    base = _validate_bridge_base_url(bridge_base_url)
     pair_id = secrets.token_urlsafe(16)
     token = secrets.token_urlsafe(PAIR_TOKEN_BYTES)
     record = PairingRecord(
@@ -239,7 +297,6 @@ def issue_pairing_grant(
         expires_at=issued_at + timedelta(seconds=ttl_seconds),
     )
     record.validate()
-    base = _validate_bridge_base_url(bridge_base_url)
     pair_path = f"{base}/pair/{quote(pair_id, safe='')}"
     pairing_link = f"{pair_path}#token={quote(token, safe='-_')}"
     return PairingGrant(record=record, token=token, pairing_link=pairing_link)
@@ -254,7 +311,7 @@ def verify_pairing_token(
 ) -> None:
     record.validate()
     checked_at = _require_aware_utc(now or utc_now(), "now")
-    if instance_id != record.instance_id:
+    if not isinstance(instance_id, str) or instance_id != record.instance_id:
         raise PairingTokenMismatchError("pairing instance mismatch")
     if record.revoked_at is not None:
         raise PairingRevokedError("pairing grant is revoked")

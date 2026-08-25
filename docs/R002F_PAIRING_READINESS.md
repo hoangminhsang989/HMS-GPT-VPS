@@ -81,10 +81,20 @@ pairing authority.
 
 This tranche deliberately does **not** claim production pairing proof yet.
 
-Before production qualification, independently review/harden:
+The follow-up SQLite-authority revision in this branch additionally hardens:
 
-- `PairingStore` SQLite lexical path / symlink-junction-reparse authority;
-- `AgentConnectionRegistry` SQLite lexical path and stored-row type exactness;
+- `PairingRecord` parsing to exact schema/type semantics with no `int()`/`str()`
+  coercion of stored authority;
+- `PairingStore` to preserve lexical database authority, reject
+  symlink/junction/reparse redirects, pin the startup database file identity
+  across later operations, reject malformed/duplicate stored JSON, and use
+  bounded exact timeout configuration;
+- `AgentConnectionRegistry` with the same lexical/stable database identity
+  discipline plus exact stored presence types, finite timestamps and epoch
+  validation.
+
+Before production qualification, remaining work includes:
+
 - Bridge HTTP endpoint assembly for `/pair/<pair_id>` and control-session
   exchange;
 - real Agent -> Bridge HTTPS connectivity on a managed Hyper-V guest;
