@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bootstrap_retirement import detach_answer_iso, retire_bootstrap_guest
+from .bootstrap_retirement import (
+    _path_chain_has_redirect,
+    _require_answer_iso_authority,
+    detach_answer_iso_by_id as detach_answer_iso,
+    retire_bootstrap_guest_by_id as retire_bootstrap_guest,
+)
 from .install_artifacts import TextSecretStore, clear_install_secrets
+from .instance_registry import InstanceRegistry
 from .powershell_direct import PowerShellDirectCredential
 from .provision_state import ProvisionRecord, ProvisionState, ProvisionStateStore
 
@@ -21,23 +27,36 @@ class PostInstallFinalizationConfig:
     answer_iso: Path
     answer_iso_sha256: str
     runtime_dir: Path
+    registry_path: Path
 
     def validate(self) -> None:
-        if not self.instance_id.strip():
+        if not isinstance(self.instance_id, str) or not self.instance_id.strip():
             raise ValueError("instance_id is required")
-        if not self.vm_name.strip():
+        if not isinstance(self.vm_name, str) or not self.vm_name.strip():
             raise ValueError("vm_name is required")
-        if not self.bootstrap_username.strip():
+        if not isinstance(self.bootstrap_username, str) or not self.bootstrap_username.strip():
             raise ValueError("bootstrap_username is required")
-        if len(self.answer_iso_sha256) != 64:
+        if not isinstance(self.answer_iso_sha256, str) or len(self.answer_iso_sha256) != 64:
             raise ValueError("answer_iso_sha256 must contain 64 hex characters")
         try:
             int(self.answer_iso_sha256, 16)
         except ValueError as exc:
             raise ValueError("answer_iso_sha256 must be hexadecimal") from exc
 
-        runtime = self.runtime_dir.expanduser().resolve()
-        answer = self.answer_iso.expanduser().resolve()
+        registry = self.registry_path.expanduser().absolute()
+        if _path_chain_has_redirect(registry):
+            raise ValueError(
+                "instance registry path must not traverse a link or reparse point"
+            )
+        if not registry.is_file():
+            raise FileNotFoundError("instance registry does not exist")
+
+        runtime = self.runtime_dir.expanduser().absolute()
+        if _path_chain_has_redirect(runtime):
+            raise ValueError(
+                "managed runtime directory must not traverse a link or reparse point"
+            )
+        answer = _require_answer_iso_authority(self.answer_iso)
         try:
             answer.relative_to(runtime)
         except ValueError as exc:
@@ -56,7 +75,10 @@ class PostInstallFinalizationRuntime:
 
     Media detach and local secret cleanup are host-side idempotent operations and
     can be retried safely after crash because both have exact managed targets and
-    postcondition checks.
+    postcondition checks. Credential retirement and answer-media detach are both
+    bound to the stable Hyper-V VMId loaded from the durable InstanceRegistry;
+    caller-supplied VM identity is not trusted. VM name is only a secondary
+    consistency check and never the sole mutation authority.
     """
 
     def __init__(
@@ -69,6 +91,7 @@ class PostInstallFinalizationRuntime:
         self.config = config
         self.store = ProvisionStateStore(state_path)
         self.secret_store = secret_store
+        self.registry = InstanceRegistry(config.registry_path)
 
     def current(self) -> ProvisionRecord:
         record = self.store.load()
@@ -78,12 +101,39 @@ class PostInstallFinalizationRuntime:
             raise PostInstallStateError("provision state belongs to another instance")
         return record
 
+    def _expected_vm_id(self) -> str:
+        if _path_chain_has_redirect(self.config.registry_path):
+            raise PostInstallStateError(
+                "instance registry authority path traverses a link or reparse point"
+            )
+        record = self.registry.get(self.config.instance_id)
+        if record is None:
+            raise PostInstallStateError(
+                "managed instance registry record is missing for post-install finalization"
+            )
+        if record.backend != "hyperv":
+            raise PostInstallStateError(
+                "managed instance registry backend is not Hyper-V"
+            )
+        if record.vm_name.casefold() != self.config.vm_name.casefold():
+            raise PostInstallStateError(
+                "managed instance registry VM name does not match post-install finalization"
+            )
+        if record.vm_id is None:
+            raise PostInstallStateError(
+                "managed instance registry does not contain a stable VMId"
+            )
+        # InstanceRegistry validates VMId as canonical lowercase GUID text when
+        # loading VMRecord. Return exactly those persisted bytes as authority.
+        return record.vm_id
+
     def retire_bootstrap(self, credential: PowerShellDirectCredential) -> ProvisionRecord:
         current = self.current()
         if current.state is not ProvisionState.AGENT_HEALTHY:
             raise PostInstallStateError(
                 "bootstrap retirement requires AGENT_HEALTHY checkpoint"
             )
+        expected_vm_id = self._expected_vm_id()
 
         self.store.transition_checked(
             instance_id=self.config.instance_id,
@@ -93,6 +143,7 @@ class PostInstallFinalizationRuntime:
         )
         try:
             result = retire_bootstrap_guest(
+                expected_vm_id,
                 self.config.vm_name,
                 credential,
                 self.config.bootstrap_username,
@@ -109,7 +160,7 @@ class PostInstallFinalizationRuntime:
             )
             raise
 
-        if not bool(result.get("retired", False)):
+        if result.get("retired") is not True:
             self.store.transition(
                 instance_id=self.config.instance_id,
                 state=ProvisionState.BOOTSTRAP_RETIRING,
@@ -144,8 +195,13 @@ class PostInstallFinalizationRuntime:
             raise PostInstallStateError(
                 "answer-media detach requires BOOTSTRAP_RETIRED checkpoint"
             )
-        result = detach_answer_iso(self.config.vm_name, self.config.answer_iso)
-        if not bool(result.get("detached", False)):
+        expected_vm_id = self._expected_vm_id()
+        result = detach_answer_iso(
+            expected_vm_id,
+            self.config.vm_name,
+            self.config.answer_iso,
+        )
+        if result.get("detached") is not True:
             raise PostInstallStateError("answer-media detach postcondition failed")
         return self.store.transition_checked(
             instance_id=self.config.instance_id,
@@ -167,7 +223,8 @@ class PostInstallFinalizationRuntime:
             expected_sha256=self.config.answer_iso_sha256,
             runtime_dir=self.config.runtime_dir,
         )
-        if self.config.answer_iso.expanduser().resolve().exists():
+        answer_authority = _require_answer_iso_authority(self.config.answer_iso)
+        if answer_authority.exists():
             raise PostInstallStateError("managed answer ISO still exists after cleanup")
 
         try:

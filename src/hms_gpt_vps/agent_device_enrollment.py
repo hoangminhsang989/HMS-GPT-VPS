@@ -23,6 +23,9 @@ _MAX_ENROLLMENT_PAYLOAD_BYTES = 4096
 _SAFE_IDENTIFIER_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 )
+_ENROLLMENT_RESULT_KEYS = frozenset(
+    {"ready", "created", "instance_id", "device_id", "credential_path"}
+)
 
 
 class AgentDeviceEnrollmentError(RuntimeError):
@@ -56,8 +59,13 @@ class AgentDeviceEnrollmentResult:
     def validate(self) -> None:
         _validate_identifier(self.instance_id, "instance_id")
         _validate_identifier(self.device_id, "device_id")
-        if not self.credential_path.strip():
+        if not isinstance(self.credential_path, str) or not self.credential_path.strip():
             raise ValueError("credential_path is required")
+        path = PureWindowsPath(self.credential_path)
+        if not path.is_absolute():
+            raise ValueError("credential_path must be an absolute Windows path")
+        if any(part in {".", ".."} for part in path.parts):
+            raise ValueError("credential_path must not contain relative traversal")
 
 
 def _validate_identifier(value: str, name: str) -> None:
@@ -88,9 +96,6 @@ def load_or_create_bridge_credential(
     try:
         return store.save_create_only(candidate)
     except (AgentDeviceCredentialConflictError, AgentDeviceCredentialIntegrityError):
-        # A concurrent publisher can win with a different generated device_id.
-        # Reload only by instance_id. Corruption/wrong-instance still fails
-        # closed because load() will raise the integrity error again.
         return store.load(expected_instance_id=instance_id)
 
 
@@ -152,6 +157,23 @@ function Test-HmsIdentifier([string]$Value) {{
     $Value -match '^[A-Za-z0-9_-]+$'
 }}
 
+function Test-HmsJsonInteger($Value) {{
+  if ($null -eq $Value) {{ return $false }}
+  $type = $Value.GetType()
+  return $type -eq [sbyte] -or
+    $type -eq [byte] -or
+    $type -eq [int16] -or
+    $type -eq [uint16] -or
+    $type -eq [int32] -or
+    $type -eq [uint32] -or
+    $type -eq [int64] -or
+    $type -eq [uint64]
+}}
+
+function Assert-HmsJsonString($Value, [string]$Label) {{
+  if ($Value -isnot [string]) {{ throw "$Label must be a JSON string" }}
+}}
+
 function Read-HmsStoredCredential {{
   if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf)) {{
     return $null
@@ -179,12 +201,17 @@ function Read-HmsStoredCredential {{
   if (($storedFields -join ',') -ne 'device_id,instance_id,protection_scope,schema_version,secret_b64') {{
     throw 'Agent device credential fields do not match schema'
   }}
-  if ([int]$stored.schema_version -ne $schemaVersion) {{ throw 'Agent device credential schema mismatch' }}
-  if ([string]$stored.protection_scope -ne 'local-machine') {{ throw 'Agent device credential scope mismatch' }}
-  if (-not (Test-HmsIdentifier ([string]$stored.instance_id))) {{ throw 'Stored instance_id is invalid' }}
-  if (-not (Test-HmsIdentifier ([string]$stored.device_id))) {{ throw 'Stored device_id is invalid' }}
+  if (-not (Test-HmsJsonInteger $stored.schema_version)) {{ throw 'Agent device credential schema_version must be a JSON integer' }}
+  if ($stored.schema_version -ne $schemaVersion) {{ throw 'Agent device credential schema mismatch' }}
+  Assert-HmsJsonString $stored.protection_scope 'Agent device credential protection_scope'
+  Assert-HmsJsonString $stored.instance_id 'Stored instance_id'
+  Assert-HmsJsonString $stored.device_id 'Stored device_id'
+  Assert-HmsJsonString $stored.secret_b64 'Stored secret_b64'
+  if ($stored.protection_scope -ne 'local-machine') {{ throw 'Agent device credential scope mismatch' }}
+  if (-not (Test-HmsIdentifier $stored.instance_id)) {{ throw 'Stored instance_id is invalid' }}
+  if (-not (Test-HmsIdentifier $stored.device_id)) {{ throw 'Stored device_id is invalid' }}
   try {{
-    $storedSecret = [System.Convert]::FromBase64String([string]$stored.secret_b64)
+    $storedSecret = [System.Convert]::FromBase64String($stored.secret_b64)
   }} catch {{
     throw 'Stored Agent device secret is not valid base64'
   }}
@@ -195,13 +222,14 @@ function Read-HmsStoredCredential {{
 
 function Assert-HmsCredentialMatch($Stored, [string]$InstanceId, [string]$DeviceId, [string]$SecretB64) {{
   if ($null -eq $Stored) {{ throw 'Agent device credential is missing after publication' }}
-  if ([string]$Stored.instance_id -ne $InstanceId) {{ throw 'Existing Agent device credential instance conflict' }}
-  if ([string]$Stored.device_id -ne $DeviceId) {{ throw 'Existing Agent device credential device conflict' }}
-  if ([string]$Stored.secret_b64 -ne $SecretB64) {{ throw 'Existing Agent device credential secret conflict' }}
+  if ($Stored.instance_id -ne $InstanceId) {{ throw 'Existing Agent device credential instance conflict' }}
+  if ($Stored.device_id -ne $DeviceId) {{ throw 'Existing Agent device credential device conflict' }}
+  if ($Stored.secret_b64 -ne $SecretB64) {{ throw 'Existing Agent device credential secret conflict' }}
 }}
 
 try {{
   $payloadBytes = [System.Convert]::FromBase64String($PayloadB64)
+  if ($payloadBytes.Length -gt {_MAX_ENROLLMENT_PAYLOAD_BYTES}) {{ throw 'Agent enrollment payload exceeds limit' }}
   $payload = [System.Text.Encoding]::UTF8.GetString($payloadBytes) | ConvertFrom-Json -ErrorAction Stop
 }} finally {{
   $PayloadB64 = $null
@@ -211,10 +239,14 @@ $payloadFields = @($payload.PSObject.Properties.Name | Sort-Object)
 if (($payloadFields -join ',') -ne 'device_id,instance_id,schema_version,secret_b64') {{
   throw 'Agent enrollment payload fields do not match schema'
 }}
-if ([int]$payload.schema_version -ne $schemaVersion) {{ throw 'Agent enrollment payload schema mismatch' }}
-$instanceId = [string]$payload.instance_id
-$deviceId = [string]$payload.device_id
-$secretB64 = [string]$payload.secret_b64
+if (-not (Test-HmsJsonInteger $payload.schema_version)) {{ throw 'Agent enrollment payload schema_version must be a JSON integer' }}
+if ($payload.schema_version -ne $schemaVersion) {{ throw 'Agent enrollment payload schema mismatch' }}
+Assert-HmsJsonString $payload.instance_id 'Enrollment instance_id'
+Assert-HmsJsonString $payload.device_id 'Enrollment device_id'
+Assert-HmsJsonString $payload.secret_b64 'Enrollment secret_b64'
+$instanceId = $payload.instance_id
+$deviceId = $payload.device_id
+$secretB64 = $payload.secret_b64
 if (-not (Test-HmsIdentifier $instanceId)) {{ throw 'Enrollment instance_id is invalid' }}
 if (-not (Test-HmsIdentifier $deviceId)) {{ throw 'Enrollment device_id is invalid' }}
 if ($instanceId -ne $expectedInstance) {{ throw 'Enrollment instance_id does not match managed instance' }}
@@ -305,6 +337,10 @@ try {{
 """.strip()
 
 
+def _same_windows_path(left: str, right: str) -> bool:
+    return str(PureWindowsPath(left)).casefold() == str(PureWindowsPath(right)).casefold()
+
+
 def enroll_agent_device(
     vm_name: str,
     bootstrap_credential: PowerShellDirectCredential,
@@ -315,7 +351,14 @@ def enroll_agent_device(
 ) -> AgentDeviceEnrollmentResult:
     """Enroll one stable Agent transport identity into the Windows guest."""
     config.validate()
+    bootstrap_credential.validate()
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
+        raise ValueError("timeout_seconds must be an integer")
+    if not 1 <= timeout_seconds <= 600:
+        raise ValueError("timeout_seconds must be between 1 and 600")
+
     credential = load_or_create_bridge_credential(bridge_store, config.instance_id)
+    credential.validate()
     payload = _build_enrollment_payload(credential)
     guest_result = run_vm_powershell_json(
         vm_name,
@@ -324,15 +367,33 @@ def enroll_agent_device(
         timeout_seconds=timeout_seconds,
         secret_payload=payload,
     )
-    if not bool(guest_result.get("ready", False)):
+    if not isinstance(guest_result, dict):
+        raise AgentDeviceEnrollmentError("guest Agent enrollment result must be an object")
+    if frozenset(guest_result) != _ENROLLMENT_RESULT_KEYS:
+        raise AgentDeviceEnrollmentError("guest Agent enrollment result schema mismatch")
+    if guest_result["ready"] is not True:
         raise AgentDeviceEnrollmentError("guest Agent device enrollment postcondition failed")
-    if guest_result.get("instance_id") != credential.instance_id:
+    if not isinstance(guest_result["created"], bool):
+        raise AgentDeviceEnrollmentError("guest Agent enrollment created evidence must be boolean")
+    instance_id = guest_result["instance_id"]
+    device_id = guest_result["device_id"]
+    if not isinstance(instance_id, str) or instance_id != credential.instance_id:
         raise AgentDeviceEnrollmentError("guest Agent enrollment returned wrong instance_id")
-    if guest_result.get("device_id") != credential.device_id:
+    if not isinstance(device_id, str) or device_id != credential.device_id:
         raise AgentDeviceEnrollmentError("guest Agent enrollment returned wrong device_id")
-    credential_path = guest_result.get("credential_path")
+    credential_path = guest_result["credential_path"]
     if not isinstance(credential_path, str) or not credential_path.strip():
         raise AgentDeviceEnrollmentError("guest Agent enrollment returned invalid credential path")
+    expected_credential_path = str(
+        PureWindowsPath(config.guest_state_path) / GUEST_DEVICE_CREDENTIAL_FILENAME
+    )
+    if not PureWindowsPath(credential_path).is_absolute() or not _same_windows_path(
+        credential_path,
+        expected_credential_path,
+    ):
+        raise AgentDeviceEnrollmentError(
+            "guest Agent enrollment returned credential path outside managed authority"
+        )
     result = AgentDeviceEnrollmentResult(
         instance_id=credential.instance_id,
         device_id=credential.device_id,

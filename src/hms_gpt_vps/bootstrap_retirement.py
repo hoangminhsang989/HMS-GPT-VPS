@@ -1,13 +1,23 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
+from pathlib import Path, PureWindowsPath
+import uuid
 
 from .powershell import ps_literal, run_powershell_json
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_RETIRE_RESULT_KEYS = frozenset({
+    "retired", "bootstrap_user", "account_disabled", "autologon_disabled",
+    "default_password_absent", "removed_unattend_count",
+})
+_DETACH_RESULT_KEYS = frozenset({"detached", "answer_iso"})
+_DETACH_BY_ID_RESULT_KEYS = frozenset({"detached", "answer_iso", "vm_id"})
+
 
 def _validate_bootstrap_username(username: str) -> None:
-    if not username.strip():
+    if not isinstance(username, str) or not username.strip():
         raise ValueError("bootstrap username is required")
     if len(username) > 20:
         raise ValueError("bootstrap username is too long")
@@ -16,15 +26,119 @@ def _validate_bootstrap_username(username: str) -> None:
         raise ValueError("bootstrap username contains unsupported characters")
 
 
-def build_retire_bootstrap_guest_script(username: str) -> str:
-    """Build the final credentialed guest action for the bootstrap account.
+def _validate_timeout_seconds(timeout_seconds: int) -> None:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
+        raise ValueError("timeout_seconds must be an integer")
+    if not 1 <= timeout_seconds <= 600:
+        raise ValueError("timeout_seconds must be between 1 and 600")
 
-    The account is disabled, not deleted. AutoLogon password residue is removed,
-    and only cached unattend files that actually mention the managed bootstrap
-    username are deleted. The caller must durably record the successful result
-    before clearing host-side DPAPI state because this action invalidates the
-    credential used by PowerShell Direct.
-    """
+
+def _normalize_vm_id(vm_id: str) -> str:
+    if not isinstance(vm_id, str) or not vm_id.strip():
+        raise ValueError("managed VMId is required")
+    try:
+        canonical = str(uuid.UUID(vm_id.strip())).lower()
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("managed VMId must be a valid GUID") from exc
+    if vm_id != canonical:
+        raise ValueError("managed VMId must use canonical lowercase GUID form")
+    return canonical
+
+
+def _lexical_absolute(path: Path) -> Path:
+    return path.expanduser().absolute()
+
+
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = _lexical_absolute(path)
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
+
+
+def _require_answer_iso_authority(answer_iso: Path) -> Path:
+    authority = _lexical_absolute(answer_iso)
+    if authority.suffix.lower() != ".iso":
+        raise ValueError("managed answer media must use .iso extension")
+    if _path_chain_has_redirect(authority):
+        raise ValueError("managed answer ISO path must not traverse a link or reparse point")
+    return authority
+
+
+def _same_windows_path(left: str, right: Path) -> bool:
+    return str(PureWindowsPath(left)).casefold() == str(
+        PureWindowsPath(str(_lexical_absolute(right)))
+    ).casefold()
+
+
+def _validate_retirement_result(result: object, *, expected_username: str) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise RuntimeError("bootstrap guest retirement result must be an object")
+    if frozenset(result) != _RETIRE_RESULT_KEYS:
+        raise RuntimeError("bootstrap guest retirement result schema is invalid")
+    if result["retired"] is not True:
+        raise RuntimeError("bootstrap guest retirement postcondition failed")
+    if result["bootstrap_user"] != expected_username:
+        raise RuntimeError("bootstrap guest retirement user differs from authority")
+    for key in ("account_disabled", "autologon_disabled", "default_password_absent"):
+        if result[key] is not True:
+            raise RuntimeError(f"bootstrap guest retirement did not prove exact {key}")
+    removed_count = result["removed_unattend_count"]
+    if isinstance(removed_count, bool) or not isinstance(removed_count, int) or not 0 <= removed_count <= 3:
+        raise RuntimeError("bootstrap guest retirement removed_unattend_count is invalid")
+    return result
+
+
+def _validate_detach_result(result: object, *, expected_answer_iso: Path) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise RuntimeError("managed answer ISO detach result must be an object")
+    if frozenset(result) != _DETACH_RESULT_KEYS:
+        raise RuntimeError("managed answer ISO detach result schema is invalid")
+    if result["detached"] is not True:
+        raise RuntimeError("managed answer ISO detach postcondition failed")
+    observed_answer = result["answer_iso"]
+    if not isinstance(observed_answer, str) or not _same_windows_path(observed_answer, expected_answer_iso):
+        raise RuntimeError("managed answer ISO detach path differs from authority")
+    return result
+
+
+def _validate_detach_by_id_result(
+    result: object,
+    *,
+    expected_answer_iso: Path,
+    expected_vm_id: str,
+) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise RuntimeError("managed answer ISO VMId-bound detach result must be an object")
+    if frozenset(result) != _DETACH_BY_ID_RESULT_KEYS:
+        raise RuntimeError("managed answer ISO VMId-bound detach result schema is invalid")
+    if result["detached"] is not True:
+        raise RuntimeError("managed answer ISO VMId-bound detach postcondition failed")
+    observed_answer = result["answer_iso"]
+    if not isinstance(observed_answer, str) or not _same_windows_path(observed_answer, expected_answer_iso):
+        raise RuntimeError("managed answer ISO VMId-bound detach path differs from authority")
+    observed_vm_id = result["vm_id"]
+    if not isinstance(observed_vm_id, str) or observed_vm_id != expected_vm_id:
+        raise RuntimeError("managed answer ISO detach VMId differs from authority")
+    return result
+
+
+def build_retire_bootstrap_guest_script(username: str) -> str:
+    """Build the final credentialed guest action for the bootstrap account."""
     _validate_bootstrap_username(username)
     user = ps_literal(username)
     return f"""
@@ -90,22 +204,51 @@ def retire_bootstrap_guest(
     *,
     timeout_seconds: int = 90,
 ) -> dict[str, object]:
+    if not isinstance(vm_name, str) or not vm_name.strip():
+        raise ValueError("VM name is required")
+    credential.validate()
+    _validate_bootstrap_username(username)
+    _validate_timeout_seconds(timeout_seconds)
     result = run_vm_powershell_json(
         vm_name,
         credential,
         build_retire_bootstrap_guest_script(username),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("retired", False)):
-        raise RuntimeError("bootstrap guest retirement postcondition failed")
-    return result
+    return _validate_retirement_result(result, expected_username=username)
+
+
+def retire_bootstrap_guest_by_id(
+    vm_id: str,
+    vm_name: str,
+    credential: PowerShellDirectCredential,
+    username: str,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    """Retire the bootstrap credential through a stable Hyper-V VMId binding."""
+    managed_vm_id = _normalize_vm_id(vm_id)
+    if not isinstance(vm_name, str) or not vm_name.strip():
+        raise ValueError("VM name is required")
+    credential.validate()
+    _validate_bootstrap_username(username)
+    _validate_timeout_seconds(timeout_seconds)
+    result = run_vm_powershell_json(
+        vm_name,
+        credential,
+        build_retire_bootstrap_guest_script(username),
+        timeout_seconds=timeout_seconds,
+        vm_id=managed_vm_id,
+    )
+    return _validate_retirement_result(result, expected_username=username)
 
 
 def build_detach_answer_iso_script(vm_name: str, answer_iso: Path) -> str:
-    if not vm_name.strip():
+    if not isinstance(vm_name, str) or not vm_name.strip():
         raise ValueError("VM name is required")
+    answer_authority = _require_answer_iso_authority(answer_iso)
     vm = ps_literal(vm_name)
-    iso = ps_literal(answer_iso.expanduser().resolve())
+    iso = ps_literal(answer_authority)
     return f"""
 $ErrorActionPreference = 'Stop'
 $vmName = {vm}
@@ -123,11 +266,69 @@ $remaining = @(Get-VMDvdDrive -VMName $vmName -ErrorAction Stop | Where-Object {
 """.strip()
 
 
-def detach_answer_iso(vm_name: str, answer_iso: Path) -> dict[str, object]:
+def build_detach_answer_iso_by_id_script(vm_id: str, vm_name: str, answer_iso: Path) -> str:
+    managed_vm_id = _normalize_vm_id(vm_id)
+    if not isinstance(vm_name, str) or not vm_name.strip():
+        raise ValueError("VM name is required")
+    answer_authority = _require_answer_iso_authority(answer_iso)
+    vm = ps_literal(vm_name)
+    iso = ps_literal(answer_authority)
+    vm_id_literal = ps_literal(managed_vm_id)
+    return f"""
+$ErrorActionPreference = 'Stop'
+$vmId = [guid]{vm_id_literal}
+$expectedVmName = {vm}
+$answerIso = {iso}
+$managedVm = Get-VM -Id $vmId -ErrorAction Stop
+if ($managedVm.Name -ine $expectedVmName) {{
+  throw 'Persisted Hyper-V VMId resolves to a different VM name during answer-media detach'
+}}
+$matches = @(Get-VMDvdDrive -VM $managedVm -ErrorAction Stop | Where-Object {{ $_.Path -eq $answerIso }})
+if ($matches.Count -gt 1) {{ throw 'multiple DVD drives reference the managed answer ISO' }}
+if ($matches.Count -eq 1) {{
+  Set-VMDvdDrive -VMDvdDrive $matches[0] -Path $null -ErrorAction Stop
+}}
+$remaining = @(Get-VMDvdDrive -VM $managedVm -ErrorAction Stop | Where-Object {{ $_.Path -eq $answerIso }})
+[pscustomobject]@{{
+  detached = [bool]($remaining.Count -eq 0)
+  answer_iso = $answerIso
+  vm_id = $managedVm.Id.ToString().ToLowerInvariant()
+}}
+""".strip()
+
+
+def detach_answer_iso(
+    vm_name: str,
+    answer_iso: Path,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    _validate_timeout_seconds(timeout_seconds)
+    answer_authority = _require_answer_iso_authority(answer_iso)
     result = run_powershell_json(
-        build_detach_answer_iso_script(vm_name, answer_iso),
-        timeout_seconds=90,
+        build_detach_answer_iso_script(vm_name, answer_authority),
+        timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("detached", False)):
-        raise RuntimeError("managed answer ISO detach postcondition failed")
-    return result
+    return _validate_detach_result(result, expected_answer_iso=answer_authority)
+
+
+def detach_answer_iso_by_id(
+    vm_id: str,
+    vm_name: str,
+    answer_iso: Path,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    """Detach managed answer media from the exact persisted Hyper-V VM object."""
+    managed_vm_id = _normalize_vm_id(vm_id)
+    _validate_timeout_seconds(timeout_seconds)
+    answer_authority = _require_answer_iso_authority(answer_iso)
+    result = run_powershell_json(
+        build_detach_answer_iso_by_id_script(managed_vm_id, vm_name, answer_authority),
+        timeout_seconds=timeout_seconds,
+    )
+    return _validate_detach_by_id_result(
+        result,
+        expected_answer_iso=answer_authority,
+        expected_vm_id=managed_vm_id,
+    )

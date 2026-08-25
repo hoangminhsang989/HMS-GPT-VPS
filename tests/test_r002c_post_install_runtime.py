@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from hms_gpt_vps import post_install_runtime as runtime_module
+from hms_gpt_vps.instance_registry import InstanceRegistry, VMRecord
 from hms_gpt_vps.post_install_runtime import (
     PostInstallFinalizationConfig,
     PostInstallFinalizationRuntime,
@@ -19,6 +20,9 @@ from hms_gpt_vps.provisioning import (
     ProvisioningOrchestrator,
 )
 from hms_gpt_vps.windows_provisioner import HyperVHostState, WindowsVMConfig
+
+
+_MANAGED_VM_ID = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
 
 
 class MemorySecretStore:
@@ -62,6 +66,17 @@ def finalization_config(tmp_path: Path, payload: bytes = b"answer-media") -> tup
     runtime.mkdir(exist_ok=True)
     answer = runtime / "hms-answer.iso"
     answer.write_bytes(payload)
+    registry_path = tmp_path / "instances.json"
+    InstanceRegistry(registry_path).upsert(
+        VMRecord(
+            instance_id="hms-01",
+            vm_name="HMS-GPT-VPS",
+            backend="hyperv",
+            phase="agent_healthy",
+            workspace_path=r"C:\HMS-Workspace",
+            vm_id=_MANAGED_VM_ID,
+        )
+    )
     config = PostInstallFinalizationConfig(
         instance_id="hms-01",
         vm_name="HMS-GPT-VPS",
@@ -69,6 +84,7 @@ def finalization_config(tmp_path: Path, payload: bytes = b"answer-media") -> tup
         answer_iso=answer,
         answer_iso_sha256=hashlib.sha256(payload).hexdigest(),
         runtime_dir=runtime,
+        registry_path=registry_path,
     )
     return config, answer
 
