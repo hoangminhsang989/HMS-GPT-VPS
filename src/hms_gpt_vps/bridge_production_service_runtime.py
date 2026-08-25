@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Event, Thread
 import time
 from typing import Any, Callable, Protocol
@@ -141,6 +141,16 @@ class BridgeProductionServiceRuntime:
     config: BridgeProductionServiceRuntimeConfig
     assembly: BridgeProductionAssembly
     mcp_server_factory: McpAsgiServerFactory = _default_mcp_asgi_server_factory
+    _tls_runtime: AgentBridgeProductionTlsRuntime | None = field(
+        init=False, default=None, repr=False
+    )
+    _mcp_thread: Thread | None = field(init=False, default=None, repr=False)
+    _mcp_server: McpAsgiServer | None = field(init=False, default=None, repr=False)
+    _mcp_error: list[BaseException] = field(
+        init=False, default_factory=list, repr=False
+    )
+    _started: bool = field(init=False, default=False, repr=False)
+    _closed: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, BridgeProductionServiceRuntimeConfig):
@@ -154,6 +164,10 @@ class BridgeProductionServiceRuntime:
             raise BridgeProductionServiceRuntimeError(
                 "Bridge assembly config differs from service runtime authority"
             )
+
+    @property
+    def ready(self) -> bool:
+        return self._started and not self._closed
 
     def _stop_mcp_server(
         self,
@@ -170,27 +184,34 @@ class BridgeProductionServiceRuntime:
                 "MCP ASGI server thread did not stop within bounded shutdown"
             )
 
-    def run(self, stop: Event) -> None:
+    def start(self, stop: Event) -> bool:
+        """Start all owned listeners and return True only after exact readiness."""
+
         if not isinstance(stop, Event):
             raise TypeError("stop must be a threading.Event")
         self.config.validate()
+        if self._closed:
+            raise BridgeProductionServiceRuntimeError(
+                "production Bridge runtime is already closed"
+            )
+        if self._started or any(
+            value is not None
+            for value in (self._tls_runtime, self._mcp_thread, self._mcp_server)
+        ):
+            raise BridgeProductionServiceRuntimeError(
+                "production Bridge runtime is already starting or started"
+            )
         if stop.is_set():
-            return
+            return False
 
-        # Re-prove the effective token at the last possible boundary before any
-        # listener starts. The service host and dependency loader also prove it.
         prove_hms_bridge_runtime_identity(self.config.expected_service_sid)
-
-        tls_runtime: AgentBridgeProductionTlsRuntime | None = None
-        mcp_thread: Thread | None = None
-        mcp_server: McpAsgiServer | None = None
-        mcp_error: list[BaseException] = []
 
         try:
             tls_runtime = start_agent_bridge_production_tls(
                 self.assembly.agent_http,
                 self.config.tls,
             )
+            self._tls_runtime = tls_runtime
             expected_tls = (
                 self.config.tls.firewall.network.gateway,
                 self.config.tls.firewall.port,
@@ -210,67 +231,152 @@ class BridgeProductionServiceRuntime:
                     raise BridgeProductionServiceRuntimeError(
                         "MCP ASGI server factory returned an invalid server"
                     )
+            self._mcp_server = mcp_server
+            self._mcp_error.clear()
 
             def run_mcp() -> None:
                 try:
                     mcp_server.run()
                 except BaseException as exc:
-                    mcp_error.append(exc)
+                    self._mcp_error.append(exc)
 
             mcp_thread = Thread(
                 target=run_mcp,
                 name="HMSBridgeMCP",
                 daemon=False,
             )
+            self._mcp_thread = mcp_thread
             mcp_thread.start()
 
             deadline = time.monotonic() + self.config.startup_timeout_seconds
             while not bool(mcp_server.started):
-                if mcp_error:
+                if self._mcp_error:
                     raise BridgeProductionServiceRuntimeError(
                         "MCP ASGI server failed during startup"
-                    ) from mcp_error[0]
+                    ) from self._mcp_error[0]
                 if not mcp_thread.is_alive():
                     raise BridgeProductionServiceRuntimeError(
                         "MCP ASGI server exited before startup completed"
                     )
                 if stop.is_set():
-                    self._stop_mcp_server(mcp_server, mcp_thread)
-                    return
+                    self.shutdown()
+                    return False
                 if time.monotonic() >= deadline:
                     raise BridgeProductionServiceRuntimeError(
                         "MCP ASGI server did not report startup within bounded time"
                     )
                 stop.wait(0.05)
 
-            while not stop.wait(0.20):
-                if mcp_error:
-                    raise BridgeProductionServiceRuntimeError(
-                        "MCP ASGI server failed while service was running"
-                    ) from mcp_error[0]
-                if not mcp_thread.is_alive():
-                    raise BridgeProductionServiceRuntimeError(
-                        "MCP ASGI server exited before SCM stop"
-                    )
-
-            self._stop_mcp_server(mcp_server, mcp_thread)
-            if mcp_error:
+            if self._mcp_error:
                 raise BridgeProductionServiceRuntimeError(
-                    "MCP ASGI server raised during shutdown"
-                ) from mcp_error[0]
-        finally:
-            if mcp_server is not None and mcp_thread is not None and mcp_thread.is_alive():
-                try:
-                    self._stop_mcp_server(mcp_server, mcp_thread)
-                except Exception:
-                    if tls_runtime is not None:
-                        try:
-                            tls_runtime.shutdown()
-                        finally:
-                            tls_runtime = None
-                    raise
+                    "MCP ASGI server failed at readiness boundary"
+                ) from self._mcp_error[0]
+            if not mcp_thread.is_alive():
+                raise BridgeProductionServiceRuntimeError(
+                    "MCP ASGI server exited before SCM readiness completed"
+                )
+            if stop.is_set():
+                self.shutdown()
+                return False
+            if tls_runtime.bound_address != expected_tls:
+                raise BridgeProductionServiceRuntimeError(
+                    "production Agent TLS authority changed before readiness"
+                )
+
+            prove_hms_bridge_runtime_identity(self.config.expected_service_sid)
+            if stop.is_set():
+                self.shutdown()
+                return False
+
+            self._started = True
+            return True
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            try:
+                self.shutdown()
+            except Exception as shutdown_exc:
+                raise BridgeProductionServiceRuntimeError(
+                    "production Bridge startup failed and shutdown also failed"
+                ) from shutdown_exc
+            raise
+
+    def wait(self, stop: Event) -> None:
+        """Remain healthy until SCM stop; fail closed on listener loss."""
+
+        if not isinstance(stop, Event):
+            raise TypeError("stop must be a threading.Event")
+        if not self.ready:
+            raise BridgeProductionServiceRuntimeError(
+                "production Bridge runtime is not ready"
+            )
+        mcp_thread = self._mcp_thread
+        tls_runtime = self._tls_runtime
+        if mcp_thread is None or tls_runtime is None:
+            raise BridgeProductionServiceRuntimeError(
+                "production Bridge runtime lost owned listener state"
+            )
+        expected_tls = (
+            self.config.tls.firewall.network.gateway,
+            self.config.tls.firewall.port,
+        )
+
+        while not stop.wait(0.20):
+            if self._mcp_error:
+                raise BridgeProductionServiceRuntimeError(
+                    "MCP ASGI server failed while service was running"
+                ) from self._mcp_error[0]
+            if not mcp_thread.is_alive():
+                raise BridgeProductionServiceRuntimeError(
+                    "MCP ASGI server exited before SCM stop"
+                )
+            if tls_runtime.bound_address != expected_tls:
+                raise BridgeProductionServiceRuntimeError(
+                    "production Agent TLS listener lost exact authority"
+                )
+
+    def shutdown(self) -> None:
+        """Idempotently stop MCP then TLS, never leaving TLS behind on failure."""
+
+        if self._closed:
+            return
+        first_error: BaseException | None = None
+        server = self._mcp_server
+        thread = self._mcp_thread
+        tls_runtime = self._tls_runtime
+
+        if server is not None and thread is not None and thread.is_alive():
+            try:
+                self._stop_mcp_server(server, thread)
+            except BaseException as exc:
+                first_error = exc
+
+        try:
             if tls_runtime is not None:
                 tls_runtime.shutdown()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            self._mcp_server = None
+            self._mcp_thread = None
+            self._tls_runtime = None
+            self._started = False
+            self._closed = True
+
+        if first_error is not None:
+            raise BridgeProductionServiceRuntimeError(
+                "production Bridge runtime shutdown failed"
+            ) from first_error
+
+    def run(self, stop: Event) -> None:
+        """Compatibility wrapper for direct callers; SCM uses start/wait/shutdown."""
+
+        try:
+            if self.start(stop):
+                self.wait(stop)
+        finally:
+            self.shutdown()
 
 
 def build_bridge_production_service_runtime(
@@ -285,8 +391,6 @@ def build_bridge_production_service_runtime(
         raise TypeError("oauth_token_verifier must implement verify_token")
     config.validate()
 
-    # First gate: no secret loader or assembly construction under a privileged or
-    # otherwise unexpected host token.
     prove_hms_bridge_runtime_identity(config.expected_service_sid)
 
     secret_dependencies: BridgeServiceSecretDependencies = (
@@ -306,8 +410,6 @@ def build_bridge_production_service_runtime(
         production_dependencies,
     )
 
-    # Second gate: fail closed if assembly construction crossed an unexpected
-    # identity boundary before the service runtime object can be published.
     prove_hms_bridge_runtime_identity(config.expected_service_sid)
 
     return BridgeProductionServiceRuntime(
