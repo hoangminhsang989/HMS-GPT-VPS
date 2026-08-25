@@ -7,7 +7,6 @@ import pytest
 import hms_gpt_vps.bridge_service_entrypoint as entry_module
 from hms_gpt_vps.bridge_cli import build_parser
 from hms_gpt_vps.bridge_service_entrypoint import (
-    BridgeOAuthVerifierAuthorityUnavailableError,
     _default_oauth_verifier_loader,
     build_hms_bridge_runtime_factory,
     resolve_hms_bridge_service_sid,
@@ -103,8 +102,6 @@ def test_service_entrypoint_passes_lazy_factory_before_config_read(
         events.append("host")
         assert expected_service_sid == _SERVICE_SID
         assert callable(runtime_factory)
-        # Deliberately do not invoke the factory: this proves entrypoint setup
-        # itself does not read fixed runtime config or secrets.
 
     monkeypatch.setattr(
         entry_module,
@@ -120,13 +117,31 @@ def test_service_entrypoint_passes_lazy_factory_before_config_read(
     assert events == ["sid", "host"]
 
 
-def test_default_oauth_verifier_loader_fails_closed(tmp_path: Path) -> None:
+def test_default_oauth_verifier_loader_uses_protected_machine_credential_then_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _config(tmp_path)
-    with pytest.raises(
-        BridgeOAuthVerifierAuthorityUnavailableError,
-        match="not provisioned",
-    ):
-        _default_oauth_verifier_loader(config)
+    events: list[object] = []
+    credential = object()
+    verifier = _Verifier()
+    monkeypatch.setattr(
+        entry_module,
+        "load_protected_bridge_oauth_introspection_credential",
+        lambda issuer: events.append(("credential", issuer)) or credential,
+    )
+    monkeypatch.setattr(
+        entry_module,
+        "build_bridge_oauth_introspection_verifier_sync",
+        lambda observed, resource: (
+            events.append(("verifier", observed, resource)) or verifier
+        ),
+    )
+    assert _default_oauth_verifier_loader(config) is verifier
+    assert events == [
+        ("credential", config.mcp_issuer_url),
+        ("verifier", credential, config.mcp_resource_server_url),
+    ]
 
 
 def test_service_sid_resolver_requires_exact_virtual_account_evidence(
