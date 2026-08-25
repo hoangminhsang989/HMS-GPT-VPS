@@ -21,6 +21,9 @@ from hms_gpt_vps.provisioning import (
 from hms_gpt_vps.windows_provisioner import HyperVHostState, WindowsVMConfig
 
 
+_MANAGED_VM_ID = "11111111-1111-1111-1111-111111111111"
+
+
 class MemorySecretStore:
     def __init__(self, value: str = "protected-bootstrap") -> None:
         self.value: str | None = value
@@ -69,6 +72,7 @@ def finalization_config(tmp_path: Path, payload: bytes = b"answer-media") -> tup
         answer_iso=answer,
         answer_iso_sha256=hashlib.sha256(payload).hexdigest(),
         runtime_dir=runtime,
+        vm_id=_MANAGED_VM_ID,
     )
     return config, answer
 
