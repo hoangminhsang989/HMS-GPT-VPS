@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 hms-agent = "hms_gpt_vps.cli:main"
+hms-bridge = "hms_gpt_vps.bridge_cli:main"
 
 [project.optional-dependencies]
 dev = [
