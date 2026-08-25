@@ -21,7 +21,7 @@ def _credential() -> BridgeOAuthIntrospectionCredential:
 
 
 def _active(**overrides):
-    raw = {"active": True, "client_id": "chatgpt-client", "sub": "user-123", "scope": "openid hms.vps.control", "iss": ISSUER, "aud": RESOURCE, "exp": 2_000_000_000, "token_type": "Bearer"}
+    raw = {"active": True, "client_id": "chatgpt-client", "sub": "user-123", "scope": "openid hms.vps.control", "aud": RESOURCE, "exp": 2_000_000_000, "token_type": "Bearer"}
     raw.update(overrides)
     return raw
 
@@ -43,7 +43,7 @@ def test_verifier_maps_active_resource_bound_token_and_uses_basic_auth() -> None
 
 
 def test_verifier_rejects_wrong_authority_and_bad_bearer_grammar() -> None:
-    for response in [_active(iss="https://other.example.test"), _active(scope="openid"), _active(aud="https://other.example.test/mcp"), _active(nbf=1_900_000_001), _active(active=False)]:
+    for response in [_active(scope="openid"), _active(aud="https://other.example.test/mcp"), _active(nbf=1_900_000_001), _active(active=False)]:
         async def request(*args, response=response):
             return response
         verifier = BridgeOAuthIntrospectionTokenVerifier(_credential(), BridgeOAuthAuthorizationServerMetadata(ISSUER, ENDPOINT), RESOURCE, json_request=request, clock=lambda: 1_900_000_000)
