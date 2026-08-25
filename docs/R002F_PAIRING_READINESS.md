@@ -140,3 +140,56 @@ pairing-to-session exchange semantics.
 
 All source and regression checks performed while staging this revision are
 static/synthetic unless an actual project CI run is cited separately.
+
+## Strict HTTP pairing boundary
+
+R002F now stages a transport-agnostic HTTP boundary for the pairing exchange.
+It deliberately does **not** open an Internet-facing plain-HTTP socket. A later
+TLS deployment/relay layer must terminate HTTPS and pass only bounded request
+bytes into this service.
+
+The endpoint contract is:
+
+- method: `POST`;
+- path: exact canonical `/pair/<pair_id>`;
+- request media type: `application/json` or
+  `application/json; charset=utf-8`;
+- body: exact strict JSON, maximum 4096 bytes;
+- fields: exactly `schema_version`, `pair_token`, `client_nonce`;
+- `schema_version`: exact integer `1`, never boolean/coerced;
+- `pair_token`: bounded non-empty string;
+- `client_nonce`: bounded URL-safe string used by the existing crash-recovery
+  exchange contract;
+- no `Transfer-Encoding`; `Content-Length` must be present, canonical and match
+  the exact body bytes.
+
+The HTTP request body and headers are secret-bearing and are excluded from
+dataclass repr output. HTTP error responses contain only static error codes and
+never reflect pairing tokens, nonces, database paths or backend exception text.
+All responses use `Cache-Control: no-store` and `Pragma: no-cache`.
+
+Before exchange, the adapter requires `PairingReadinessRuntime.observe()` to
+prove fresh authenticated Agent presence, `pairing_ready=true`, and the exact
+requested `pair_id`. The exchange uses the same readiness-runtime clock
+authority. After the atomic pairing-to-session commit, the adapter re-observes
+and releases the initial session credential only if fresh presence still proves
+`pairing_ready=true`, `paired=true`, and the same `pair_id`.
+
+A lost success response may be retried with the same pairing token and same
+client nonce within the existing 60-second exchange recovery window. A
+different nonce, stale Agent presence, wrong pair identity or wrong token fails
+closed without returning a session secret.
+
+The outer HTTPS listener/relay remains responsible for bounding header sizes and
+checking `Content-Length` **before** reading an untrusted network body. This
+staged adapter alone is not evidence of a deployed public HTTPS endpoint.
+
+Therefore this tranche still does not claim:
+
+- a real public Bridge endpoint;
+- real ChatGPT copy/paste pairing;
+- real managed-guest end-to-end command flow;
+- production `pairing_ready=true`.
+
+Those claims require actual TLS deployment plus managed Hyper-V qualification
+and remain false until separately proven.
