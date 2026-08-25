@@ -69,7 +69,7 @@ def _path_chain_has_redirect(path: Path) -> bool:
     return False
 
 
-def _normalize_vm_id(value: str, label: str) -> str:
+def _normalize_vm_id(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ManagedAgentProvisioningError(f"{label} is missing")
     try:
@@ -188,7 +188,16 @@ if ($vm.Name -ine $expectedVmName) {{
 """.strip(),
             timeout_seconds=30,
         )
-        observed_vm_id = _normalize_vm_id(str(result.get("vm_id", "")), "observed VMId")
+        if frozenset(result) != frozenset({"vm_id", "vm_name"}):
+            raise ManagedAgentProvisioningError(
+                "observed Hyper-V VM identity evidence schema is invalid"
+            )
+        observed_vm_id_raw = result.get("vm_id")
+        observed_vm_id = _normalize_vm_id(observed_vm_id_raw, "observed VMId")
+        if observed_vm_id_raw != observed_vm_id:
+            raise ManagedAgentProvisioningError(
+                "observed Hyper-V VMId is not canonical lowercase GUID text"
+            )
         observed_vm_name = result.get("vm_name")
         if observed_vm_id != expected_vm_id:
             raise ManagedAgentProvisioningError(
