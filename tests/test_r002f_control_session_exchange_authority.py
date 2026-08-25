@@ -90,7 +90,7 @@ def test_control_session_rejects_unknown_field_and_uppercase_digest() -> None:
         ControlSessionRecord.from_dict(payload)
 
     payload = canonical_session_record().to_dict()
-    payload["token_sha256"] = str(payload["token_sha256"]).upper()
+    payload["token_sha256"] = "A" * 64
     with pytest.raises(ControlSessionError, match="lowercase"):
         ControlSessionRecord.from_dict(payload)
 
