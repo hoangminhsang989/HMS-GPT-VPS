@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
+from pathlib import Path, PureWindowsPath
 
 from .powershell import ps_literal, run_powershell_json
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_RETIRE_RESULT_KEYS = frozenset({
+    "retired", "bootstrap_user", "account_disabled", "autologon_disabled",
+    "default_password_absent", "removed_unattend_count",
+})
+_DETACH_RESULT_KEYS = frozenset({"detached", "answer_iso"})
+
 
 def _validate_bootstrap_username(username: str) -> None:
-    if not username.strip():
+    if not isinstance(username, str) or not username.strip():
         raise ValueError("bootstrap username is required")
     if len(username) > 20:
         raise ValueError("bootstrap username is too long")
@@ -16,15 +24,86 @@ def _validate_bootstrap_username(username: str) -> None:
         raise ValueError("bootstrap username contains unsupported characters")
 
 
-def build_retire_bootstrap_guest_script(username: str) -> str:
-    """Build the final credentialed guest action for the bootstrap account.
+def _validate_timeout_seconds(timeout_seconds: int) -> None:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
+        raise ValueError("timeout_seconds must be an integer")
+    if not 1 <= timeout_seconds <= 600:
+        raise ValueError("timeout_seconds must be between 1 and 600")
 
-    The account is disabled, not deleted. AutoLogon password residue is removed,
-    and only cached unattend files that actually mention the managed bootstrap
-    username are deleted. The caller must durably record the successful result
-    before clearing host-side DPAPI state because this action invalidates the
-    credential used by PowerShell Direct.
-    """
+
+def _lexical_absolute(path: Path) -> Path:
+    return path.expanduser().absolute()
+
+
+def _path_chain_has_redirect(path: Path) -> bool:
+    chain: list[Path] = []
+    current = _lexical_absolute(path)
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        if candidate.is_symlink():
+            return True
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(stat_result, "st_file_attributes", 0))
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
+
+
+def _require_answer_iso_authority(answer_iso: Path) -> Path:
+    authority = _lexical_absolute(answer_iso)
+    if authority.suffix.lower() != ".iso":
+        raise ValueError("managed answer media must use .iso extension")
+    if _path_chain_has_redirect(authority):
+        raise ValueError("managed answer ISO path must not traverse a link or reparse point")
+    return authority
+
+
+def _same_windows_path(left: str, right: Path) -> bool:
+    return str(PureWindowsPath(left)).casefold() == str(
+        PureWindowsPath(str(_lexical_absolute(right)))
+    ).casefold()
+
+
+def _validate_retirement_result(result: object, *, expected_username: str) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise RuntimeError("bootstrap guest retirement result must be an object")
+    if frozenset(result) != _RETIRE_RESULT_KEYS:
+        raise RuntimeError("bootstrap guest retirement result schema is invalid")
+    if result["retired"] is not True:
+        raise RuntimeError("bootstrap guest retirement postcondition failed")
+    if result["bootstrap_user"] != expected_username:
+        raise RuntimeError("bootstrap guest retirement user differs from authority")
+    for key in ("account_disabled", "autologon_disabled", "default_password_absent"):
+        if result[key] is not True:
+            raise RuntimeError(f"bootstrap guest retirement did not prove exact {key}")
+    removed_count = result["removed_unattend_count"]
+    if isinstance(removed_count, bool) or not isinstance(removed_count, int) or not 0 <= removed_count <= 3:
+        raise RuntimeError("bootstrap guest retirement removed_unattend_count is invalid")
+    return result
+
+
+def _validate_detach_result(result: object, *, expected_answer_iso: Path) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise RuntimeError("managed answer ISO detach result must be an object")
+    if frozenset(result) != _DETACH_RESULT_KEYS:
+        raise RuntimeError("managed answer ISO detach result schema is invalid")
+    if result["detached"] is not True:
+        raise RuntimeError("managed answer ISO detach postcondition failed")
+    observed_answer = result["answer_iso"]
+    if not isinstance(observed_answer, str) or not _same_windows_path(observed_answer, expected_answer_iso):
+        raise RuntimeError("managed answer ISO detach path differs from authority")
+    return result
+
+
+def build_retire_bootstrap_guest_script(username: str) -> str:
+    """Build the final credentialed guest action for the bootstrap account."""
     _validate_bootstrap_username(username)
     user = ps_literal(username)
     return f"""
@@ -90,22 +169,26 @@ def retire_bootstrap_guest(
     *,
     timeout_seconds: int = 90,
 ) -> dict[str, object]:
+    if not isinstance(vm_name, str) or not vm_name.strip():
+        raise ValueError("VM name is required")
+    credential.validate()
+    _validate_bootstrap_username(username)
+    _validate_timeout_seconds(timeout_seconds)
     result = run_vm_powershell_json(
         vm_name,
         credential,
         build_retire_bootstrap_guest_script(username),
         timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("retired", False)):
-        raise RuntimeError("bootstrap guest retirement postcondition failed")
-    return result
+    return _validate_retirement_result(result, expected_username=username)
 
 
 def build_detach_answer_iso_script(vm_name: str, answer_iso: Path) -> str:
-    if not vm_name.strip():
+    if not isinstance(vm_name, str) or not vm_name.strip():
         raise ValueError("VM name is required")
+    answer_authority = _require_answer_iso_authority(answer_iso)
     vm = ps_literal(vm_name)
-    iso = ps_literal(answer_iso.expanduser().resolve())
+    iso = ps_literal(answer_authority)
     return f"""
 $ErrorActionPreference = 'Stop'
 $vmName = {vm}
@@ -123,11 +206,16 @@ $remaining = @(Get-VMDvdDrive -VMName $vmName -ErrorAction Stop | Where-Object {
 """.strip()
 
 
-def detach_answer_iso(vm_name: str, answer_iso: Path) -> dict[str, object]:
+def detach_answer_iso(
+    vm_name: str,
+    answer_iso: Path,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    _validate_timeout_seconds(timeout_seconds)
+    answer_authority = _require_answer_iso_authority(answer_iso)
     result = run_powershell_json(
-        build_detach_answer_iso_script(vm_name, answer_iso),
-        timeout_seconds=90,
+        build_detach_answer_iso_script(vm_name, answer_authority),
+        timeout_seconds=timeout_seconds,
     )
-    if not bool(result.get("detached", False)):
-        raise RuntimeError("managed answer ISO detach postcondition failed")
-    return result
+    return _validate_detach_result(result, expected_answer_iso=answer_authority)
