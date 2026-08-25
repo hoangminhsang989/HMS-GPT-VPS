@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path, PureWindowsPath
+import uuid
 
 from .powershell import ps_literal, run_powershell_json
 from .powershell_direct import PowerShellDirectCredential, run_vm_powershell_json
@@ -12,6 +13,7 @@ _RETIRE_RESULT_KEYS = frozenset({
     "default_password_absent", "removed_unattend_count",
 })
 _DETACH_RESULT_KEYS = frozenset({"detached", "answer_iso"})
+_DETACH_BY_ID_RESULT_KEYS = frozenset({"detached", "answer_iso", "vm_id"})
 
 
 def _validate_bootstrap_username(username: str) -> None:
@@ -29,6 +31,18 @@ def _validate_timeout_seconds(timeout_seconds: int) -> None:
         raise ValueError("timeout_seconds must be an integer")
     if not 1 <= timeout_seconds <= 600:
         raise ValueError("timeout_seconds must be between 1 and 600")
+
+
+def _normalize_vm_id(vm_id: str) -> str:
+    if not isinstance(vm_id, str) or not vm_id.strip():
+        raise ValueError("managed VMId is required")
+    try:
+        canonical = str(uuid.UUID(vm_id.strip())).lower()
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("managed VMId must be a valid GUID") from exc
+    if vm_id != canonical:
+        raise ValueError("managed VMId must use canonical lowercase GUID form")
+    return canonical
 
 
 def _lexical_absolute(path: Path) -> Path:
@@ -99,6 +113,27 @@ def _validate_detach_result(result: object, *, expected_answer_iso: Path) -> dic
     observed_answer = result["answer_iso"]
     if not isinstance(observed_answer, str) or not _same_windows_path(observed_answer, expected_answer_iso):
         raise RuntimeError("managed answer ISO detach path differs from authority")
+    return result
+
+
+def _validate_detach_by_id_result(
+    result: object,
+    *,
+    expected_answer_iso: Path,
+    expected_vm_id: str,
+) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise RuntimeError("managed answer ISO VMId-bound detach result must be an object")
+    if frozenset(result) != _DETACH_BY_ID_RESULT_KEYS:
+        raise RuntimeError("managed answer ISO VMId-bound detach result schema is invalid")
+    if result["detached"] is not True:
+        raise RuntimeError("managed answer ISO VMId-bound detach postcondition failed")
+    observed_answer = result["answer_iso"]
+    if not isinstance(observed_answer, str) or not _same_windows_path(observed_answer, expected_answer_iso):
+        raise RuntimeError("managed answer ISO VMId-bound detach path differs from authority")
+    observed_vm_id = result["vm_id"]
+    if not isinstance(observed_vm_id, str) or observed_vm_id != expected_vm_id:
+        raise RuntimeError("managed answer ISO detach VMId differs from authority")
     return result
 
 
@@ -183,6 +218,31 @@ def retire_bootstrap_guest(
     return _validate_retirement_result(result, expected_username=username)
 
 
+def retire_bootstrap_guest_by_id(
+    vm_id: str,
+    vm_name: str,
+    credential: PowerShellDirectCredential,
+    username: str,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    """Retire the bootstrap credential through a stable Hyper-V VMId binding."""
+    managed_vm_id = _normalize_vm_id(vm_id)
+    if not isinstance(vm_name, str) or not vm_name.strip():
+        raise ValueError("VM name is required")
+    credential.validate()
+    _validate_bootstrap_username(username)
+    _validate_timeout_seconds(timeout_seconds)
+    result = run_vm_powershell_json(
+        vm_name,
+        credential,
+        build_retire_bootstrap_guest_script(username),
+        timeout_seconds=timeout_seconds,
+        vm_id=managed_vm_id,
+    )
+    return _validate_retirement_result(result, expected_username=username)
+
+
 def build_detach_answer_iso_script(vm_name: str, answer_iso: Path) -> str:
     if not isinstance(vm_name, str) or not vm_name.strip():
         raise ValueError("VM name is required")
@@ -206,6 +266,37 @@ $remaining = @(Get-VMDvdDrive -VMName $vmName -ErrorAction Stop | Where-Object {
 """.strip()
 
 
+def build_detach_answer_iso_by_id_script(vm_id: str, vm_name: str, answer_iso: Path) -> str:
+    managed_vm_id = _normalize_vm_id(vm_id)
+    if not isinstance(vm_name, str) or not vm_name.strip():
+        raise ValueError("VM name is required")
+    answer_authority = _require_answer_iso_authority(answer_iso)
+    vm = ps_literal(vm_name)
+    iso = ps_literal(answer_authority)
+    vm_id_literal = ps_literal(managed_vm_id)
+    return f"""
+$ErrorActionPreference = 'Stop'
+$vmId = [guid]{vm_id_literal}
+$expectedVmName = {vm}
+$answerIso = {iso}
+$managedVm = Get-VM -Id $vmId -ErrorAction Stop
+if ($managedVm.Name -ine $expectedVmName) {{
+  throw 'Persisted Hyper-V VMId resolves to a different VM name during answer-media detach'
+}}
+$matches = @(Get-VMDvdDrive -VM $managedVm -ErrorAction Stop | Where-Object {{ $_.Path -eq $answerIso }})
+if ($matches.Count -gt 1) {{ throw 'multiple DVD drives reference the managed answer ISO' }}
+if ($matches.Count -eq 1) {{
+  Set-VMDvdDrive -VMDvdDrive $matches[0] -Path $null -ErrorAction Stop
+}}
+$remaining = @(Get-VMDvdDrive -VM $managedVm -ErrorAction Stop | Where-Object {{ $_.Path -eq $answerIso }})
+[pscustomobject]@{{
+  detached = [bool]($remaining.Count -eq 0)
+  answer_iso = $answerIso
+  vm_id = $managedVm.Id.ToString().ToLowerInvariant()
+}}
+""".strip()
+
+
 def detach_answer_iso(
     vm_name: str,
     answer_iso: Path,
@@ -219,3 +310,25 @@ def detach_answer_iso(
         timeout_seconds=timeout_seconds,
     )
     return _validate_detach_result(result, expected_answer_iso=answer_authority)
+
+
+def detach_answer_iso_by_id(
+    vm_id: str,
+    vm_name: str,
+    answer_iso: Path,
+    *,
+    timeout_seconds: int = 90,
+) -> dict[str, object]:
+    """Detach managed answer media from the exact persisted Hyper-V VM object."""
+    managed_vm_id = _normalize_vm_id(vm_id)
+    _validate_timeout_seconds(timeout_seconds)
+    answer_authority = _require_answer_iso_authority(answer_iso)
+    result = run_powershell_json(
+        build_detach_answer_iso_by_id_script(managed_vm_id, vm_name, answer_authority),
+        timeout_seconds=timeout_seconds,
+    )
+    return _validate_detach_by_id_result(
+        result,
+        expected_answer_iso=answer_authority,
+        expected_vm_id=managed_vm_id,
+    )

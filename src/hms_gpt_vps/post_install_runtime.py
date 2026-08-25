@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import uuid
 
 from .bootstrap_retirement import (
     _path_chain_has_redirect,
     _require_answer_iso_authority,
-    detach_answer_iso,
-    retire_bootstrap_guest,
+    detach_answer_iso_by_id as detach_answer_iso,
+    retire_bootstrap_guest_by_id as retire_bootstrap_guest,
 )
 from .install_artifacts import TextSecretStore, clear_install_secrets
 from .powershell_direct import PowerShellDirectCredential
@@ -26,12 +27,21 @@ class PostInstallFinalizationConfig:
     answer_iso: Path
     answer_iso_sha256: str
     runtime_dir: Path
+    vm_id: str = ""
 
     def validate(self) -> None:
         if not isinstance(self.instance_id, str) or not self.instance_id.strip():
             raise ValueError("instance_id is required")
         if not isinstance(self.vm_name, str) or not self.vm_name.strip():
             raise ValueError("vm_name is required")
+        if not isinstance(self.vm_id, str) or not self.vm_id.strip():
+            raise ValueError("vm_id is required for post-install finalization")
+        try:
+            canonical_vm_id = str(uuid.UUID(self.vm_id)).lower()
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("vm_id must be a valid GUID") from exc
+        if self.vm_id != canonical_vm_id:
+            raise ValueError("vm_id must use canonical lowercase GUID form")
         if not isinstance(self.bootstrap_username, str) or not self.bootstrap_username.strip():
             raise ValueError("bootstrap_username is required")
         if not isinstance(self.answer_iso_sha256, str) or len(self.answer_iso_sha256) != 64:
@@ -65,7 +75,9 @@ class PostInstallFinalizationRuntime:
 
     Media detach and local secret cleanup are host-side idempotent operations and
     can be retried safely after crash because both have exact managed targets and
-    postcondition checks.
+    postcondition checks. Credential retirement and answer-media detach are both
+    bound to the persisted canonical Hyper-V VMId; VM name is only a secondary
+    consistency check and never the sole mutation authority.
     """
 
     def __init__(
@@ -102,6 +114,7 @@ class PostInstallFinalizationRuntime:
         )
         try:
             result = retire_bootstrap_guest(
+                self.config.vm_id,
                 self.config.vm_name,
                 credential,
                 self.config.bootstrap_username,
@@ -153,7 +166,11 @@ class PostInstallFinalizationRuntime:
             raise PostInstallStateError(
                 "answer-media detach requires BOOTSTRAP_RETIRED checkpoint"
             )
-        result = detach_answer_iso(self.config.vm_name, self.config.answer_iso)
+        result = detach_answer_iso(
+            self.config.vm_id,
+            self.config.vm_name,
+            self.config.answer_iso,
+        )
         if result.get("detached") is not True:
             raise PostInstallStateError("answer-media detach postcondition failed")
         return self.store.transition_checked(
