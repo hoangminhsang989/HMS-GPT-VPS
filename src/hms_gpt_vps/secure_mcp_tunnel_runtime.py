@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path, PureWindowsPath
-import secrets
 import subprocess
 import time
 from typing import Callable, Mapping, Protocol
@@ -16,6 +15,7 @@ from .mcp_tunnel_ingress import (
     MCP_TUNNEL_INGRESS_TOKEN_ENV,
     McpTunnelIngressError,
     build_mcp_tunnel_ingress_child_environment,
+    derive_mcp_tunnel_ingress_generation,
     require_mcp_tunnel_ingress_token,
 )
 from .qualification_file_authority import lexical_absolute, path_chain_has_redirect
@@ -88,6 +88,7 @@ class SecureMcpTunnelRuntimeEvidence:
     health_base_url: str
     readiness_url: str
     mcp_server_url: str
+    mcp_ingress_generation: str
     restart_policy: str = "fail-closed-to-HMSBridge-SCM"
 
 
@@ -129,7 +130,8 @@ class SecureMcpTunnelRuntime:
         return parent
 
     def _prepare_handshake(self) -> Path:
-        parent=self._health_parent(); attempt=parent/f"attempt-{secrets.token_hex(16)}"
+        generation=derive_mcp_tunnel_ingress_generation(self.config.mcp_ingress_token)
+        parent=self._health_parent(); attempt=parent/f"attempt-{generation}"
         if attempt.exists() or path_chain_has_redirect(attempt): raise SecureMcpTunnelRuntimeError("tunnel health attempt is not new")
         os.mkdir(attempt); self._health_attempt=attempt; return attempt/_HEALTH_FILE
 
@@ -198,7 +200,7 @@ class SecureMcpTunnelRuntime:
     def evidence(self) -> SecureMcpTunnelRuntimeEvidence:
         if not self.ready: raise SecureMcpTunnelRuntimeError("tunnel runtime is not ready")
         assert self._process is not None and self._health_base_url is not None and self._exe_sha is not None
-        return SecureMcpTunnelRuntimeEvidence(True,self._process.pid,str(self.config.package.executable_path),self._exe_sha,self._health_base_url,self._health_base_url+"/readyz",HMS_MCP_SERVER_URL)
+        return SecureMcpTunnelRuntimeEvidence(True,self._process.pid,str(self.config.package.executable_path),self._exe_sha,self._health_base_url,self._health_base_url+"/readyz",HMS_MCP_SERVER_URL,derive_mcp_tunnel_ingress_generation(self.config.mcp_ingress_token))
 
     def assert_healthy(self) -> None:
         if not self._started or self._closed or self._process is None or self._health_base_url is None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
+import hashlib
 import re
 import secrets
 from typing import Any, Awaitable, Callable
@@ -10,11 +12,17 @@ MCP_TUNNEL_INGRESS_TOKEN_ENV = "HMS_TUNNEL_INGRESS_TOKEN"
 MCP_EXTRA_HEADERS_ENV = "MCP_EXTRA_HEADERS"
 MCP_TUNNEL_INGRESS_PATH = "/mcp"
 MCP_TUNNEL_INGRESS_TOKEN_HEX_LENGTH = 64
+MCP_TUNNEL_INGRESS_GENERATION_HEX_LENGTH = 32
 MCP_TUNNEL_EXTRA_HEADER_SPEC = (
     f"{MCP_TUNNEL_INGRESS_HEADER}: env:{MCP_TUNNEL_INGRESS_TOKEN_ENV}"
 )
 
 _TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
+_GENERATION_DOMAIN = b"hms-gpt-vps/mcp-tunnel-ingress-generation/v1\x00"
+_INGRESS_GENERATION_CONTEXT: ContextVar[str | None] = ContextVar(
+    "hms_mcp_tunnel_ingress_generation", default=None
+)
 _HEADER_BYTES = MCP_TUNNEL_INGRESS_HEADER.lower().encode("ascii")
 
 
@@ -38,6 +46,24 @@ def require_mcp_tunnel_ingress_token(token: str) -> str:
 def generate_mcp_tunnel_ingress_token() -> str:
     token = secrets.token_hex(32)
     return require_mcp_tunnel_ingress_token(token)
+
+
+def derive_mcp_tunnel_ingress_generation(token: str) -> str:
+    checked = require_mcp_tunnel_ingress_token(token)
+    digest = hashlib.sha256(_GENERATION_DOMAIN + checked.encode("ascii")).hexdigest()
+    generation = digest[:MCP_TUNNEL_INGRESS_GENERATION_HEX_LENGTH]
+    if _GENERATION_RE.fullmatch(generation) is None:
+        raise McpTunnelIngressError("derived MCP tunnel ingress generation is invalid")
+    return generation
+
+
+def current_mcp_tunnel_ingress_generation() -> str | None:
+    value = _INGRESS_GENERATION_CONTEXT.get()
+    if value is None:
+        return None
+    if _GENERATION_RE.fullmatch(value) is None:
+        raise McpTunnelIngressError("MCP tunnel ingress generation context is invalid")
+    return value
 
 
 def build_mcp_tunnel_ingress_child_environment(
@@ -75,6 +101,7 @@ class McpTunnelIngressGate:
             raise TypeError("app must be callable")
         self._app = app
         self._expected_token = require_mcp_tunnel_ingress_token(token)
+        self._generation = derive_mcp_tunnel_ingress_generation(self._expected_token)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(path={MCP_TUNNEL_INGRESS_PATH!r})"
@@ -137,4 +164,8 @@ class McpTunnelIngressGate:
         ):
             await self._reject(send)
             return
-        await self._app(scope, receive, send)
+        marker = _INGRESS_GENERATION_CONTEXT.set(self._generation)
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            _INGRESS_GENERATION_CONTEXT.reset(marker)
