@@ -121,11 +121,14 @@ def _aware_utc(value: datetime) -> datetime:
 
 
 class PairingReadinessRuntime:
-    """Crash-recoverable bridge-side gate for issuing one one-time pairing URL.
+    """Crash-recoverable bridge-side gate for one one-time pairing URL.
 
-    This runtime never advances provisioning state. It only mutates pairing
-    authority under its own lock and returns observations that the existing
-    provisioning orchestrator may later consume.
+    Pairing authority and provisioning state are committed in a strict order.
+    An active encrypted lease plus its digest-only PairingStore record must be
+    durable before INSTALL_SECRETS_CLEARED may CAS to PAIRING_PENDING. The raw
+    link is never returned before that checkpoint is committed. READY is a
+    separate post-binding commit and may be requested only after the authenticated
+    principal layer has durably published its exact PrincipalSessionBinding.
     """
 
     def __init__(
@@ -165,6 +168,70 @@ class PairingReadinessRuntime:
                 "pairing issuance requires INSTALL_SECRETS_CLEARED or PAIRING_PENDING"
             )
         return record.state
+
+    def _advance_pairing_state(
+        self,
+        expected: ProvisionState,
+        target: ProvisionState,
+        *,
+        reason: str,
+    ) -> None:
+        current = self.provision_store.load()
+        if current is None:
+            raise PairingStateError("provision state does not exist")
+        if current.instance_id != self.config.instance_id:
+            raise PairingStateError("provision state belongs to another instance")
+        if current.state is target:
+            return
+        if current.state is not expected:
+            raise PairingStateError(
+                f"pairing state commit requires {expected.value} or {target.value}"
+            )
+        try:
+            committed = self.provision_store.transition_checked(
+                instance_id=self.config.instance_id,
+                expected_state=expected,
+                state=target,
+                reason=reason,
+            )
+        except ValueError as exc:
+            observed = self.provision_store.load()
+            if (
+                observed is None
+                or observed.instance_id != self.config.instance_id
+                or observed.state is not target
+            ):
+                raise PairingStateError(
+                    "pairing provision-state authority changed during CAS"
+                ) from exc
+            return
+        if (
+            committed.instance_id != self.config.instance_id
+            or committed.state is not target
+        ):
+            raise PairingStateError(
+                "pairing provision-state CAS returned unexpected authority"
+            )
+
+    def _commit_pairing_pending(self) -> None:
+        self._advance_pairing_state(
+            ProvisionState.INSTALL_SECRETS_CLEARED,
+            ProvisionState.PAIRING_PENDING,
+            reason="pairing_authority_published",
+        )
+
+    def commit_principal_binding_ready(self) -> None:
+        """Commit READY only after the caller durably published principal binding."""
+        observed = self.observe()
+        if observed.pairing_ready is not True or observed.paired is not True:
+            raise PairingStateError(
+                "READY requires fresh Agent presence and consumed pairing authority"
+            )
+        self._advance_pairing_state(
+            ProvisionState.PAIRING_PENDING,
+            ProvisionState.READY,
+            reason="principal_binding_published",
+        )
 
     def _presence(self, now: datetime) -> AgentPresence:
         presence = self.presence_reader.get_presence(self.config.instance_id)
@@ -248,6 +315,7 @@ class PairingReadinessRuntime:
             return None
         if now < current.issued_at:
             raise PairingReadinessError("pairing grant is not yet valid")
+        self._commit_pairing_pending()
         return self._issue_result(lease)
 
     def issue(self) -> PairingIssueResult:
@@ -270,9 +338,6 @@ class PairingReadinessRuntime:
                 ttl_seconds=self.config.pair_ttl_seconds,
             )
             lease = PairingLinkLease.from_grant(grant, self.config.bridge_base_url)
-
-            # Crash-safe ordering is deliberate: persist the recoverable raw
-            # token/link before publishing the digest-only pairing record.
             self.lease_store.save(lease)
 
             self._require_pairing_state()
@@ -281,6 +346,7 @@ class PairingReadinessRuntime:
             readback = self.pairing_store.require(grant.record.pair_id)
             if not self._same_initial_record(readback, grant.record):
                 raise PairingReadinessError("pairing record readback differs from issued authority")
+            self._commit_pairing_pending()
             return self._issue_result(lease)
 
     def observe(self) -> PairingReadinessObservation:
@@ -326,18 +392,20 @@ class PairingReadinessRuntime:
         )
 
     def current_pairing_link(self) -> str:
-        self._require_pairing_state()
-        now = self._now()
-        self._presence(now)
-        lease = self.lease_store.load()
-        if lease is None:
-            raise PairingReadinessError("pairing link lease does not exist")
-        self._require_lease_authority(lease)
-        current = self.pairing_store.require(lease.record.pair_id)
-        if not self._same_initial_record(current, lease.record):
-            raise PairingReadinessError("pairing store record differs from encrypted lease authority")
-        if current.consumed_at is not None:
-            raise PairingConsumedError("pairing grant is already consumed")
-        if current.revoked_at is not None or now < current.issued_at or now >= current.expires_at:
-            raise PairingReadinessError("pairing link is not active")
-        return lease.pairing_link
+        with exclusive_authority_lock(self.lock_path):
+            self._require_pairing_state()
+            now = self._now()
+            self._presence(now)
+            lease = self.lease_store.load()
+            if lease is None:
+                raise PairingReadinessError("pairing link lease does not exist")
+            self._require_lease_authority(lease)
+            current = self.pairing_store.require(lease.record.pair_id)
+            if not self._same_initial_record(current, lease.record):
+                raise PairingReadinessError("pairing store record differs from encrypted lease authority")
+            if current.consumed_at is not None:
+                raise PairingConsumedError("pairing grant is already consumed")
+            if current.revoked_at is not None or now < current.issued_at or now >= current.expires_at:
+                raise PairingReadinessError("pairing link is not active")
+            self._commit_pairing_pending()
+            return lease.pairing_link
