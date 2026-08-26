@@ -22,6 +22,10 @@ def build_parser() -> argparse.ArgumentParser:
         "provision-oauth-introspection-credential",
         help="Provision the OAuth introspection client credential from stdin",
     )
+    subparsers.add_parser(
+        "pairing-link",
+        help="Retrieve the active one-time HMS VPS pairing link from running HMSBridge",
+    )
     return parser
 
 
@@ -43,6 +47,17 @@ def main() -> int:
 
         evidence = provision_bridge_oauth_introspection_credential_from_stdin()
         print(json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "pairing-link":
+        # The raw one-time token is intentionally retrieved from the running
+        # HMSBridge service through the PID-pinned local named pipe. No config,
+        # token, PID, or secret override is accepted on argv.
+        from .bridge_pairing_link_ipc import (
+            request_pairing_link_from_running_hms_bridge,
+        )
+
+        result = request_pairing_link_from_running_hms_bridge()
+        print(json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")))
         return 0
     return 2
 
