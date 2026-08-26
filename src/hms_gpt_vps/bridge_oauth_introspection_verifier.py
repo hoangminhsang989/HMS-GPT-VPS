@@ -33,6 +33,18 @@ class BridgeOAuthIntrospectionVerifierError(RuntimeError):
     pass
 
 
+def require_oauth_token_client_id(value: object, name: str = "expected_client_id") -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 512
+        or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+    ):
+        raise BridgeOAuthIntrospectionVerifierError(f"{name} is invalid")
+    return value
+
+
 def _basic_header(client_id: str, client_secret: str) -> str:
     raw = f"{quote_plus(client_id, safe='~')}:{quote_plus(client_secret, safe='~')}".encode("utf-8")
     return "Basic " + base64.b64encode(raw).decode("ascii")
@@ -59,7 +71,7 @@ def _audience_matches(value: object, resource: str) -> bool:
 
 
 class BridgeOAuthIntrospectionTokenVerifier(TokenVerifier):
-    def __init__(self, credential: BridgeOAuthIntrospectionCredential, metadata: BridgeOAuthAuthorizationServerMetadata, resource_server_url: str, *, json_request: JsonRequest = request_oauth_json, clock: Callable[[], int] | None = None, timeout_seconds: int = DEFAULT_OAUTH_HTTP_TIMEOUT_SECONDS) -> None:
+    def __init__(self, credential: BridgeOAuthIntrospectionCredential, metadata: BridgeOAuthAuthorizationServerMetadata, resource_server_url: str, *, expected_client_id: str | None = None, json_request: JsonRequest = request_oauth_json, clock: Callable[[], int] | None = None, timeout_seconds: int = DEFAULT_OAUTH_HTTP_TIMEOUT_SECONDS) -> None:
         if not isinstance(credential, BridgeOAuthIntrospectionCredential):
             raise TypeError("credential must be a BridgeOAuthIntrospectionCredential")
         if not isinstance(metadata, BridgeOAuthAuthorizationServerMetadata):
@@ -69,11 +81,14 @@ class BridgeOAuthIntrospectionTokenVerifier(TokenVerifier):
         require_https_endpoint(resource_server_url, "resource_server_url")
         if credential.issuer_url != metadata.issuer_url:
             raise BridgeOAuthIntrospectionVerifierError("OAuth introspection credential issuer differs from discovered authority")
+        if expected_client_id is not None:
+            expected_client_id = require_oauth_token_client_id(expected_client_id)
         if not callable(json_request):
             raise TypeError("json_request must be callable")
         self.credential = credential
         self.metadata = metadata
         self.resource_server_url = resource_server_url
+        self.expected_client_id = expected_client_id
         self._json_request = json_request
         self._clock = clock or (lambda: int(time.time()))
         self._timeout_seconds = require_oauth_timeout(timeout_seconds)
@@ -109,6 +124,8 @@ class BridgeOAuthIntrospectionTokenVerifier(TokenVerifier):
             return None
         if any(ord(c) < 0x20 or ord(c) == 0x7F for c in client_id + subject):
             return None
+        if self.expected_client_id is not None and client_id != self.expected_client_id:
+            return None
         scopes = _scope_list(raw.get("scope"))
         if scopes is None or MCP_CONTROL_SCOPE not in scopes or not _audience_matches(raw.get("aud"), self.resource_server_url):
             return None
@@ -138,8 +155,10 @@ class BridgeOAuthIntrospectionTokenVerifier(TokenVerifier):
         )
 
 
-def build_bridge_oauth_introspection_verifier_sync(credential: BridgeOAuthIntrospectionCredential, resource_server_url: str, *, discovery_request: SyncJsonRequest = request_oauth_json_sync, json_request: JsonRequest = request_oauth_json, timeout_seconds: int = DEFAULT_OAUTH_HTTP_TIMEOUT_SECONDS) -> BridgeOAuthIntrospectionTokenVerifier:
+def build_bridge_oauth_introspection_verifier_sync(credential: BridgeOAuthIntrospectionCredential, resource_server_url: str, *, expected_client_id: str | None = None, discovery_request: SyncJsonRequest = request_oauth_json_sync, json_request: JsonRequest = request_oauth_json, timeout_seconds: int = DEFAULT_OAUTH_HTTP_TIMEOUT_SECONDS) -> BridgeOAuthIntrospectionTokenVerifier:
     credential.validate()
+    if expected_client_id is not None:
+        expected_client_id = require_oauth_token_client_id(expected_client_id)
     metadata = discover_bridge_oauth_authorization_server_sync(
         credential.issuer_url,
         json_request=discovery_request,
@@ -149,13 +168,16 @@ def build_bridge_oauth_introspection_verifier_sync(credential: BridgeOAuthIntros
         credential,
         metadata,
         resource_server_url,
+        expected_client_id=expected_client_id,
         json_request=json_request,
         timeout_seconds=timeout_seconds,
     )
 
 
-async def build_bridge_oauth_introspection_verifier(credential: BridgeOAuthIntrospectionCredential, resource_server_url: str, *, json_request: JsonRequest = request_oauth_json, timeout_seconds: int = DEFAULT_OAUTH_HTTP_TIMEOUT_SECONDS) -> BridgeOAuthIntrospectionTokenVerifier:
+async def build_bridge_oauth_introspection_verifier(credential: BridgeOAuthIntrospectionCredential, resource_server_url: str, *, expected_client_id: str | None = None, json_request: JsonRequest = request_oauth_json, timeout_seconds: int = DEFAULT_OAUTH_HTTP_TIMEOUT_SECONDS) -> BridgeOAuthIntrospectionTokenVerifier:
     credential.validate()
+    if expected_client_id is not None:
+        expected_client_id = require_oauth_token_client_id(expected_client_id)
     metadata = await discover_bridge_oauth_authorization_server(
         credential.issuer_url,
         json_request=json_request,
@@ -165,6 +187,7 @@ async def build_bridge_oauth_introspection_verifier(credential: BridgeOAuthIntro
         credential,
         metadata,
         resource_server_url,
+        expected_client_id=expected_client_id,
         json_request=json_request,
         timeout_seconds=timeout_seconds,
     )
