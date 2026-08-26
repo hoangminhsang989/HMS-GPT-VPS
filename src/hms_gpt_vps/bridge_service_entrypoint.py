@@ -10,6 +10,10 @@ from .bridge_oauth_introspection_credential import (
 from .bridge_oauth_introspection_verifier import (
     build_bridge_oauth_introspection_verifier_sync,
 )
+from .bridge_pairing_surface_runtime import (
+    BridgePairingSurfaceRuntime,
+    build_bridge_pairing_surface_runtime,
+)
 from .bridge_production_service_runtime import (
     BridgeProductionServiceRuntime,
     build_bridge_production_service_runtime,
@@ -33,6 +37,10 @@ class BridgeServiceEntrypointError(RuntimeError):
 
 RuntimeConfigLoader = Callable[[], BridgeServiceRuntimeConfig]
 OAuthVerifierLoader = Callable[[BridgeServiceRuntimeConfig], TokenVerifier]
+RuntimeWrapper = Callable[
+    [BridgeProductionServiceRuntime, str],
+    BridgePairingSurfaceRuntime,
+]
 
 
 def resolve_hms_bridge_service_sid() -> str:
@@ -94,7 +102,8 @@ def build_hms_bridge_runtime_factory(
     *,
     config_loader: RuntimeConfigLoader = load_protected_bridge_service_runtime_config,
     verifier_loader: OAuthVerifierLoader = _default_oauth_verifier_loader,
-) -> Callable[[], BridgeProductionServiceRuntime]:
+    runtime_wrapper: RuntimeWrapper = build_bridge_pairing_surface_runtime,
+) -> Callable[[], BridgePairingSurfaceRuntime]:
     """Build a lazy factory so SCM identity proof precedes config/secret access."""
 
     service_sid = require_hms_bridge_service_sid(expected_service_sid)
@@ -102,8 +111,10 @@ def build_hms_bridge_runtime_factory(
         raise TypeError("config_loader must be callable")
     if not callable(verifier_loader):
         raise TypeError("verifier_loader must be callable")
+    if not callable(runtime_wrapper):
+        raise TypeError("runtime_wrapper must be callable")
 
-    def factory() -> BridgeProductionServiceRuntime:
+    def factory() -> BridgePairingSurfaceRuntime:
         # The Windows service host proves the effective process identity before
         # invoking this closure. Re-prove at the config boundary as defense in depth.
         prove_hms_bridge_runtime_identity(service_sid)
@@ -119,10 +130,20 @@ def build_hms_bridge_runtime_factory(
                 "OAuth verifier loader returned an invalid TokenVerifier"
             )
         runtime_config = config.to_runtime_config(service_sid)
-        return build_bridge_production_service_runtime(
+        base_runtime = build_bridge_production_service_runtime(
             runtime_config,
             verifier,
         )
+        if not isinstance(base_runtime, BridgeProductionServiceRuntime):
+            raise BridgeServiceEntrypointError(
+                "Bridge production runtime factory returned an invalid runtime"
+            )
+        wrapped = runtime_wrapper(base_runtime, service_sid)
+        if not isinstance(wrapped, BridgePairingSurfaceRuntime):
+            raise BridgeServiceEntrypointError(
+                "Bridge pairing runtime wrapper returned an invalid runtime"
+            )
+        return wrapped
 
     return factory
 
@@ -132,6 +153,7 @@ def run_hms_bridge_service_entrypoint(
     sid_resolver: Callable[[], str] = resolve_hms_bridge_service_sid,
     config_loader: RuntimeConfigLoader = load_protected_bridge_service_runtime_config,
     verifier_loader: OAuthVerifierLoader = _default_oauth_verifier_loader,
+    runtime_wrapper: RuntimeWrapper = build_bridge_pairing_surface_runtime,
 ) -> None:
     """Enter SCM without accepting config paths, secrets, or auth material on argv."""
 
@@ -142,6 +164,7 @@ def run_hms_bridge_service_entrypoint(
         service_sid,
         config_loader=config_loader,
         verifier_loader=verifier_loader,
+        runtime_wrapper=runtime_wrapper,
     )
     run_hms_bridge_windows_service(
         expected_service_sid=service_sid,
