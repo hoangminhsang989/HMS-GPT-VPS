@@ -19,6 +19,7 @@ from hms_gpt_vps.bridge_service_runtime_config import BRIDGE_SERVICE_RUNTIME_SCH
 _SERVICE_SID="S-1-5-80-123-456-789-1011-1213"
 _VM_ID="12345678-1234-1234-1234-123456789abc"
 _TUNNEL_ID="tunnel_"+"a"*32
+_EXPECTED_CLIENT_ID="chatgpt-confidential-client-01"
 
 class _Verifier:
     async def verify_token(self, token: str): return None
@@ -29,7 +30,7 @@ def _config(tmp_path: Path) -> BridgeServiceRuntimeConfig:
         schema_version=BRIDGE_SERVICE_RUNTIME_SCHEMA_VERSION,
         instance_id="HMS-VPS-1", runtime_root=str(runtime_root), provision_state_path=str(runtime_root/"provision-state.json"),
         bridge_base_url="https://bridge.example.test", mcp_issuer_url="https://issuer.example.test", mcp_resource_server_url="https://resource.example.test",
-        mcp_port=8765, presence_max_age_seconds=90, pair_ttl_seconds=300,
+        mcp_expected_client_id=_EXPECTED_CLIENT_ID, mcp_port=8765, presence_max_age_seconds=90, pair_ttl_seconds=300,
         tls_certificate_path=str(tmp_path/"agent-bridge.pem"), tls_private_key_path=str(tls_root/"agent-bridge-private-key.pem"), tls_storage_root=str(tls_root),
         tls_certificate_der_sha256="b"*64, tls_private_key_file_sha256="a"*64, tls_port=9443,
         vm_id=_VM_ID, vm_name="HMS-VPS-1", trust_root_der_sha256="c"*64, tunnel_id=_TUNNEL_ID,
@@ -57,9 +58,14 @@ def test_service_entrypoint_passes_lazy_factory_before_config_read(monkeypatch: 
 def test_default_oauth_verifier_loader_uses_protected_machine_credential_then_discovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config=_config(tmp_path); events=[]; credential=object(); verifier=_Verifier()
     monkeypatch.setattr(entry_module,"load_protected_bridge_oauth_introspection_credential",lambda issuer:events.append(("credential",issuer)) or credential)
-    monkeypatch.setattr(entry_module,"build_bridge_oauth_introspection_verifier_sync",lambda observed,resource:events.append(("verifier",observed,resource)) or verifier)
+    def build(observed, resource, *, expected_client_id):
+        events.append(("verifier",observed,resource,expected_client_id)); return verifier
+    monkeypatch.setattr(entry_module,"build_bridge_oauth_introspection_verifier_sync",build)
     assert _default_oauth_verifier_loader(config) is verifier
-    assert events==[("credential",config.mcp_issuer_url),("verifier",credential,config.mcp_resource_server_url)]
+    assert events==[
+        ("credential",config.mcp_issuer_url),
+        ("verifier",credential,config.mcp_resource_server_url,_EXPECTED_CLIENT_ID),
+    ]
 
 def test_service_sid_resolver_requires_exact_virtual_account_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(entry_module,"run_powershell_json",lambda script,timeout_seconds:{"service_account":r"NT SERVICE\HMSBridge","service_sid":_SERVICE_SID})

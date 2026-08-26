@@ -19,13 +19,14 @@ from .mcp_bridge_server import HmsMcpBridgeConfig
 from .pairing_readiness_runtime import PairingReadinessConfig
 from .qualification_file_authority import read_file_pinned
 
-BRIDGE_SERVICE_RUNTIME_SCHEMA_VERSION = 2
+BRIDGE_SERVICE_RUNTIME_SCHEMA_VERSION = 3
 DEFAULT_BRIDGE_RUNTIME_CONFIG_PATH = Path(r"C:\ProgramData\HMS-GPT-VPS\Bridge\bridge-runtime.json")
 MAX_BRIDGE_RUNTIME_CONFIG_BYTES = 64 * 1024
 _TUNNEL_ID_RE = re.compile(r"^tunnel_[0-9a-f]{32}$")
 _REQUIRED_KEYS = frozenset({
     "schema_version", "instance_id", "runtime_root", "provision_state_path",
-    "bridge_base_url", "mcp_issuer_url", "mcp_resource_server_url", "mcp_port",
+    "bridge_base_url", "mcp_issuer_url", "mcp_resource_server_url",
+    "mcp_expected_client_id", "mcp_port",
     "presence_max_age_seconds", "pair_ttl_seconds", "tls_certificate_path",
     "tls_private_key_path", "tls_storage_root", "tls_certificate_der_sha256",
     "tls_private_key_file_sha256", "tls_port", "vm_id", "vm_name",
@@ -47,6 +48,16 @@ def _require_int(value: object, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise BridgeServiceRuntimeConfigError(f"{name} must be an integer")
     return value
+
+
+def _require_client_id(value: object) -> str:
+    text = _require_text(value, "mcp_expected_client_id")
+    if (
+        len(text) > 512
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
+    ):
+        raise BridgeServiceRuntimeConfigError("mcp_expected_client_id is invalid")
+    return text
 
 
 def _require_sha256(value: object, name: str) -> str:
@@ -90,6 +101,7 @@ class BridgeServiceRuntimeConfig:
     bridge_base_url: str
     mcp_issuer_url: str
     mcp_resource_server_url: str
+    mcp_expected_client_id: str
     mcp_port: int
     presence_max_age_seconds: int
     pair_ttl_seconds: int
@@ -113,6 +125,7 @@ class BridgeServiceRuntimeConfig:
         _require_text(self.bridge_base_url, "bridge_base_url")
         _require_text(self.mcp_issuer_url, "mcp_issuer_url")
         _require_text(self.mcp_resource_server_url, "mcp_resource_server_url")
+        _require_client_id(self.mcp_expected_client_id)
         _require_int(self.mcp_port, "mcp_port")
         _require_int(self.presence_max_age_seconds, "presence_max_age_seconds")
         _require_int(self.pair_ttl_seconds, "pair_ttl_seconds")
@@ -132,6 +145,7 @@ class BridgeServiceRuntimeConfig:
             issuer_url=self.mcp_issuer_url,
             resource_server_url=self.mcp_resource_server_url,
             port=self.mcp_port,
+            expected_client_id=self.mcp_expected_client_id,
         ).validate()
         if self.mcp_port != 8765:
             raise BridgeServiceRuntimeConfigError("mcp_port must remain 8765 for fixed OpenAI tunnel MCP authority")
@@ -158,6 +172,7 @@ class BridgeServiceRuntimeConfig:
                 issuer_url=self.mcp_issuer_url,
                 resource_server_url=self.mcp_resource_server_url,
                 port=self.mcp_port,
+                expected_client_id=self.mcp_expected_client_id,
             ),
             presence_max_age_seconds=self.presence_max_age_seconds,
             pair_ttl_seconds=self.pair_ttl_seconds,
@@ -215,6 +230,7 @@ class BridgeServiceRuntimeConfig:
             "bridge_base_url": self.bridge_base_url,
             "mcp_issuer_url": self.mcp_issuer_url,
             "mcp_resource_server_url": self.mcp_resource_server_url,
+            "mcp_expected_client_id": self.mcp_expected_client_id,
             "mcp_port": self.mcp_port,
             "presence_max_age_seconds": self.presence_max_age_seconds,
             "pair_ttl_seconds": self.pair_ttl_seconds,
@@ -246,6 +262,7 @@ class BridgeServiceRuntimeConfig:
             bridge_base_url=_require_text(raw["bridge_base_url"], "bridge_base_url"),
             mcp_issuer_url=_require_text(raw["mcp_issuer_url"], "mcp_issuer_url"),
             mcp_resource_server_url=_require_text(raw["mcp_resource_server_url"], "mcp_resource_server_url"),
+            mcp_expected_client_id=_require_client_id(raw["mcp_expected_client_id"]),
             mcp_port=_require_int(raw["mcp_port"], "mcp_port"),
             presence_max_age_seconds=_require_int(raw["presence_max_age_seconds"], "presence_max_age_seconds"),
             pair_ttl_seconds=_require_int(raw["pair_ttl_seconds"], "pair_ttl_seconds"),

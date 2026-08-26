@@ -14,6 +14,7 @@ from hms_gpt_vps.bridge_service_runtime_config import (
 _SERVICE_SID = "S-1-5-80-123-456-789-1011-1213"
 _VM_ID = "12345678-1234-1234-1234-123456789abc"
 _TUNNEL_ID = "tunnel_" + "a" * 32
+_EXPECTED_CLIENT_ID = "chatgpt-confidential-client-01"
 
 
 def _mapping(tmp_path: Path) -> dict[str, object]:
@@ -28,6 +29,7 @@ def _mapping(tmp_path: Path) -> dict[str, object]:
         "bridge_base_url": "https://bridge.example.test",
         "mcp_issuer_url": "https://issuer.example.test",
         "mcp_resource_server_url": "https://resource.example.test",
+        "mcp_expected_client_id": _EXPECTED_CLIENT_ID,
         "mcp_port": 8765,
         "presence_max_age_seconds": 90,
         "pair_ttl_seconds": 300,
@@ -53,6 +55,7 @@ def test_config_converts_to_fixed_private_network_and_tunnel_authority(tmp_path:
     runtime = config.to_runtime_config(_SERVICE_SID)
     assert runtime.expected_service_sid == _SERVICE_SID
     assert runtime.tunnel_id == _TUNNEL_ID
+    assert runtime.production.mcp.expected_client_id == _EXPECTED_CLIENT_ID
     assert runtime.tls.firewall.network.switch_name == "HMS-GPT-VPS-Internal"
     assert runtime.tls.firewall.network.subnet == "172.29.240.0/24"
     assert runtime.tls.firewall.network.gateway == "172.29.240.1"
@@ -99,4 +102,20 @@ def test_config_requires_exact_tunnel_id(tmp_path: Path) -> None:
 def test_config_locks_mcp_port_for_tunnel_target(tmp_path: Path) -> None:
     raw = _mapping(tmp_path); raw["mcp_port"] = 8766
     with pytest.raises(BridgeServiceRuntimeConfigError, match="mcp_port must remain 8765"):
+        parse_bridge_service_runtime_config(_bytes(raw))
+
+
+def test_config_schema_v3_requires_exact_mcp_client_authority(tmp_path: Path) -> None:
+    raw = _mapping(tmp_path); del raw["mcp_expected_client_id"]
+    with pytest.raises(BridgeServiceRuntimeConfigError, match="missing=mcp_expected_client_id"):
+        parse_bridge_service_runtime_config(_bytes(raw))
+    raw = _mapping(tmp_path); raw["schema_version"] = 2
+    with pytest.raises(BridgeServiceRuntimeConfigError, match="unsupported"):
+        parse_bridge_service_runtime_config(_bytes(raw))
+
+
+@pytest.mark.parametrize("value", ["", " client", "client ", "client\nname", "x" * 513])
+def test_config_rejects_invalid_mcp_expected_client_id(tmp_path: Path, value: str) -> None:
+    raw = _mapping(tmp_path); raw["mcp_expected_client_id"] = value
+    with pytest.raises(BridgeServiceRuntimeConfigError, match="mcp_expected_client_id"):
         parse_bridge_service_runtime_config(_bytes(raw))

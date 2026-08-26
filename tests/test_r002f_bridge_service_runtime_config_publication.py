@@ -15,6 +15,7 @@ from hms_gpt_vps.bridge_service_runtime_config import (
 SID = "S-1-5-80-123-456-789-1011-1213"
 VM_ID = "12345678-1234-1234-1234-123456789abc"
 TUNNEL_ID = "tunnel_" + "a" * 32
+EXPECTED_CLIENT_ID = "chatgpt-confidential-client-01"
 
 
 def _config(tmp_path: Path):
@@ -29,6 +30,7 @@ def _config(tmp_path: Path):
         "bridge_base_url": "https://bridge.example.test",
         "mcp_issuer_url": "https://issuer.example.test",
         "mcp_resource_server_url": "https://resource.example.test",
+        "mcp_expected_client_id": EXPECTED_CLIENT_ID,
         "mcp_port": 8765,
         "presence_max_age_seconds": 90,
         "pair_ttl_seconds": 300,
@@ -67,6 +69,8 @@ def test_canonical_bytes_are_deterministic_round_trip_and_include_tunnel(tmp_pat
     assert parse_bridge_service_runtime_config(first) == config
     assert b'"tunnel_id":"' in first
     assert TUNNEL_ID.encode() in first
+    assert b'"mcp_expected_client_id":"' in first
+    assert EXPECTED_CLIENT_ID.encode() in first
     assert len(mod.bridge_service_runtime_config_sha256(config)) == 64
 
 

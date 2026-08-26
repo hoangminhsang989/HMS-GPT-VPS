@@ -72,15 +72,30 @@ def _require_https_url(value: object, name: str) -> str:
     return value
 
 
+def _require_client_id(value: object, name: str = "expected_client_id") -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 512
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        raise HmsMcpBridgeError(f"{name} is invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class HmsMcpBridgeConfig:
     issuer_url: str
     resource_server_url: str
     port: int = 8765
+    expected_client_id: str | None = None
 
     def validate(self) -> None:
         _require_https_url(self.issuer_url, "issuer_url")
         _require_https_url(self.resource_server_url, "resource_server_url")
+        if self.expected_client_id is not None:
+            _require_client_id(self.expected_client_id)
         if (
             isinstance(self.port, bool)
             or not isinstance(self.port, int)
@@ -105,8 +120,17 @@ def _validate_access_token(
     config.validate()
     if not isinstance(token, AccessToken):
         raise HmsMcpAuthenticationError("verified bearer authority is invalid")
-    if not isinstance(token.client_id, str) or not token.client_id or len(token.client_id) > 512:
-        raise HmsMcpAuthenticationError("authenticated client identity is unavailable")
+    try:
+        client_id = _require_client_id(token.client_id, "authenticated client identity")
+    except HmsMcpBridgeError as exc:
+        raise HmsMcpAuthenticationError("authenticated client identity is unavailable") from exc
+    if (
+        config.expected_client_id is not None
+        and client_id != config.expected_client_id
+    ):
+        raise HmsMcpAuthenticationError(
+            "authenticated client identity differs from configured authority"
+        )
     if not isinstance(token.subject, str) or not token.subject or len(token.subject) > 1024:
         raise HmsMcpAuthenticationError("authenticated user subject is unavailable")
     if token.resource != config.resource_server_url:

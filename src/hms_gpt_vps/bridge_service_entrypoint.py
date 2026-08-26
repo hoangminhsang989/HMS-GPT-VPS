@@ -94,6 +94,7 @@ def _default_oauth_verifier_loader(
     return build_bridge_oauth_introspection_verifier_sync(
         credential,
         config.mcp_resource_server_url,
+        expected_client_id=config.mcp_expected_client_id,
     )
 
 
