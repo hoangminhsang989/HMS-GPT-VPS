@@ -40,13 +40,14 @@ def exact_result(**overrides):
         "session_id": "session-1",
         "session_epoch": 7,
         "agent_result_sha256": "d" * 64,
+        "mcp_ingress_generation": "e" * 32,
         "authenticated_principal_control_path_proven": True,
         "durable_external_principal_read_proven": True,
         "runner_invoked_mcp": False,
         "runner_enqueued_agent_command": False,
         "secure_tunnel_generation_proven": True,
         "listeners_absent_after_stop": True,
-        "mcp_adapter_invocation_proven": False,
+        "mcp_adapter_invocation_proven": True,
         "openai_control_plane_origin_proven": False,
         "full_bridge_command_flow_proven": False,
         "bootstrap_retired": False,
@@ -73,7 +74,7 @@ def test_result_validator_locks_boundary_and_exact_types():
     for patch in (
         {"runner_invoked_mcp": True},
         {"runner_enqueued_agent_command": True},
-        {"mcp_adapter_invocation_proven": True},
+        {"mcp_adapter_invocation_proven": False},
         {"openai_control_plane_origin_proven": True},
         {"full_bridge_command_flow_proven": True},
         {"secure_tunnel_generation_proven": False},
@@ -82,6 +83,8 @@ def test_result_validator_locks_boundary_and_exact_types():
         {"workspace_content_encoding": "latin-1"},
         {"tunnel_readiness_body_class": "startup_timeout"},
         {"principal_sha256": "C" * 64},
+        {"mcp_ingress_generation": "E" * 32},
+        {"mcp_ingress_generation": "e" * 31},
     ):
         with pytest.raises(mod.BridgeExternalMcpCommandFlowRunnerError):
             mod.validate_external_mcp_command_flow_result(exact_result(**patch))

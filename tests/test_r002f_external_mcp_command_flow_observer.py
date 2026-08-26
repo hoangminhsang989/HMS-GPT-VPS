@@ -47,6 +47,7 @@ SOURCE_COMMIT = "4" * 40
 PATH = "proof/external-mcp-read.txt"
 CONTENT = b"HMS GPT VPS external MCP durable read proof\n"
 CONTENT_SHA256 = hashlib.sha256(CONTENT).hexdigest()
+INGRESS_GENERATION = "a" * 32
 BASE = datetime(2026, 8, 26, 5, 0, tzinfo=timezone.utc)
 SESSION_ISSUED = BASE - timedelta(minutes=4)
 SESSION_EXPIRES = BASE + timedelta(minutes=56)
@@ -175,6 +176,7 @@ def _write_authority(
     result: AgentCommandResult | None = None,
     idempotency_state: str = "completed",
     receipt_override: dict[str, object] | None = None,
+    ingress_generation: str | None = INGRESS_GENERATION,
 ) -> PrincipalDispatchIntent:
     command = command or _command()
     result = result or _result()
@@ -302,6 +304,19 @@ def _write_authority(
             expires_at TEXT NOT NULL,
             PRIMARY KEY(session_id, request_id)
         ) WITHOUT ROWID;
+        CREATE TABLE principal_dispatch_ingress_provenance (
+            schema_version INTEGER NOT NULL,
+            principal_sha256 TEXT NOT NULL,
+            pair_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            session_epoch INTEGER NOT NULL,
+            instance_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            command_sha256 TEXT NOT NULL,
+            mcp_ingress_generation TEXT NOT NULL,
+            PRIMARY KEY(session_id, request_id)
+        ) WITHOUT ROWID;
         CREATE TABLE idempotency_records (
             session_id TEXT NOT NULL,
             request_id TEXT NOT NULL,
@@ -319,6 +334,22 @@ def _write_authority(
         "INSERT INTO principal_agent_dispatch_claims VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         intent.to_row(),
     )
+    if ingress_generation is not None:
+        idempotency.execute(
+            "INSERT INTO principal_dispatch_ingress_provenance VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                intent.principal_sha256,
+                intent.pair_id,
+                intent.session_id,
+                intent.session_epoch,
+                intent.instance_id,
+                intent.request_id,
+                intent.request_sha256,
+                intent.command_sha256,
+                ingress_generation,
+            ),
+        )
     if idempotency_state == "completed":
         idempotency.execute(
             "INSERT INTO idempotency_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -384,7 +415,9 @@ def test_external_mcp_durable_read_observer_accepts_exact_chain_read_only(tmp_pa
     assert proof["agent_command_action"] == "workspace.read"
     assert proof["workspace_content_size"] == len(CONTENT)
     assert proof["expected_content_sha256"] == CONTENT_SHA256
-    assert proof["mcp_adapter_invocation_proven"] is False
+    assert proof["mcp_ingress_provenance_present"] is True
+    assert proof["mcp_ingress_generation"] == INGRESS_GENERATION
+    assert proof["mcp_adapter_invocation_proven"] is True
     assert proof["openai_control_plane_origin_proven"] is False
     assert proof["secure_tunnel_generation_proven"] is False
     assert proof["full_bridge_command_flow_proven"] is False
@@ -485,4 +518,27 @@ def test_observer_rejects_binding_drift_during_reobservation(tmp_path: Path) -> 
             _challenge(),
             binding_loader=drifting_loader,
             now=BASE + timedelta(minutes=2),
+        )
+
+
+def test_observer_rejects_missing_mcp_ingress_provenance(tmp_path: Path) -> None:
+    _write_authority(tmp_path, ingress_generation=None)
+    with pytest.raises(ExternalMcpCommandFlowObservationError, match="provenance"):
+        observe_external_mcp_read_durable_authority(
+            tmp_path, _challenge(), binding_loader=_loader(_binding()), now=BASE + timedelta(minutes=2)
+        )
+
+
+def test_observer_rejects_ingress_provenance_digest_drift(tmp_path: Path) -> None:
+    _write_authority(tmp_path)
+    db = _db(tmp_path / "db" / "control-idempotency.sqlite3")
+    db.execute(
+        "UPDATE principal_dispatch_ingress_provenance SET command_sha256 = ? WHERE request_id = ?",
+        ("f" * 64, REQUEST_ID),
+    )
+    db.commit()
+    db.close()
+    with pytest.raises(ExternalMcpCommandFlowObservationError, match="provenance"):
+        observe_external_mcp_read_durable_authority(
+            tmp_path, _challenge(), binding_loader=_loader(_binding()), now=BASE + timedelta(minutes=2)
         )

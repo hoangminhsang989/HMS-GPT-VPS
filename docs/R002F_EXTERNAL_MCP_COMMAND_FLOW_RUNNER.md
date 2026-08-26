@@ -50,14 +50,15 @@ A successful staged result may set:
 
 It must still keep all of these false:
 
-- `mcp_adapter_invocation_proven`
 - `openai_control_plane_origin_proven`
 - `full_bridge_command_flow_proven`
 - `bootstrap_retired`
 - `pairing_ready`
 - `automatic_start_enabled`
 
-The ephemeral MCP tunnel-ingress capability prevents an ordinary loopback caller with only an OAuth bearer from reaching `/mcp`, and the composite runner proves a live reviewed tunnel generation remained present across the external request. However, the current durable request records do not carry a per-request ingress provenance marker. Therefore this tranche does **not** claim that a specific completed request originated in the OpenAI control plane or that the MCP adapter itself is independently proven from durable bytes. Those require a later live connector/origin evidence tranche (or a separately reviewed per-request ingress provenance design).
+The ephemeral MCP tunnel-ingress capability prevents an ordinary loopback caller with only an OAuth bearer from reaching `/mcp`. The later durable provenance tranche records the exact non-secret ingress generation atomically with the NEW principal dispatch. This runner now requires that exact durable generation to equal the independently qualified native tunnel generation both before and after the challenged request. A successful run may therefore publish `mcp_adapter_invocation_proven=true` and the exact `mcp_ingress_generation`.
+
+This still does **not** prove that ChatGPT/OpenAI control-plane initiated the request. The same reviewed HMS tunnel client and protected MCP ingress may be exercised by another authorized integration path. Therefore `openai_control_plane_origin_proven=false` and `full_bridge_command_flow_proven=false` remain mandatory until a separate live connector/origin proof exists.
 
 ## Staging validation
 

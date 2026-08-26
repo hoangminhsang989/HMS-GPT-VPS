@@ -22,7 +22,7 @@ from .external_mcp_command_flow_contract import (
 )
 from .external_mcp_command_flow_sqlite import (
     load_completed_agent_command,
-    load_dispatch_and_receipt,
+    load_dispatch_provenance_and_receipt,
     load_pairing_and_control_session,
 )
 from .principal_binding_registry_authority import PinnedDpapiPrincipalBindingRegistry
@@ -245,7 +245,9 @@ def observe_external_mcp_read_durable_authority(
     auth_db = db_dir / "pairing-control.sqlite3"
     command_db = db_dir / "agent-commands.sqlite3"
 
-    intent, receipt = load_dispatch_and_receipt(idempotency_db, challenge)
+    intent, provenance, receipt = load_dispatch_provenance_and_receipt(
+        idempotency_db, challenge
+    )
     if intent.instance_id != challenge.instance_id or intent.request_id != challenge.request_id:
         raise ExternalMcpCommandFlowObservationError(
             "principal dispatch identity differs from challenge"
@@ -365,7 +367,9 @@ def observe_external_mcp_read_durable_authority(
         "idempotency_completion_receipt_proven": True,
         "agent_command_result_proven": True,
         "authenticated_principal_control_path_proven": True,
-        "mcp_adapter_invocation_proven": False,
+        "mcp_ingress_provenance_present": True,
+        "mcp_ingress_generation": provenance.mcp_ingress_generation,
+        "mcp_adapter_invocation_proven": True,
         "openai_control_plane_origin_proven": False,
         "secure_tunnel_generation_proven": False,
         "full_bridge_command_flow_proven": False,

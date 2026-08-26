@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import MutableMapping
 
-from .bridge_external_mcp_command_flow_qualification import (
+from .bridge_protected_mcp_command_flow_qualification import (
     BridgeExternalMcpCommandFlowQualificationRequest,
     qualify_external_mcp_read_with_stable_tunnel,
 )
@@ -53,6 +53,7 @@ _RESULT_KEYS = frozenset(
         "session_id",
         "session_epoch",
         "agent_result_sha256",
+        "mcp_ingress_generation",
         "authenticated_principal_control_path_proven",
         "durable_external_principal_read_proven",
         "runner_invoked_mcp",
@@ -123,6 +124,7 @@ def validate_external_mcp_command_flow_result(
         "durable_external_principal_read_proven",
         "secure_tunnel_generation_proven",
         "listeners_absent_after_stop",
+        "mcp_adapter_invocation_proven",
     ):
         if result.get(key) is not True:
             raise BridgeExternalMcpCommandFlowRunnerError(
@@ -131,7 +133,6 @@ def validate_external_mcp_command_flow_result(
     for key in (
         "runner_invoked_mcp",
         "runner_enqueued_agent_command",
-        "mcp_adapter_invocation_proven",
         "openai_control_plane_origin_proven",
         "full_bridge_command_flow_proven",
         "bootstrap_retired",
@@ -202,6 +203,16 @@ def validate_external_mcp_command_flow_result(
     if result.get("tunnel_readiness_body_class") not in {"ready", "mcp_auth_required"}:
         raise BridgeExternalMcpCommandFlowRunnerError(
             "external MCP command-flow tunnel readiness class is invalid"
+        )
+    generation = result.get("mcp_ingress_generation")
+    if (
+        not isinstance(generation, str)
+        or len(generation) != 32
+        or generation != generation.lower()
+        or any(char not in "0123456789abcdef" for char in generation)
+    ):
+        raise BridgeExternalMcpCommandFlowRunnerError(
+            "external MCP command-flow ingress generation is invalid"
         )
     return dict(result)
 

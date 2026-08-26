@@ -46,16 +46,17 @@ For one exact `(instance_id, request_id)` it requires:
 
 The observer also reconstructs the exact production `ControlRequest` using the observed session id plus challenge request/action/path and requires its `request_sha256()` to equal the durable dispatch intent. This prevents a matching request id from proving a different action or path.
 
-## Deliberately false proof flags
+## Proof boundary after durable ingress provenance
 
-A successful observer result keeps all of these false:
+A successful observer now requires one exact `principal_dispatch_ingress_provenance` row in the same read-only SQLite snapshot as the dispatch and completed idempotency receipt. It returns the canonical 32-hex `mcp_ingress_generation` and may set `mcp_adapter_invocation_proven=true`.
 
-- `mcp_adapter_invocation_proven`
+The observer still keeps all of these false:
+
 - `openai_control_plane_origin_proven`
 - `secure_tunnel_generation_proven`
 - `full_bridge_command_flow_proven`
 
-A durable database chain alone cannot prove where the initiating authenticated principal call came from. Those flags may only advance in a later composite runner that brackets an actual ChatGPT/OpenAI tunnel invocation.
+The durable database chain does not independently observe the live tunnel process and cannot prove that ChatGPT/OpenAI control plane initiated the call. Native tunnel generation is joined later by the composite qualification; origin remains a separate live connector proof.
 
 ## Validation performed while staging
 
@@ -66,4 +67,4 @@ A durable database chain alone cannot prove where the initiating authenticated p
 - Repository pytest: NOT RUN in this environment.
 - Real Windows / Hyper-V / LocalMachine-DPAPI / OpenAI tunnel / ChatGPT connector execution: NOT RUN.
 
-Therefore this tranche remains `STAGED_NOT_EXECUTED` and does not change `full_bridge_command_flow_proven=false`.
+The observer remains read-only and `STAGED_NOT_EXECUTED`. It does not itself bind the stored ingress generation to an independently observed native tunnel process; that comparison belongs to the composite qualification. `openai_control_plane_origin_proven=false` and `full_bridge_command_flow_proven=false` remain unchanged.

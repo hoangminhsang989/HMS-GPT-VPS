@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import hms_gpt_vps.bridge_external_mcp_command_flow_qualification as mod
+import hms_gpt_vps.bridge_external_mcp_command_flow_qualification as base_mod
+import hms_gpt_vps.bridge_protected_mcp_command_flow_qualification as mod
 from hms_gpt_vps.idempotency_store import IdempotencyState
 from hms_gpt_vps.powershell_direct import PowerShellDirectCredential
 
@@ -14,6 +15,7 @@ TUNNEL_PID = 5252
 AGENT_PID = 6262
 SOURCE_COMMIT = "4" * 40
 CONTENT_SHA256 = "a" * 64
+INGRESS_GENERATION = "d" * 32
 
 
 class Config:
@@ -83,6 +85,7 @@ def tunnel_evidence(**overrides):
         "readiness_url": "http://127.0.0.1:54321/readyz",
         "readiness_status_code": 200,
         "readiness_body_class": "mcp_auth_required",
+        "mcp_ingress_generation": INGRESS_GENERATION,
     }
     value.update(overrides)
     return value
@@ -114,7 +117,9 @@ def observer_evidence(challenge, **overrides):
         "idempotency_completion_receipt_proven": True,
         "agent_command_result_proven": True,
         "authenticated_principal_control_path_proven": True,
-        "mcp_adapter_invocation_proven": False,
+        "mcp_ingress_provenance_present": True,
+        "mcp_ingress_generation": INGRESS_GENERATION,
+        "mcp_adapter_invocation_proven": True,
         "openai_control_plane_origin_proven": False,
         "secure_tunnel_generation_proven": False,
         "full_bridge_command_flow_proven": False,
@@ -171,7 +176,7 @@ def install_success(monkeypatch):
     tunnel_values = iter([tunnel_evidence(), tunnel_evidence()])
     monkeypatch.setattr(
         mod,
-        "qualify_running_secure_mcp_tunnel",
+        "qualify_running_secure_mcp_tunnel_with_ingress_generation",
         lambda **k: order.append("tunnel.probe") or next(tunnel_values),
     )
     hello = SimpleNamespace(
@@ -246,21 +251,21 @@ def test_challenge_payload_is_non_secret_and_exact():
 
 
 def test_progress_observer_handles_absent_claimed_completed_and_atomic_gap(monkeypatch):
-    challenge = mod._new_challenge(request(), instance_id="instance-1")
+    challenge = base_mod._new_challenge(request(), instance_id="instance-1")
 
     @contextmanager
     def connection(*args, **kwargs):
         yield object()
 
-    monkeypatch.setattr(mod, "read_only_connection", connection)
-    monkeypatch.setattr(mod, "PrincipalDispatchIntent", FakeIntent)
+    monkeypatch.setattr(base_mod, "read_only_connection", connection)
+    monkeypatch.setattr(base_mod, "PrincipalDispatchIntent", FakeIntent)
     monkeypatch.setattr(
-        mod.IdempotencyStore,
+        base_mod.IdempotencyStore,
         "_validate_row",
         staticmethod(lambda row, **kwargs: (row["_state"], None)),
     )
-    monkeypatch.setattr(mod, "query_rows", lambda *a, **k: [])
-    assert mod._observe_external_progress(Path("C:/runtime"), challenge) == "absent"
+    monkeypatch.setattr(base_mod, "query_rows", lambda *a, **k: [])
+    assert base_mod._observe_external_progress(Path("C:/runtime"), challenge) == "absent"
 
     for state, expected in (
         (IdempotencyState.CLAIMED, "claimed"),
@@ -278,8 +283,8 @@ def test_progress_observer_handles_absent_claimed_completed_and_atomic_gap(monke
                 ]
             return [{"_state": state}]
 
-        monkeypatch.setattr(mod, "query_rows", query_rows)
-        assert mod._observe_external_progress(Path("C:/runtime"), challenge) == expected
+        monkeypatch.setattr(base_mod, "query_rows", query_rows)
+        assert base_mod._observe_external_progress(Path("C:/runtime"), challenge) == expected
 
     def atomic_gap(connection, query, params):
         if "FROM principal_agent_dispatch_claims" in query:
@@ -293,26 +298,26 @@ def test_progress_observer_handles_absent_claimed_completed_and_atomic_gap(monke
             ]
         return []
 
-    monkeypatch.setattr(mod, "query_rows", atomic_gap)
+    monkeypatch.setattr(base_mod, "query_rows", atomic_gap)
     with pytest.raises(
-        mod.BridgeExternalMcpCommandFlowQualificationError,
+        base_mod.BridgeExternalMcpCommandFlowQualificationError,
         match="atomic idempotency",
     ):
-        mod._observe_external_progress(Path("C:/runtime"), challenge)
+        base_mod._observe_external_progress(Path("C:/runtime"), challenge)
 
 
 def test_wait_calls_full_observer_only_after_completed(monkeypatch):
-    challenge = mod._new_challenge(request(), instance_id="instance-1")
+    challenge = base_mod._new_challenge(request(), instance_id="instance-1")
     states = iter(["absent", "claimed", "completed"])
     calls = []
-    monkeypatch.setattr(mod, "_observe_external_progress", lambda *a: next(states))
+    monkeypatch.setattr(base_mod, "_observe_external_progress", lambda *a: next(states))
     monkeypatch.setattr(
-        mod,
+        base_mod,
         "observe_external_mcp_read_durable_authority",
         lambda *a, **k: calls.append("observer") or observer_evidence(challenge),
     )
     ticks = iter([0.0, 0.0, 0.1, 0.2, 0.3])
-    result = mod._wait_for_external_observation(
+    result = base_mod._wait_for_external_observation(
         Path("C:/runtime"),
         challenge,
         timeout_seconds=1.0,
@@ -351,7 +356,8 @@ def test_external_read_is_bracketed_without_runner_self_call(monkeypatch):
     assert result["secure_tunnel_generation_proven"] is True
     assert result["runner_invoked_mcp"] is False
     assert result["runner_enqueued_agent_command"] is False
-    assert result["mcp_adapter_invocation_proven"] is False
+    assert result["mcp_ingress_generation"] == INGRESS_GENERATION
+    assert result["mcp_adapter_invocation_proven"] is True
     assert result["openai_control_plane_origin_proven"] is False
     assert result["full_bridge_command_flow_proven"] is False
 
@@ -379,12 +385,28 @@ def test_tunnel_generation_drift_fails_closed_and_stops(monkeypatch):
     )
     monkeypatch.setattr(
         mod,
-        "qualify_running_secure_mcp_tunnel",
+        "qualify_running_secure_mcp_tunnel_with_ingress_generation",
         lambda **k: order.append("tunnel.probe") or next(tunnel_values),
     )
     with pytest.raises(
         mod.BridgeExternalMcpCommandFlowQualificationError,
         match="tunnel generation changed",
+    ):
+        mod.qualify_external_mcp_read_with_stable_tunnel(request())
+    assert "service.stop" in order
+
+
+def test_ingress_provenance_generation_mismatch_fails_closed_and_stops(monkeypatch):
+    order, _ = install_success(monkeypatch)
+
+    def wait_for_external(runtime_root, challenge, **kwargs):
+        order.append("external.wait")
+        return observer_evidence(challenge, mcp_ingress_generation="e" * 32)
+
+    monkeypatch.setattr(mod, "_wait_for_external_observation", wait_for_external)
+    with pytest.raises(
+        mod.BridgeExternalMcpCommandFlowQualificationError,
+        match="provenance differs from native tunnel generation",
     ):
         mod.qualify_external_mcp_read_with_stable_tunnel(request())
     assert "service.stop" in order

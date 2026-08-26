@@ -17,6 +17,7 @@ from .external_mcp_command_flow_contract import (
 from .idempotency_store import IdempotencyState, IdempotencyStore
 from .pairing import PairingRecord
 from .pairing_store import PairingStore
+from .principal_dispatch_ingress_provenance import McpIngressDispatchProvenance
 from .principal_dispatch_intent import PrincipalDispatchIntent
 from .qualification_file_authority import lexical_absolute, path_chain_has_redirect
 
@@ -163,6 +164,91 @@ def load_dispatch_and_receipt(
             "principal read request has not reached durable completed state"
         )
     return intent, dict(receipt)
+
+
+def load_dispatch_provenance_and_receipt(
+    idempotency_db: Path,
+    challenge: ExternalMcpReadChallenge,
+) -> tuple[PrincipalDispatchIntent, McpIngressDispatchProvenance, dict[str, object]]:
+    """Load one completed dispatch and its atomic protected-MCP provenance snapshot."""
+
+    with read_only_connection(
+        idempotency_db,
+        label="principal dispatch authority database",
+    ) as connection:
+        dispatch_rows = query_rows(
+            connection,
+            """
+            SELECT schema_version, principal_sha256, pair_id, session_id,
+                   session_epoch, instance_id, request_id, request_sha256,
+                   command_sha256, expires_at
+            FROM principal_agent_dispatch_claims
+            WHERE instance_id = ? AND request_id = ?
+            """,
+            (challenge.instance_id, challenge.request_id),
+        )
+        if len(dispatch_rows) != 1:
+            raise ExternalMcpCommandFlowObservationError(
+                "challenge must resolve to exactly one principal dispatch intent"
+            )
+        try:
+            intent = PrincipalDispatchIntent.from_row(dispatch_rows[0])
+        except Exception as exc:
+            raise ExternalMcpCommandFlowObservationError(
+                "principal dispatch intent failed exact validation"
+            ) from exc
+
+        provenance_rows = query_rows(
+            connection,
+            """
+            SELECT schema_version, principal_sha256, pair_id, session_id,
+                   session_epoch, instance_id, request_id, request_sha256,
+                   command_sha256, mcp_ingress_generation
+            FROM principal_dispatch_ingress_provenance
+            WHERE session_id = ? AND request_id = ?
+            """,
+            (intent.session_id, intent.request_id),
+        )
+        if len(provenance_rows) != 1:
+            raise ExternalMcpCommandFlowObservationError(
+                "principal dispatch lacks one exact protected MCP ingress provenance row"
+            )
+        try:
+            provenance = McpIngressDispatchProvenance.from_row(provenance_rows[0])
+            provenance.require_exact_intent(intent)
+        except Exception as exc:
+            raise ExternalMcpCommandFlowObservationError(
+                "protected MCP ingress provenance failed exact dispatch validation"
+            ) from exc
+
+        idempotency_rows = query_rows(
+            connection,
+            """
+            SELECT request_sha256, state, response_json, response_sha256,
+                   claimed_at, completed_at
+            FROM idempotency_records
+            WHERE session_id = ? AND request_id = ?
+            """,
+            (intent.session_id, intent.request_id),
+        )
+        if len(idempotency_rows) != 1:
+            raise ExternalMcpCommandFlowObservationError(
+                "principal dispatch intent lacks one exact idempotency record"
+            )
+        try:
+            state, receipt = IdempotencyStore._validate_row(
+                idempotency_rows[0],
+                expected_request_sha256=intent.request_sha256,
+            )
+        except Exception as exc:
+            raise ExternalMcpCommandFlowObservationError(
+                "principal idempotency record failed exact validation"
+            ) from exc
+    if state is not IdempotencyState.COMPLETED or not isinstance(receipt, dict):
+        raise ExternalMcpCommandFlowObservationError(
+            "principal read request has not reached durable completed state"
+        )
+    return intent, provenance, dict(receipt)
 
 
 def load_pairing_and_control_session(
