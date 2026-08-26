@@ -2,81 +2,71 @@
 
 Status: `STAGED_NOT_EXECUTED`
 
-This checkpoint stages the long-lived `HMSBridge` runtime composition that sits behind
-the Windows SCM host. It does not start the Windows service and does not claim any
-real Windows/Hyper-V proof.
+This authority stages the long-lived `HMSBridge` runtime behind the Windows SCM host. It now composes the private Agent TLS listener, loopback MCP server, and supervised OpenAI tunnel-client runtime. It does not claim a real Windows service start or a real OpenAI tunnel attachment.
 
-## Authority
+## Composite authority
 
-`BridgeProductionServiceRuntimeConfig` pins one service SID across:
+`BridgeProductionServiceRuntimeConfig` binds one exact `NT SERVICE\HMSBridge` SID across:
 
-- the SCM/runtime authority;
-- the machine-scope Bridge secret store reader;
-- the Agent TLS private-key reader.
+- SCM/runtime identity;
+- machine-scope Bridge secret reader;
+- Agent TLS private-key reader;
+- Secure MCP Tunnel supervisor;
+- durable non-secret `tunnel_id` loaded from protected `bridge-runtime.json` schema v2.
 
-The machine-scope secret root must be the fixed `service-runtime` child under the
-production Bridge `secrets` directory.
+The production MCP endpoint remains exact loopback `127.0.0.1:8765/mcp`. The tunnel package remains outside the service-writable runtime tree under the fixed immutable package authority `C:\ProgramData\HMS-GPT-VPS\Bridge\tunnel-client\v0.0.12`.
 
 ## Construction order
 
-`build_bridge_production_service_runtime(...)` is fail closed:
+`build_bridge_production_service_runtime(...)` remains fail closed:
 
-1. prove the exact low-privilege `NT SERVICE\HMSBridge` token;
-2. load the already-provisioned LocalMachine-DPAPI service secrets behind exact ACLs;
-3. build `BridgeProductionDependencies`;
-4. assemble the production Bridge;
-5. re-prove the exact service token before publishing the runtime object.
+1. prove the exact low-privilege HMSBridge token;
+2. load already-provisioned LocalMachine-DPAPI service dependencies behind exact ACLs;
+3. assemble the production Bridge and local MCP authority;
+4. re-prove the service token;
+5. publish a runtime object whose tunnel supervisor is still unstarted.
 
-No privileged provisioning credential is accepted by this factory.
+No privileged provisioning credential, tunnel API key, config path, or tunnel ID is accepted on argv.
 
-## Runtime lifecycle
+## Startup and SCM readiness
 
-`BridgeProductionServiceRuntime.run(stop)`:
+`start(stop)` now owns the complete readiness boundary:
 
-1. re-proves the strict service identity immediately before listener startup;
-2. starts the private Agent TLS listener through the existing production TLS runtime;
-3. builds MCP Streamable HTTP as a top-level ASGI application;
-4. hosts MCP on exact loopback `127.0.0.1` with the configured MCP port;
-5. uses a non-daemon uvicorn server thread with bounded startup;
-6. watches both SCM stop and unexpected MCP exit;
-7. requests graceful uvicorn exit on SCM stop, escalates to `force_exit` only after the
-   bounded graceful wait, and fails closed if the thread remains alive;
-8. always shuts down the Agent TLS listener in `finally`.
+1. re-prove HMSBridge runtime identity;
+2. start the exact private Agent TLS listener;
+3. start MCP Streamable HTTP on exact loopback `127.0.0.1:8765`;
+4. require the MCP server thread to reach bounded startup and remain alive;
+5. construct `SecureMcpTunnelRuntime` from protected service authority;
+6. start the pinned `tunnel-client-runtime.exe` child;
+7. require a fresh canonical loopback health URL handoff and accepted `/readyz` response;
+8. re-check TLS/MCP and call `tunnel.assert_healthy()`;
+9. re-prove service identity;
+10. return `True` only then, allowing the SCM host to publish `SERVICE_RUNNING`.
 
-The MCP ASGI application is served directly rather than mounted into another ASGI
-application, so its built-in session-manager lifespan remains authoritative.
+A pre-existing SCM stop returns `False` without opening listeners. Any startup failure runs bounded reverse cleanup and never converts partial readiness into SCM readiness.
 
-## Remaining boundary
+## Steady-state health
 
-This checkpoint deliberately does not change the older SID-only helper inside
-`agent_bridge_tls_storage.py`. The production SCM path now has strict identity gates
-at the service host, secret loader, runtime factory construction, and runtime start.
-A later contained remediation should supersede the compatibility helper itself.
+`wait(stop)` continues checking:
 
-The SCM host still reports `SERVICE_RUNNING` before `runtime.run(...)` has completed
-listener startup. That lifecycle/reporting issue must be remediated before production
-service activation.
+- MCP thread liveness and stored MCP startup/runtime errors;
+- exact Agent TLS bind authority;
+- Secure MCP Tunnel child liveness and fresh `/readyz` through `assert_healthy()` on a bounded cadence.
 
-## Validation
+A tunnel child exit, unreachable tunnel health endpoint, or degraded readiness fails HMSBridge closed. The child is not blindly restarted inside the service process; failure bubbles to the existing bounded SCM recovery policy.
 
-Scratch validation only:
+## Shutdown order
 
-- direct Python syntax compilation: PASS for module and focused tests;
-- synthetic dependency-stub import: PASS.
+Shutdown is idempotent and intentionally removes remote ingress first:
 
-Not executed here:
+1. Secure MCP Tunnel;
+2. local MCP server, graceful then forced only after bounded wait;
+3. Agent TLS listener.
 
-- repository pytest suite;
-- GitHub Actions;
-- real Windows SCM;
-- real service SID/token proof;
-- real LocalMachine-DPAPI load;
-- real TLS bind;
-- real MCP bind;
-- real managed-guest TLS;
-- authenticated Agent traffic;
-- full command flow.
+A failure in an earlier shutdown stage does not skip later cleanup; the first failure is surfaced after owned resources have been given their cleanup attempt.
 
-Therefore all production proof flags remain false, including
-`authenticated_agent_transport_proven`, `full_bridge_command_flow_proven`,
-`bootstrap_retired`, and `pairing_ready`.
+## Validation boundary
+
+Dependency-isolated local regression covers composite ordering, rollback, tunnel health loss, MCP/TLS liveness, fixed port/tunnel ID validation, and shutdown ordering. The Secure MCP Tunnel focused suite separately covers process, package, health handoff, secret-environment scrubbing, and one-shot `assert_healthy()` behavior.
+
+This is not GitHub CI, native Windows SCM proof, a real `tunnel-client-runtime.exe` run, or a real OpenAI/ChatGPT principal flow. Project status remains `STAGED_NOT_EXECUTED`.

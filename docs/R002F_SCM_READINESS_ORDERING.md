@@ -2,88 +2,45 @@
 
 Status: `STAGED_NOT_EXECUTED`
 
-This checkpoint supersedes the earlier SCM lifecycle ordering in
-`f393953de4ca4fd22378e8c98d20f5a23da0d5f8` and the production runtime lifecycle
-staged in `bbe62ed985214faf0ba68a96306580b885c10ec6`.
+This authority supersedes earlier TLS+MCP-only readiness descriptions. HMSBridge SCM readiness now includes the supervised Secure MCP Tunnel.
 
-## Why this checkpoint is required
+## Canonical ordering
 
-The previous `HmsBridgeWindowsServiceHost` published `SERVICE_RUNNING` before
-`BridgeProductionServiceRuntime.run(...)` had started and proved the Agent TLS
-listener and loopback MCP server. That allowed SCM-visible readiness to get ahead
-of actual runtime readiness.
+The runtime contract remains split into `start`, `wait`, and `shutdown`.
 
-The production runtime also uses `uvicorn.Server` for controllable ASGI shutdown,
-so the `bridge` optional dependency must include `uvicorn`.
+`start(stop) -> bool`:
 
-## Canonical SCM ordering
+1. strict `NT SERVICE\HMSBridge` identity proof;
+2. Agent TLS exact bind;
+3. loopback MCP exact bind on `127.0.0.1:8765` and bounded server startup;
+4. Secure MCP Tunnel child start from the immutable pinned package;
+5. fresh health URL handoff and accepted `/readyz`;
+6. fresh local TLS/MCP check plus tunnel `assert_healthy()`;
+7. final service identity proof;
+8. return `True` only when the composite runtime is ready.
 
-The service runtime contract is now split into:
+`wait(stop)` fails closed on MCP exit/error, TLS authority loss, tunnel child exit, unreachable tunnel health, or degraded `/readyz`.
 
-1. `start(stop) -> bool`
-   - performs strict `NT SERVICE\\HMSBridge` token proof;
-   - starts the exact Agent TLS listener;
-   - starts loopback MCP on `127.0.0.1`;
-   - waits for MCP server startup;
-   - re-proves TLS bind authority and strict service identity;
-   - returns `True` only after all readiness gates pass;
-   - returns `False` if SCM stop wins before readiness.
+`shutdown()` removes ingress in this order:
 
-2. `wait(stop)`
-   - is entered only after `start(...)` returned `True`;
-   - fails closed if MCP exits or the TLS listener loses exact bind authority;
-   - returns only after the SCM stop event is set.
+`tunnel -> MCP -> Agent TLS`
 
-3. `shutdown()`
-   - is idempotent;
-   - stops MCP first using bounded graceful/forced exit;
-   - always closes the Agent TLS runtime;
-   - never leaves TLS running because MCP shutdown failed.
+`run(stop)` remains a compatibility wrapper around `start -> wait -> shutdown`; the Windows SCM host owns the status transitions.
 
-`run(stop)` remains only as a compatibility wrapper around
-`start -> wait -> shutdown`. The Windows SCM host no longer uses it.
+## SCM status authority
 
-The SCM host now follows:
+The host ordering remains:
 
 `START_PENDING -> runtime.start() -> RUNNING -> runtime.wait() -> STOP_PENDING -> runtime.shutdown() -> STOPPED`
 
-If stop wins during startup, `SERVICE_RUNNING` is never published. Runtime
-startup failures also transition through `STOP_PENDING` before cleanup when
-the service status channel remains available.
+Therefore `SERVICE_RUNNING` must never be published from TLS+MCP readiness alone. If tunnel startup fails or stop wins before composite readiness, the service never reaches `RUNNING`.
 
-## Failure-code authority
+## Restart authority
 
-- identity proof: `110`
-- runtime construction: `120`
-- runtime startup/readiness: `125`
-- runtime execution/health: `130`
-- runtime shutdown: `140`
-- host lifecycle/status channel: `190`
-
-## Dependency authority
-
-`pyproject.toml` now requires `uvicorn>=0.30,<1` in the `bridge` optional
-dependency set alongside `mcp>=2,<3`.
+The tunnel supervisor deliberately contains no blind child restart loop. Runtime health failure escapes the HMSBridge service generation and delegates recovery to the existing bounded SCM failure-action authority. A fresh generation must re-prove service identity, protected secrets, immutable package bytes/ACLs, and tunnel health.
 
 ## Validation boundary
 
-Scratch/synthetic validation performed before publication:
+Focused local dependency-isolated tests cover composite startup ordering, pre-stop behavior, tunnel-start rollback, steady tunnel loss, reverse shutdown ordering, and fixed MCP/tunnel authority. This is not repository CI or native Windows execution.
 
-- updated Windows service-host focused suite: 4/4 PASS;
-- production runtime start/wait/shutdown synthetic suite: 2/2 PASS;
-- direct Python syntax compilation for the updated host, runtime, and focused
-  test source: PASS.
-
-This is not repository pytest, GitHub Actions, or real Windows/Hyper-V execution.
-
-The following remain false until later real qualification succeeds:
-
-- real-host HMSBridge SCM execution
-- real-host Agent TLS listener proof
-- real loopback MCP startup proof
-- authenticated Agent transport proof
-- full Bridge command-flow proof
-- bootstrap retirement
-- pairing readiness
-
-PR #11 remains outside this promotion.
+Still unproven: real SCM execution, real LocalMachine-DPAPI tunnel-key use, real `tunnel-client-runtime.exe`, real OpenAI tunnel attachment, real ChatGPT/MCP principal flow, full command flow, bootstrap retirement, and pairing readiness.

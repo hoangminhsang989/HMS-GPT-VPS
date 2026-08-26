@@ -19,6 +19,7 @@ def test_runtime_shutdown_surfaces_mcp_error_and_still_closes_tls():
     runtime = object.__new__(BridgeProductionServiceRuntime)
     runtime._closed = False
     runtime._started = True
+    runtime._tunnel_runtime = None
     runtime._mcp_server = None
     runtime._mcp_thread = None
     runtime._mcp_error = [RuntimeError("mcp failed during shutdown")]

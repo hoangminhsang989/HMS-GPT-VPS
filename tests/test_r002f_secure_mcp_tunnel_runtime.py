@@ -242,6 +242,51 @@ def test_wait_fails_closed_on_unexpected_child_exit(monkeypatch, tmp_path):
     runtime.shutdown()
 
 
+def test_assert_healthy_reprobes_ready_runtime(monkeypatch, tmp_path):
+    runtime, _, captured = make_runtime(
+        monkeypatch,
+        tmp_path,
+        responses=[
+            health.TunnelHealthResponse(200, b"ready", "text/plain"),
+            health.TunnelHealthResponse(200, b"ready", "text/plain"),
+        ],
+    )
+    assert runtime.start(Stop()) is True
+    runtime.assert_healthy()
+    assert captured["probes"] == [
+        "http://127.0.0.1:54321/readyz",
+        "http://127.0.0.1:54321/readyz",
+    ]
+    runtime.shutdown()
+
+
+def test_assert_healthy_fails_closed_on_child_exit(monkeypatch, tmp_path):
+    runtime, process, _ = make_runtime(monkeypatch, tmp_path)
+    assert runtime.start(Stop()) is True
+    process.returncode = 23
+    with pytest.raises(
+        module.SecureMcpTunnelRuntimeError,
+        match="exited unexpectedly with code 23",
+    ):
+        runtime.assert_healthy()
+    runtime.shutdown()
+
+
+def test_assert_healthy_rejects_degraded_readiness(monkeypatch, tmp_path):
+    runtime, _, _ = make_runtime(
+        monkeypatch,
+        tmp_path,
+        responses=[
+            health.TunnelHealthResponse(200, b"ready", "text/plain"),
+            health.TunnelHealthResponse(503, b"mcp startup probe failed", "text/plain"),
+        ],
+    )
+    assert runtime.start(Stop()) is True
+    with pytest.raises(module.SecureMcpTunnelRuntimeError, match="HTTP 503"):
+        runtime.assert_healthy()
+    runtime.shutdown()
+
+
 def test_shutdown_escalates_terminate_to_kill_after_bound(monkeypatch, tmp_path):
     process = FakeProcess()
     process.timeout_once = True

@@ -168,17 +168,23 @@ Shutdown is bounded:
 4. second bounded wait;
 5. cleanup only the fresh owned health attempt.
 
-## Integration ordering
+## Production service integration ordering
 
-This tranche provides the standalone package provisioner and supervisor authority. The production service integration order is locked for the next wiring step:
+The supervisor is now staged into the HMSBridge production service lifecycle. Runtime configuration schema v2 carries one durable, non-secret `tunnel_id`; the service does not accept a tunnel-id argv, environment, or mutable side-config override. The protected create-only `bridge-runtime.json` remains the durable authority.
 
-`HMSBridge identity + secrets -> Agent TLS -> local MCP 127.0.0.1:8765 -> SecureMcpTunnelRuntime -> SCM ready`
+Startup is locked to:
 
-The tunnel must not be allowed to make HMSBridge SCM-ready before the local MCP server and the tunnel `/readyz` proof both succeed.
+`HMSBridge identity + protected config/secrets -> Agent TLS -> local MCP 127.0.0.1:8765 -> SecureMcpTunnelRuntime -> fresh /readyz proof -> SCM ready`
+
+The service rechecks the local MCP listener and calls `SecureMcpTunnelRuntime.assert_healthy()` on a bounded steady-state cadence. Tunnel child exit, unreachable health, or degraded `/readyz` therefore fails HMSBridge closed and delegates bounded restart to the existing SCM failure policy. Merely retaining a previously true `ready` property is not sufficient.
+
+Shutdown is ordered `tunnel -> local MCP -> Agent TLS` so cloud ingress is removed before the local endpoint is torn down.
+
+Host deployment is also staged to provision and re-prove the pinned tunnel runtime package, package ACL, LocalMachine-DPAPI tunnel API key, and exact service secret ACLs before the schema-v2 Bridge runtime config is published. The create-only deployment transaction still leaves HMSBridge `Stopped/Manual` and reports `tunnel_runtime_started=false` and `tunnel_ready=false`; provisioning is not execution proof.
 
 ## Evidence boundary at this checkpoint
 
-Focused dependency-stub harness for the newly staged package/supervisor code passes `18/18` tests, including defects found and remediated before commit:
+Focused local regression for package/supervisor plus production-service/deployment wiring passes `44/44` tests in the staged dependency-isolated harness. The supervisor suite now also exercises the public one-shot health assertion used by HMSBridge. Defects found and remediated before publication include:
 
 - ZIP Unix permission-only mode must not be misclassified as a special file;
 - unexpected child exit must retain its specific exit-code failure instead of being hidden by a derived `ready=false` property;
@@ -187,4 +193,4 @@ Focused dependency-stub harness for the newly staged package/supervisor code pas
 
 This is not GitHub CI and not Windows production proof.
 
-Project-level status remains `STAGED_NOT_EXECUTED` until a real Windows qualification observes package acquisition, LocalMachine DPAPI key use, child creation, health URL publication, `/readyz=200`, authenticated tunnel attachment, and an actual OpenAI/MCP principal flow.
+Project-level status remains `STAGED_NOT_EXECUTED` until a real Windows qualification observes package acquisition, LocalMachine DPAPI key use, protected schema-v2 config consumption, child creation, composite TLS/MCP/tunnel SCM readiness, health URL publication, `/readyz=200`, authenticated tunnel attachment, and an actual OpenAI/MCP principal flow.

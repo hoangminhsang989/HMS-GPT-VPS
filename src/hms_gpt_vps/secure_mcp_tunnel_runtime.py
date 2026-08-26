@@ -190,6 +190,14 @@ class SecureMcpTunnelRuntime:
         assert self._process is not None and self._health_base_url is not None and self._exe_sha is not None
         return SecureMcpTunnelRuntimeEvidence(True,self._process.pid,str(self.config.package.executable_path),self._exe_sha,self._health_base_url,self._health_base_url+"/readyz",HMS_MCP_SERVER_URL)
 
+    def assert_healthy(self) -> None:
+        if not self._started or self._closed or self._process is None or self._health_base_url is None:
+            raise SecureMcpTunnelRuntimeError("tunnel runtime is not ready")
+        code=self._process.poll()
+        if code is not None:
+            raise SecureMcpTunnelRuntimeError(f"tunnel process exited unexpectedly with code {code}")
+        self._probe(self._health_base_url+"/readyz",startup=False)
+
     def wait(self, stop: StopSignal) -> None:
         if not self._started or self._closed or self._process is None or self._health_base_url is None: raise SecureMcpTunnelRuntimeError("tunnel runtime is not ready")
         code=self._process.poll()

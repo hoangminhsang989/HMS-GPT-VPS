@@ -5,6 +5,7 @@ from io import BytesIO
 import hashlib
 import json
 from pathlib import Path, PureWindowsPath
+import secrets
 import struct
 
 from .agent_bridge_production_tls import provision_agent_bridge_production_tls_prerequisites
@@ -38,6 +39,10 @@ from .bridge_service_runtime_config_publication import (
     publish_bridge_service_runtime_config_create_only,
 )
 from .bridge_service_config_storage import load_protected_bridge_service_runtime_config
+from .bridge_service_secret_storage import (
+    provision_bridge_service_secret_storage,
+    prove_bridge_service_secret_storage,
+)
 from .bridge_tls_material_publication import (
     BRIDGE_TLS_CERTIFICATE_PATH,
     BRIDGE_TLS_PRIVATE_DIR,
@@ -46,11 +51,19 @@ from .bridge_tls_material_publication import (
 )
 from .pairing_exchange import PairingExchangeKey
 from .powershell_direct import PowerShellDirectCredential
+from .secure_mcp_tunnel import TunnelRuntimeApiKeyStore
+from .secure_mcp_tunnel_package import (
+    OPENAI_TUNNEL_CLIENT_SHA256,
+    TunnelRuntimePackageConfig,
+    provision_tunnel_runtime_package,
+    prove_installed_tunnel_runtime,
+)
 
 
 HMS_BRIDGE_EXPECTED_SERVICE_SID = (
     "S-1-5-80-3027300117-82505545-3616633165-1729693371-3881641565"
 )
+_MAX_TUNNEL_API_KEY_BYTES = 16 * 1024
 
 
 class BridgeHostDeploymentTransactionError(RuntimeError):
@@ -81,21 +94,40 @@ def _same_windows_path(left: object, right: object) -> bool:
     return str(PureWindowsPath(str(left))).casefold() == str(PureWindowsPath(str(right))).casefold()
 
 
+def _validate_tunnel_api_key_input(value: object) -> None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise TypeError("tunnel_runtime_api_key must be non-empty canonical text")
+    if any(char in value for char in ("\x00", "\r", "\n")):
+        raise TypeError("tunnel_runtime_api_key contains a forbidden control character")
+    try:
+        size = len(value.encode("utf-8", errors="strict"))
+    except UnicodeError as exc:
+        raise TypeError("tunnel_runtime_api_key must be valid UTF-8 text") from exc
+    if size > _MAX_TUNNEL_API_KEY_BYTES:
+        raise TypeError("tunnel_runtime_api_key exceeds safety bound")
+    if any(char not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-" for char in value):
+        raise TypeError("tunnel_runtime_api_key contains unsupported characters")
+
+
 @dataclass(frozen=True)
 class BridgeHostDeploymentRequest:
     source_package_root: Path
     package_manifest: BridgePackageManifest
     runtime_config: BridgeServiceRuntimeConfig
+    tunnel_archive_path: Path
     agent_credential: AgentDeviceCredential = field(repr=False)
     oauth_credential: BridgeOAuthIntrospectionCredential = field(repr=False)
     tls_certificate_pem: bytes = field(repr=False)
     tls_private_key_pem: bytes = field(repr=False)
     guest_credential: PowerShellDirectCredential = field(repr=False)
     trust_root_certificate_pem: bytes = field(repr=False)
+    tunnel_runtime_api_key: str = field(repr=False)
 
     def validate(self) -> None:
         if not isinstance(self.source_package_root, Path):
             raise TypeError("source_package_root must be pathlib.Path")
+        if not isinstance(self.tunnel_archive_path, Path):
+            raise TypeError("tunnel_archive_path must be pathlib.Path")
         if not isinstance(self.package_manifest, BridgePackageManifest):
             raise TypeError("package_manifest must be a BridgePackageManifest")
         if not isinstance(self.runtime_config, BridgeServiceRuntimeConfig):
@@ -112,6 +144,7 @@ class BridgeHostDeploymentRequest:
             raise TypeError("tls_private_key_pem must be non-empty bytes")
         if not isinstance(self.trust_root_certificate_pem, bytes) or not self.trust_root_certificate_pem:
             raise TypeError("trust_root_certificate_pem must be non-empty bytes")
+        _validate_tunnel_api_key_input(self.tunnel_runtime_api_key)
 
         self.package_manifest.validate()
         self.runtime_config.validate()
@@ -150,12 +183,7 @@ def _run_stage(stage: str, callback):
 
 
 def deploy_hms_bridge_host_create_only(request: BridgeHostDeploymentRequest) -> dict[str, object]:
-    """Provision the complete host-side HMSBridge authority without starting it.
-
-    This is an intentionally create-only first-deployment transaction. It leaves
-    partial state in a fail-closed Stopped/Manual form for explicit recovery rather
-    than deleting or overwriting already-published security authorities.
-    """
+    """Provision complete host authority without starting HMSBridge or the tunnel."""
 
     request.validate()
     service_sid = derive_hms_bridge_service_sid()
@@ -201,6 +229,19 @@ def deploy_hms_bridge_host_create_only(request: BridgeHostDeploymentRequest) -> 
         lambda: request.runtime_config.to_runtime_config(service_sid),
     )
 
+    tunnel_package = _run_stage(
+        "tunnel_package",
+        lambda: provision_tunnel_runtime_package(request.tunnel_archive_path),
+    )
+    if (
+        tunnel_package.ready is not True
+        or tunnel_package.archive_sha256 != OPENAI_TUNNEL_CLIENT_SHA256
+        or tunnel_package.file_count != 5
+    ):
+        raise BridgeHostDeploymentTransactionError(
+            "tunnel_package", "OpenAI tunnel runtime package evidence differs"
+        )
+
     tls_material = _run_stage(
         "tls_material",
         lambda: publish_bridge_tls_material_create_only(
@@ -229,6 +270,27 @@ def deploy_hms_bridge_host_create_only(request: BridgeHostDeploymentRequest) -> 
     )
     if stored_agent.instance_id != request.agent_credential.instance_id or stored_agent.device_id != request.agent_credential.device_id:
         raise BridgeHostDeploymentTransactionError("agent_credential", "stored Agent credential identity differs")
+
+    tunnel_key_store = TunnelRuntimeApiKeyStore(runtime.secret_storage)
+    _run_stage("tunnel_api_key", lambda: tunnel_key_store.provision(request.tunnel_runtime_api_key))
+    secret_acl = _run_stage(
+        "tunnel_secret_acl",
+        lambda: provision_bridge_service_secret_storage(
+            runtime.secret_storage,
+            require_pairing_key=True,
+        ),
+    )
+    if secret_acl.get("ready") is not True or secret_acl.get("secret_file_acls_exact") is not True:
+        raise BridgeHostDeploymentTransactionError(
+            "tunnel_secret_acl", "tunnel API-key secret ACL did not converge"
+        )
+    loaded_tunnel_key = _run_stage("tunnel_api_key_load", tunnel_key_store.load)
+    if not secrets.compare_digest(loaded_tunnel_key, request.tunnel_runtime_api_key):
+        raise BridgeHostDeploymentTransactionError(
+            "tunnel_api_key_load", "protected tunnel API-key readback differs"
+        )
+    loaded_tunnel_key = ""
+
     post_secret_identity = _run_stage("post_machine_secrets_identity", prove_hms_bridge_provisioning_identity)
     if post_secret_identity.get("service_sid") != service_sid:
         raise BridgeHostDeploymentTransactionError("post_machine_secrets_identity", "HMSBridge SID changed across machine secrets")
@@ -286,15 +348,31 @@ def deploy_hms_bridge_host_create_only(request: BridgeHostDeploymentRequest) -> 
     if loaded_oauth != request.oauth_credential:
         raise BridgeHostDeploymentTransactionError("oauth_protected_load", "OAuth protected load differs from provisioned identity")
 
-    # Final immutable/config proofs while the service still must be Stopped/Manual.
-    final_config = _run_stage(
-        "final_config_proof",
-        load_protected_bridge_service_runtime_config,
-    )
+    final_config = _run_stage("final_config_proof", load_protected_bridge_service_runtime_config)
     if canonical_bridge_service_runtime_config_bytes(final_config) != canonical_bridge_service_runtime_config_bytes(request.runtime_config):
         raise BridgeHostDeploymentTransactionError("final_config_proof", "final runtime config differs")
     final_tls = _run_stage("final_tls_proof", lambda: load_agent_bridge_tls_material(runtime.tls.material))
     final_tls.validate()
+    final_secret = _run_stage(
+        "final_secret_proof",
+        lambda: prove_bridge_service_secret_storage(runtime.secret_storage, require_pairing_key=True),
+    )
+    if final_secret.get("ready") is not True or final_secret.get("secret_file_acls_exact") is not True:
+        raise BridgeHostDeploymentTransactionError("final_secret_proof", "final secret authority differs")
+    final_tunnel_key = _run_stage("final_tunnel_key_proof", tunnel_key_store.load)
+    if not secrets.compare_digest(final_tunnel_key, request.tunnel_runtime_api_key):
+        raise BridgeHostDeploymentTransactionError("final_tunnel_key_proof", "final tunnel key authority differs")
+    final_tunnel_key = ""
+    final_tunnel = _run_stage(
+        "final_tunnel_package_proof",
+        lambda: prove_installed_tunnel_runtime(
+            TunnelRuntimePackageConfig(),
+            service_sid=service_sid,
+            prove_acl=True,
+        ),
+    )
+    if final_tunnel.ready is not True or final_tunnel.archive_sha256 != OPENAI_TUNNEL_CLIENT_SHA256:
+        raise BridgeHostDeploymentTransactionError("final_tunnel_package_proof", "final tunnel package authority differs")
     final_identity = _run_stage("final_identity", prove_hms_bridge_provisioning_identity)
     if (
         final_identity.get("service_sid") != service_sid
@@ -320,16 +398,22 @@ def deploy_hms_bridge_host_create_only(request: BridgeHostDeploymentRequest) -> 
         "agent_device_id": request.agent_credential.device_id,
         "oauth_issuer_url": request.oauth_credential.issuer_url,
         "oauth_client_id": request.oauth_credential.client_id,
+        "tunnel_id": request.runtime_config.tunnel_id,
+        "tunnel_archive_sha256": final_tunnel.archive_sha256,
         "package_service_acl_finalized": True,
         "runtime_layout_ready": True,
         "runtime_config_ready": True,
         "pairing_key_ready": True,
         "agent_credential_ready": True,
         "oauth_credential_ready": True,
+        "tunnel_package_ready": True,
+        "tunnel_api_key_ready": True,
         "tls_material_ready": True,
         "firewall_ready": True,
         "guest_trust_root_present": True,
         "runtime_listener_started": False,
+        "tunnel_runtime_started": False,
+        "tunnel_ready": False,
         "live_managed_guest_tls_proven": False,
         "authenticated_agent_transport_proven": False,
         "full_bridge_command_flow_proven": False,

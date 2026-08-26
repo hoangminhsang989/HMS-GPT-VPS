@@ -12,9 +12,9 @@ from hms_gpt_vps.bridge_service_runtime_config import (
     parse_bridge_service_runtime_config,
 )
 
-
 SID = "S-1-5-80-123-456-789-1011-1213"
 VM_ID = "12345678-1234-1234-1234-123456789abc"
+TUNNEL_ID = "tunnel_" + "a" * 32
 
 
 def _config(tmp_path: Path):
@@ -41,10 +41,9 @@ def _config(tmp_path: Path):
         "vm_id": VM_ID,
         "vm_name": "HMS-VPS-1",
         "trust_root_der_sha256": "c" * 64,
+        "tunnel_id": TUNNEL_ID,
     }
-    return parse_bridge_service_runtime_config(
-        json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
+    return parse_bridge_service_runtime_config(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def _identity():
@@ -60,21 +59,20 @@ def _identity():
     }
 
 
-def test_canonical_bytes_are_deterministic_and_round_trip(tmp_path: Path):
+def test_canonical_bytes_are_deterministic_round_trip_and_include_tunnel(tmp_path: Path):
     config = _config(tmp_path)
     first = mod.canonical_bridge_service_runtime_config_bytes(config)
     second = mod.canonical_bridge_service_runtime_config_bytes(config)
     assert first == second
     assert parse_bridge_service_runtime_config(first) == config
+    assert b'"tunnel_id":"' in first
+    assert TUNNEL_ID.encode() in first
     assert len(mod.bridge_service_runtime_config_sha256(config)) == 64
 
 
 def test_publication_script_is_create_only_and_acl_pinned(tmp_path: Path):
     config = _config(tmp_path)
-    script = mod.build_bridge_service_runtime_config_publication_script(
-        config,
-        expected_service_sid=SID,
-    )
+    script = mod.build_bridge_service_runtime_config_publication_script(config, expected_service_sid=SID)
     assert "[System.IO.FileMode]::CreateNew" in script
     assert "[System.IO.File]::Move" in script
     assert "publication is create-only" in script
@@ -85,98 +83,37 @@ def test_publication_script_is_create_only_and_acl_pinned(tmp_path: Path):
 
 def test_publication_rejects_path_override(tmp_path: Path):
     config = _config(tmp_path)
-    with pytest.raises(
-        mod.BridgeServiceRuntimeConfigPublicationError,
-        match="fixed authority",
-    ):
-        mod.build_bridge_service_runtime_config_publication_script(
-            config,
-            expected_service_sid=SID,
-            path=tmp_path / "other.json",
-        )
+    with pytest.raises(mod.BridgeServiceRuntimeConfigPublicationError, match="fixed authority"):
+        mod.build_bridge_service_runtime_config_publication_script(config, expected_service_sid=SID, path=tmp_path / "other.json")
 
 
-def test_publish_orders_identity_publish_proofs_and_reload(
-    monkeypatch,
-    tmp_path: Path,
-):
-    config = _config(tmp_path)
-    expected_sha = mod.bridge_service_runtime_config_sha256(config)
-    calls: list[str] = []
-
-    monkeypatch.setattr(
-        mod,
-        "prove_hms_bridge_provisioning_identity",
-        lambda: calls.append("identity") or _identity(),
-    )
-    monkeypatch.setattr(
-        mod,
-        "run_powershell_json",
-        lambda *a, **k: calls.append("publish")
-        or {
-            "ready": True,
-            "created": True,
-            "config_path": str(PureWindowsPath(str(DEFAULT_BRIDGE_RUNTIME_CONFIG_PATH))),
-            "config_sha256": expected_sha,
-            "service_sid": SID,
-            "service_state": "Stopped",
-            "service_start_mode": "Manual",
-            "root_acl_exact": True,
-            "config_acl_exact": True,
-            "config_reparse_point": False,
-        },
-    )
-    monkeypatch.setattr(
-        mod,
-        "prove_bridge_service_runtime_config_storage",
-        lambda path: calls.append("storage")
-        or {"changed": False, "config_sha256": expected_sha},
-    )
-    monkeypatch.setattr(
-        mod,
-        "load_protected_bridge_service_runtime_config",
-        lambda path: calls.append("load") or config,
-    )
-
+def test_publish_orders_identity_publish_proofs_and_reload(monkeypatch, tmp_path: Path):
+    config = _config(tmp_path); expected_sha = mod.bridge_service_runtime_config_sha256(config); calls=[]
+    monkeypatch.setattr(mod, "prove_hms_bridge_provisioning_identity", lambda: calls.append("identity") or _identity())
+    monkeypatch.setattr(mod, "run_powershell_json", lambda *a, **k: calls.append("publish") or {
+        "ready": True, "created": True,
+        "config_path": str(PureWindowsPath(str(DEFAULT_BRIDGE_RUNTIME_CONFIG_PATH))),
+        "config_sha256": expected_sha, "service_sid": SID, "service_state": "Stopped",
+        "service_start_mode": "Manual", "root_acl_exact": True, "config_acl_exact": True,
+        "config_reparse_point": False,
+    })
+    monkeypatch.setattr(mod, "prove_bridge_service_runtime_config_storage", lambda path: calls.append("storage") or {"changed": False, "config_sha256": expected_sha})
+    monkeypatch.setattr(mod, "load_protected_bridge_service_runtime_config", lambda path: calls.append("load") or config)
     result = mod.publish_bridge_service_runtime_config_create_only(config)
-
     assert calls == ["identity", "publish", "storage", "load", "identity"]
-    assert result["created"] is True
-    assert result["protected_load_proven"] is True
-    assert result["post_identity_proven"] is True
+    assert result["created"] is True and result["protected_load_proven"] is True and result["post_identity_proven"] is True
 
 
 def test_publish_rejects_storage_sha_drift(monkeypatch, tmp_path: Path):
-    config = _config(tmp_path)
-    expected_sha = mod.bridge_service_runtime_config_sha256(config)
-    monkeypatch.setattr(
-        mod,
-        "prove_hms_bridge_provisioning_identity",
-        lambda: _identity(),
-    )
-    monkeypatch.setattr(
-        mod,
-        "run_powershell_json",
-        lambda *a, **k: {
-            "ready": True,
-            "created": True,
-            "config_path": str(PureWindowsPath(str(DEFAULT_BRIDGE_RUNTIME_CONFIG_PATH))),
-            "config_sha256": expected_sha,
-            "service_sid": SID,
-            "service_state": "Stopped",
-            "service_start_mode": "Manual",
-            "root_acl_exact": True,
-            "config_acl_exact": True,
-            "config_reparse_point": False,
-        },
-    )
-    monkeypatch.setattr(
-        mod,
-        "prove_bridge_service_runtime_config_storage",
-        lambda path: {"changed": False, "config_sha256": "0" * 64},
-    )
-    with pytest.raises(
-        mod.BridgeServiceRuntimeConfigPublicationError,
-        match="storage SHA-256 differs",
-    ):
+    config = _config(tmp_path); expected_sha = mod.bridge_service_runtime_config_sha256(config)
+    monkeypatch.setattr(mod, "prove_hms_bridge_provisioning_identity", lambda: _identity())
+    monkeypatch.setattr(mod, "run_powershell_json", lambda *a, **k: {
+        "ready": True, "created": True,
+        "config_path": str(PureWindowsPath(str(DEFAULT_BRIDGE_RUNTIME_CONFIG_PATH))),
+        "config_sha256": expected_sha, "service_sid": SID, "service_state": "Stopped",
+        "service_start_mode": "Manual", "root_acl_exact": True, "config_acl_exact": True,
+        "config_reparse_point": False,
+    })
+    monkeypatch.setattr(mod, "prove_bridge_service_runtime_config_storage", lambda path: {"changed": False, "config_sha256": "0" * 64})
+    with pytest.raises(mod.BridgeServiceRuntimeConfigPublicationError, match="storage SHA-256 differs"):
         mod.publish_bridge_service_runtime_config_create_only(config)
