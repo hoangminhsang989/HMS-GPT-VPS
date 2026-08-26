@@ -10,6 +10,7 @@ from .qualification_file_authority import (
     write_json_create_only,
 )
 from .r002f_execution_preflight import render_powershell_command
+from .r002f_reviewed_toolchain_authority import canonical_sha256
 
 MAX_COMPONENT_PROOF_BYTES = 128 * 1024
 MAX_FINAL_PROOF_BYTES = 192 * 1024
@@ -48,30 +49,91 @@ def component_digest(path: Path) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def reviewed_one_shot_argv(component_argv: object, *, expected_commit: str) -> list[str]:
+def _require_absolute_python_executable(path: Path) -> Path:
+    if not isinstance(path, Path):
+        raise TypeError("python_executable must be pathlib.Path")
+    authority = path.expanduser().absolute()
+    if not authority.is_absolute() or path_chain_has_redirect(authority):
+        raise R002FReviewedPreflightProofError(
+            "reviewed Python executable authority is redirected or non-absolute"
+        )
+    if not authority.is_file():
+        raise R002FReviewedPreflightProofError(
+            "reviewed Python executable authority is not a regular file"
+        )
+    return authority
+
+
+def reviewed_one_shot_argv(
+    component_argv: object,
+    *,
+    expected_commit: str,
+    repo_root: Path,
+    python_executable: Path,
+    git_executable: Path,
+    git_executable_sha256: str,
+) -> list[str]:
     if (
         not isinstance(component_argv, list)
-        or not component_argv
+        or len(component_argv) < 3
         or any(not isinstance(value, str) or not value for value in component_argv)
     ):
         raise R002FReviewedPreflightProofError("component one-shot argv is invalid")
-    argv = list(component_argv)
-    indexes = [index for index, value in enumerate(argv) if value == "--runner-source-commit"]
+
+    repo = repo_root.expanduser().absolute()
+    expected_script = (
+        repo / "scripts" / "run_r002f_one_shot_production_qualification.py"
+    ).absolute()
+    observed_script = Path(component_argv[1]).expanduser().absolute()
+    if observed_script != expected_script:
+        raise R002FReviewedPreflightProofError(
+            "component one-shot script path differs from reviewed repo authority"
+        )
+
+    tail = list(component_argv[2:])
+    indexes = [index for index, value in enumerate(tail) if value == "--runner-source-commit"]
     if len(indexes) != 1:
         raise R002FReviewedPreflightProofError(
             "component one-shot argv runner-source authority is ambiguous"
         )
     index = indexes[0]
-    if index + 1 >= len(argv) or argv[index + 1] != expected_commit:
+    if index + 1 >= len(tail) or tail[index + 1] != expected_commit:
         raise R002FReviewedPreflightProofError(
             "component one-shot argv runner-source commit differs from reviewed authority"
         )
-    if "--reviewed-runner-source-commit" in argv:
+    forbidden = {
+        "--reviewed-runner-source-commit",
+        "--git-executable",
+        "--git-executable-sha256",
+    }
+    if any(value in forbidden for value in tail):
         raise R002FReviewedPreflightProofError(
-            "component one-shot argv unexpectedly contains reviewed authority"
+            "component one-shot argv unexpectedly contains reviewed toolchain authority"
         )
-    argv[index + 2:index + 2] = ["--reviewed-runner-source-commit", expected_commit]
-    return argv
+
+    python_path = _require_absolute_python_executable(python_executable)
+    git_path = git_executable.expanduser().absolute()
+    git_sha = canonical_sha256(
+        git_executable_sha256,
+        "reviewed Git executable SHA-256",
+    )
+
+    tail[index + 2:index + 2] = [
+        "--reviewed-runner-source-commit",
+        expected_commit,
+        "--git-executable",
+        str(git_path),
+        "--git-executable-sha256",
+        git_sha,
+    ]
+    return [
+        str(python_path),
+        "-I",
+        "-X",
+        "utf8",
+        str(expected_script),
+        *tail,
+    ]
 
 
 def publish_reviewed_preflight_proof(path: Path, proof: dict[str, object]) -> None:

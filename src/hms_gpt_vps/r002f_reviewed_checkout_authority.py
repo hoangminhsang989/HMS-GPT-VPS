@@ -8,6 +8,10 @@ from typing import Callable, Mapping, Sequence
 from .external_mcp_command_flow_contract import canonical_git_sha1
 from .qualification_file_authority import path_chain_has_redirect, require_existing_directory
 from .r002f_reviewed_git_environment import checkout_validation_environment
+from .r002f_reviewed_toolchain_authority import (
+    PinnedGitExecutable,
+    pin_reviewed_git_executable,
+)
 
 _GIT_SAFE_OVERRIDES = (
     ("core.fsmonitor", "false"),
@@ -26,13 +30,15 @@ def _same_lexical_path(left: str | Path, right: str | Path) -> bool:
 
 
 def _run_git_text(
+    pinned_git: PinnedGitExecutable,
     repo_root: Path,
     argv: Sequence[str],
     *,
     environment: Mapping[str, str],
     command_runner: Callable[..., object],
 ) -> str:
-    command: list[str] = ["git"]
+    pinned_git.assert_stable()
+    command: list[str] = [pinned_git.executable_path]
     for key, value in _GIT_SAFE_OVERRIDES:
         command.extend(["-c", f"{key}={value}"])
     command.extend(["-C", str(repo_root), *argv])
@@ -45,6 +51,7 @@ def _run_git_text(
         text=True,
         timeout=60.0,
     )
+    pinned_git.assert_stable()
     returncode = getattr(completed, "returncode", None)
     stdout = getattr(completed, "stdout", None)
     if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
@@ -62,10 +69,12 @@ def require_reviewed_clean_checkout(
     repo_root: Path,
     expected_commit: str,
     *,
+    git_executable: Path,
+    git_executable_sha256: str,
     environment: Mapping[str, str] | None = None,
     command_runner: Callable[..., object] = subprocess.run,
 ) -> None:
-    """Bind a checkout to an externally supplied reviewed commit authority."""
+    """Bind a checkout to an external commit and an external Git binary authority."""
 
     if not isinstance(repo_root, Path):
         raise TypeError("repo_root must be pathlib.Path")
@@ -78,47 +87,55 @@ def require_reviewed_clean_checkout(
     source = os.environ if environment is None else environment
     safe_environment = checkout_validation_environment(source)
 
-    top_level = _run_git_text(
-        root,
-        ["rev-parse", "--show-toplevel"],
-        environment=safe_environment,
-        command_runner=command_runner,
-    ).strip()
-    if not top_level or not _same_lexical_path(top_level, root):
-        raise R002FReviewedCheckoutAuthorityError(
-            "Git top-level differs from reviewed qualification repo authority"
-        )
+    with pin_reviewed_git_executable(
+        git_executable,
+        git_executable_sha256,
+    ) as pinned_git:
+        top_level = _run_git_text(
+            pinned_git,
+            root,
+            ["rev-parse", "--show-toplevel"],
+            environment=safe_environment,
+            command_runner=command_runner,
+        ).strip()
+        if not top_level or not _same_lexical_path(top_level, root):
+            raise R002FReviewedCheckoutAuthorityError(
+                "Git top-level differs from reviewed qualification repo authority"
+            )
 
-    actual = _run_git_text(
-        root,
-        ["rev-parse", "--verify", "HEAD"],
-        environment=safe_environment,
-        command_runner=command_runner,
-    ).strip()
-    if actual != expected:
-        raise R002FReviewedCheckoutAuthorityError(
-            "qualification checkout HEAD differs from reviewed runner commit"
-        )
+        actual = _run_git_text(
+            pinned_git,
+            root,
+            ["rev-parse", "--verify", "HEAD"],
+            environment=safe_environment,
+            command_runner=command_runner,
+        ).strip()
+        if actual != expected:
+            raise R002FReviewedCheckoutAuthorityError(
+                "qualification checkout HEAD differs from reviewed runner commit"
+            )
 
-    status = _run_git_text(
-        root,
-        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
-        environment=safe_environment,
-        command_runner=command_runner,
-    )
-    if status:
-        raise R002FReviewedCheckoutAuthorityError(
-            "reviewed qualification checkout contains modified, untracked, or ignored content"
+        status = _run_git_text(
+            pinned_git,
+            root,
+            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
+            environment=safe_environment,
+            command_runner=command_runner,
         )
+        if status:
+            raise R002FReviewedCheckoutAuthorityError(
+                "reviewed qualification checkout contains modified, untracked, or ignored content"
+            )
 
-    flags = _run_git_text(
-        root,
-        ["ls-files", "-v", "-z"],
-        environment=safe_environment,
-        command_runner=command_runner,
-    )
-    entries = [entry for entry in flags.split("\x00") if entry]
-    if not entries or any(not entry.startswith("H ") for entry in entries):
-        raise R002FReviewedCheckoutAuthorityError(
-            "reviewed qualification checkout contains non-normal index authority flags"
+        flags = _run_git_text(
+            pinned_git,
+            root,
+            ["ls-files", "-v", "-z"],
+            environment=safe_environment,
+            command_runner=command_runner,
         )
+        entries = [entry for entry in flags.split("\x00") if entry]
+        if not entries or any(not entry.startswith("H ") for entry in entries):
+            raise R002FReviewedCheckoutAuthorityError(
+                "reviewed qualification checkout contains non-normal index authority flags"
+            )
