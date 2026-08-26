@@ -13,6 +13,7 @@ from hms_gpt_vps.pairing_readiness_runtime import (
     PairingPresenceStaleError,
     PairingReadinessConfig,
     PairingReadinessRuntime,
+    PairingStateError,
 )
 from hms_gpt_vps.pairing_store import PairingStore
 from hms_gpt_vps.provision_state import ProvisionState, ProvisionStateStore
@@ -99,7 +100,7 @@ def build_runtime(
     return runtime, provision, pairing, lease, secret
 
 
-def test_issue_is_recoverable_and_does_not_advance_provision_state(tmp_path: Path) -> None:
+def test_issue_is_recoverable_and_commits_pairing_pending(tmp_path: Path) -> None:
     runtime, provision, pairing, lease_store, _secret = build_runtime(tmp_path)
 
     first = runtime.issue()
@@ -109,7 +110,8 @@ def test_issue_is_recoverable_and_does_not_advance_provision_state(tmp_path: Pat
 
     record = provision.load()
     assert record is not None
-    assert record.state is ProvisionState.INSTALL_SECRETS_CLEARED
+    assert record.state is ProvisionState.PAIRING_PENDING
+    assert record.reason == "pairing_authority_published"
 
     stored = pairing.require(first.pair_id)
     lease = lease_store.load()
@@ -140,7 +142,7 @@ def test_restart_recovers_same_copyable_link(tmp_path: Path) -> None:
 def test_crash_after_encrypted_lease_before_digest_record_recovers_exact_grant(
     tmp_path: Path,
 ) -> None:
-    runtime, _provision, pairing, lease_store, _secret = build_runtime(tmp_path)
+    runtime, provision, pairing, lease_store, _secret = build_runtime(tmp_path)
     grant = issue_pairing_grant(
         "hms-01",
         "https://bridge.example",
@@ -155,6 +157,31 @@ def test_crash_after_encrypted_lease_before_digest_record_recovers_exact_grant(
     assert recovered.pairing_link == grant.pairing_link
     stored = pairing.require(grant.record.pair_id)
     assert stored.token_sha256 == grant.record.token_sha256
+    checkpoint = provision.load()
+    assert checkpoint is not None
+    assert checkpoint.state is ProvisionState.PAIRING_PENDING
+
+
+def test_current_link_recovers_state_commit_after_pair_record_publication(
+    tmp_path: Path,
+) -> None:
+    runtime, provision, pairing, lease_store, _secret = build_runtime(tmp_path)
+    grant = issue_pairing_grant(
+        "hms-01",
+        "https://bridge.example",
+        now=NOW,
+        ttl_seconds=600,
+    )
+    lease_store.save(PairingLinkLease.from_grant(grant, "https://bridge.example"))
+    pairing.create(grant.record)
+    before = provision.load()
+    assert before is not None
+    assert before.state is ProvisionState.INSTALL_SECRETS_CLEARED
+
+    assert runtime.current_pairing_link() == grant.pairing_link
+    after = provision.load()
+    assert after is not None
+    assert after.state is ProvisionState.PAIRING_PENDING
 
 
 def test_stale_or_missing_authenticated_presence_blocks_issuance(tmp_path: Path) -> None:
@@ -206,6 +233,18 @@ def test_consumed_grant_observes_pairing_ready_and_paired_without_replacement(
 
     with pytest.raises(PairingConsumedError):
         runtime.issue()
+
+
+def test_ready_commit_rejects_unconsumed_pairing(tmp_path: Path) -> None:
+    runtime, provision, _pairing, _lease_store, _secret = build_runtime(tmp_path)
+    runtime.issue()
+
+    with pytest.raises(PairingStateError, match="consumed pairing authority"):
+        runtime.commit_principal_binding_ready()
+
+    checkpoint = provision.load()
+    assert checkpoint is not None
+    assert checkpoint.state is ProvisionState.PAIRING_PENDING
 
 
 def test_expired_unconsumed_grant_is_replaced_only_with_fresh_presence(tmp_path: Path) -> None:
