@@ -17,6 +17,9 @@ from hms_gpt_vps.pairing_exchange import PairingExchangeKey
 from hms_gpt_vps.principal_binding_registry_authority import (
     PinnedDpapiPrincipalBindingRegistry,
 )
+from hms_gpt_vps.provision_state_bound_principal_pairing import (
+    ProvisionStateBoundPrincipalPairingService,
+)
 
 
 INSTANCE_ID = "hms-prod-01"
@@ -124,6 +127,10 @@ def test_production_assembly_wires_exact_shared_authorities(
     assert assembly.pairing_exchange.pairing_store is assembly.pairing_store
     assert assembly.pairing_exchange.session_store is assembly.session_store
     assert assembly.principal_pairing.readiness is assembly.readiness
+    assert isinstance(
+        assembly.principal_pairing,
+        ProvisionStateBoundPrincipalPairingService,
+    )
     assert isinstance(
         assembly.principal_pairing.binding_registry,
         PinnedDpapiPrincipalBindingRegistry,
