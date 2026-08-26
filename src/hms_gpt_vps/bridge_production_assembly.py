@@ -38,6 +38,9 @@ from .principal_binding_registry_authority import (
 )
 from .principal_dispatch_intent import PrincipalDispatchIntentStore
 from .principal_pairing_service import PrincipalPairingService
+from .provision_state_bound_principal_pairing import (
+    ProvisionStateBoundPrincipalPairingService,
+)
 from .provision_state import ProvisionStateStore
 from .qualification_file_authority import (
     lexical_absolute,
@@ -313,7 +316,7 @@ def assemble_production_bridge(
         layout.pairing_issue_lock_path,
     )
 
-    principal_pairing = PrincipalPairingService(
+    principal_pairing = ProvisionStateBoundPrincipalPairingService(
         readiness,
         pairing_exchange,
         PinnedDpapiPrincipalBindingRegistry(
