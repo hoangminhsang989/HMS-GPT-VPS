@@ -5,6 +5,13 @@ Status: **STAGED_NOT_EXECUTED**
 Parent authority: `55cf8c9a04c555ae6595185d62aa1528f84336ea`
 Branch: `r002f-pairing-readiness-runtime`
 
+> **Current R002F state-commit supersession:** pairing-link issuance now owns the
+> crash-safe `INSTALL_SECRETS_CLEARED -> PAIRING_PENDING` CAS before exposing the
+> raw link, while production principal pairing owns the only allowed
+> `PAIRING_PENDING -> READY` CAS after durable principal binding. The generic
+> provisioning orchestrator may no longer promote `paired=true` directly to
+> `READY`, and its legacy `mark_ready()` shortcut is fail-closed.
+
 ## Purpose
 
 R002F begins Stage 3: Pairing & Secure Control Channel. The transport protocol,
@@ -38,16 +45,22 @@ encrypted host lease is written first:
 3. re-check provisioning state and fresh Agent presence;
 4. create the digest-only `PairingStore` record;
 5. read back and compare immutable record authority;
-6. return the copyable link.
+6. CAS `INSTALL_SECRETS_CLEARED -> PAIRING_PENDING`, accepting only an exact
+   concurrent winner already at `PAIRING_PENDING`;
+7. return the copyable link.
 
 If the host process dies after step 2 but before step 4, the next call reloads
 the encrypted lease and creates the exact missing digest record. It does not
-mint a replacement token. If the process dies after step 4 but before the UI
-receives the link, the same encrypted lease reconstructs the same link.
+mint a replacement token. If the process dies after step 4 but before step 6,
+`issue()` or `current_pairing_link()` repairs the exact missing
+`PAIRING_PENDING` CAS under the pairing issuance authority lock before exposing
+the link. If the process dies after step 6 but before the UI receives the link,
+the same encrypted lease reconstructs the same link.
 
-## Observation contract
+## Observation and state-commit contract
 
-The runtime does not mutate provisioning state.
+`observe()` remains read-only. Pairing issuance/recovery is now state-aware and
+may commit only the `INSTALL_SECRETS_CLEARED -> PAIRING_PENDING` checkpoint.
 
 - active record + fresh authenticated Agent:
   `pairing_ready=true`, `paired=false`;
@@ -57,8 +70,25 @@ The runtime does not mutate provisioning state.
   grant:
   readiness remains false.
 
-The existing `ProvisioningOrchestrator` remains the only owner of
-`INSTALL_SECRETS_CLEARED -> PAIRING_PENDING -> READY` advancement.
+A consumed grant by itself is **not** sufficient authority for `READY`.
+`ProvisioningOrchestrator.reconcile()` remains at `PAIRING_PENDING` with
+`WAIT_FOR_PRINCIPAL_BINDING` even when `paired=true`, and the old
+`ProvisioningOrchestrator.mark_ready()` shortcut is blocked.
+
+Production assembly uses `ProvisionStateBoundPrincipalPairingService`. Its
+ordering is strict:
+
+1. authenticate the integration principal;
+2. execute/recover the one-time pairing exchange;
+3. verify and durably publish the exact encrypted `PrincipalSessionBinding`;
+4. re-prove fresh Agent presence plus the consumed pairing authority;
+5. CAS `PAIRING_PENDING -> READY` with reason
+   `principal_binding_published`.
+
+If the process dies after step 3 but before step 5, retrying the same principal
+recovers the exact durable binding and then completes the idempotent READY CAS.
+A wrong link, conflicting principal, failed binding publication or stale Agent
+presence cannot advance READY.
 
 ## Secret handling
 
@@ -73,9 +103,11 @@ the encrypted copy without introducing a crash window.
 
 ## Concurrency
 
-Issuance runs under `exclusive_authority_lock`. Cooperating host processes
-therefore cannot independently mint competing grants for the same configured
-pairing authority.
+Issuance and crash-recovery link retrieval run under the same
+`exclusive_authority_lock`. Cooperating host processes therefore cannot
+independently mint competing grants or expose a recovered raw link while its
+provisioning-state CAS is still unresolved. Provision-state writes remain exact
+compare-and-swap operations under the independent state-store authority lock.
 
 ## Remaining trust-boundary work
 
