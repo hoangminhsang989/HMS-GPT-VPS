@@ -36,6 +36,9 @@ from .principal_agent_control_service import PrincipalAgentControlService
 from .principal_binding_registry_authority import (
     PinnedDpapiPrincipalBindingRegistry,
 )
+from .principal_dispatch_ingress_provenance import (
+    IngressProvenancePrincipalDispatchIntentStore,
+)
 from .principal_dispatch_intent import PrincipalDispatchIntentStore
 from .principal_pairing_service import PrincipalPairingService
 from .provision_state_bound_principal_pairing import (
@@ -332,7 +335,7 @@ def assemble_production_bridge(
         session_store,
         idempotency_store,
     )
-    dispatch_intent_store = PrincipalDispatchIntentStore(
+    dispatch_intent_store = IngressProvenancePrincipalDispatchIntentStore(
         idempotency_store
     )
     principal_control = PrincipalAgentControlService(
