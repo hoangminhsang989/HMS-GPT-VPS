@@ -366,14 +366,11 @@ class ProvisioningOrchestrator:
             return TransitionResult(next_record, "PAIRING_RECORD_VERIFIED")
 
         if record.state is ProvisionState.PAIRING_PENDING:
-            if not observed.paired:
-                return TransitionResult(record, "WAIT_FOR_PAIRING")
-            next_record = self._advance(
-                record,
-                instance_id=context.instance_id,
-                state=ProvisionState.READY,
-            )
-            return TransitionResult(next_record, "CONTROL_READY")
+            # A consumed one-time grant is insufficient to prove the principal
+            # binding is durable. READY is committed only by the authenticated
+            # principal-pairing production authority after exact binding
+            # publication and fresh pairing/Agent revalidation.
+            return TransitionResult(record, "WAIT_FOR_PRINCIPAL_BINDING")
 
         return TransitionResult(record, "RECONCILE_EXTERNAL_SIGNAL")
 
@@ -421,8 +418,6 @@ class ProvisioningOrchestrator:
         )
 
     def mark_ready(self, instance_id: str) -> ProvisionRecord:
-        return self.store.transition_checked(
-            instance_id=instance_id,
-            expected_state=ProvisionState.PAIRING_PENDING,
-            state=ProvisionState.READY,
+        raise NotImplementedError(
+            "READY is committed only by principal-pairing binding authority"
         )
