@@ -195,6 +195,9 @@ class PairingReadinessRuntime:
                 reason=reason,
             )
         except ValueError as exc:
+            # Another exact reconciler may have won the same CAS. Accept only
+            # the target checkpoint for this exact instance; all other drift is
+            # fail-closed.
             observed = self.provision_store.load()
             if (
                 observed is None
@@ -221,7 +224,15 @@ class PairingReadinessRuntime:
         )
 
     def commit_principal_binding_ready(self) -> None:
-        """Commit READY only after the caller durably published principal binding."""
+        """Commit READY only after the caller durably published principal binding.
+
+        This method intentionally cannot prove the encrypted principal-binding
+        bytes itself; the production principal-pairing wrapper calls it only
+        after PrincipalPairingService.pair() has returned successfully. It does
+        independently re-prove a fresh authenticated Agent presence and the
+        consumed pairing authority before committing READY.
+        """
+
         observed = self.observe()
         if observed.pairing_ready is not True or observed.paired is not True:
             raise PairingStateError(
@@ -338,6 +349,9 @@ class PairingReadinessRuntime:
                 ttl_seconds=self.config.pair_ttl_seconds,
             )
             lease = PairingLinkLease.from_grant(grant, self.config.bridge_base_url)
+
+            # Crash-safe ordering is deliberate: persist the recoverable raw
+            # token/link before publishing the digest-only pairing record.
             self.lease_store.save(lease)
 
             self._require_pairing_state()
@@ -346,6 +360,8 @@ class PairingReadinessRuntime:
             readback = self.pairing_store.require(grant.record.pair_id)
             if not self._same_initial_record(readback, grant.record):
                 raise PairingReadinessError("pairing record readback differs from issued authority")
+            # The copyable raw link is exposed only after provisioning has
+            # durably entered PAIRING_PENDING.
             self._commit_pairing_pending()
             return self._issue_result(lease)
 
@@ -392,6 +408,9 @@ class PairingReadinessRuntime:
         )
 
     def current_pairing_link(self) -> str:
+        # This read surface may repair a crash-interrupted provisioning CAS, so
+        # it shares the exact issuance authority lock instead of mutating state
+        # from an otherwise unlocked read path.
         with exclusive_authority_lock(self.lock_path):
             self._require_pairing_state()
             now = self._now()
