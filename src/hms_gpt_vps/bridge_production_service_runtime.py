@@ -13,6 +13,11 @@ from .bridge_production_assembly import BridgeProductionAssembly, BridgeProducti
 from .bridge_service_dependency_loader import BridgeServiceSecretDependencies, load_bridge_service_secret_dependencies
 from .bridge_service_identity import prove_hms_bridge_runtime_identity, require_hms_bridge_service_sid
 from .bridge_service_secret_storage import BridgeServiceSecretStorageConfig
+from .mcp_tunnel_ingress import (
+    McpTunnelIngressGate,
+    generate_mcp_tunnel_ingress_token,
+    require_mcp_tunnel_ingress_token,
+)
 from .secure_mcp_tunnel_runtime import SecureMcpTunnelRuntime, SecureMcpTunnelRuntimeConfig
 
 _LOOPBACK_HOST = "127.0.0.1"
@@ -42,8 +47,8 @@ class TunnelRuntime(Protocol):
     def shutdown(self) -> None: ...
 
 
-McpAsgiServerFactory = Callable[[Any, str, int], McpAsgiServer]
-TunnelRuntimeFactory = Callable[["BridgeProductionServiceRuntimeConfig"], TunnelRuntime]
+McpAsgiServerFactory = Callable[[Any, str, int, str], McpAsgiServer]
+TunnelRuntimeFactory = Callable[["BridgeProductionServiceRuntimeConfig", str], TunnelRuntime]
 
 
 @dataclass(frozen=True)
@@ -82,22 +87,25 @@ class BridgeProductionServiceRuntimeConfig:
                 raise BridgeProductionServiceRuntimeError(f"{name} must be an integer from 1 through 300")
 
 
-def _default_mcp_asgi_server_factory(mcp_server: Any, host: str, port: int) -> McpAsgiServer:
+def _default_mcp_asgi_server_factory(mcp_server: Any, host: str, port: int, mcp_ingress_token: str) -> McpAsgiServer:
     if host != _LOOPBACK_HOST:
         raise BridgeProductionServiceRuntimeError("production MCP ASGI server must bind exact loopback")
+    checked_ingress_token=require_mcp_tunnel_ingress_token(mcp_ingress_token)
     try: import uvicorn
     except ImportError as exc:
         raise BridgeProductionServiceRuntimeError("uvicorn is required by the Bridge production MCP runtime") from exc
-    app = mcp_server.streamable_http_app(host=_LOOPBACK_HOST, streamable_http_path=_MCP_PATH, stateless_http=True, json_response=True)
-    return uvicorn.Server(uvicorn.Config(app=app, host=_LOOPBACK_HOST, port=port, log_level="warning", access_log=False, lifespan="on"))
+    app=mcp_server.streamable_http_app(host=_LOOPBACK_HOST,streamable_http_path=_MCP_PATH,stateless_http=True,json_response=True)
+    protected_app=McpTunnelIngressGate(app,token=checked_ingress_token)
+    return uvicorn.Server(uvicorn.Config(app=protected_app, host=_LOOPBACK_HOST, port=port, log_level="warning", access_log=False, lifespan="on"))
 
 
-def _default_tunnel_runtime_factory(config: BridgeProductionServiceRuntimeConfig) -> TunnelRuntime:
+def _default_tunnel_runtime_factory(config: BridgeProductionServiceRuntimeConfig, mcp_ingress_token: str) -> TunnelRuntime:
     config.validate()
     tunnel_config = SecureMcpTunnelRuntimeConfig(
         expected_service_sid=config.expected_service_sid,
         secret_storage=config.secret_storage,
         tunnel_id=config.tunnel_id,
+        mcp_ingress_token=require_mcp_tunnel_ingress_token(mcp_ingress_token),
         runtime_root=config.production.runtime_root,
         startup_timeout_seconds=float(config.startup_timeout_seconds),
         shutdown_timeout_seconds=float(min(config.shutdown_timeout_seconds, 120)),
@@ -154,11 +162,12 @@ class BridgeProductionServiceRuntime:
             raise BridgeProductionServiceRuntimeError("production Bridge runtime is already starting or started")
         if stop.is_set(): return False
         prove_hms_bridge_runtime_identity(self.config.expected_service_sid)
+        mcp_ingress_token=generate_mcp_tunnel_ingress_token()
         try:
             tls_runtime=start_agent_bridge_production_tls(self.assembly.agent_http,self.config.tls); self._tls_runtime=tls_runtime
             expected_tls=(self.config.tls.firewall.network.gateway,self.config.tls.firewall.port)
             if tls_runtime.bound_address != expected_tls: raise BridgeProductionServiceRuntimeError("production Agent TLS runtime returned the wrong bind authority")
-            mcp_server=self.mcp_server_factory(self.assembly.mcp_server,_LOOPBACK_HOST,self.config.production.mcp.port)
+            mcp_server=self.mcp_server_factory(self.assembly.mcp_server,_LOOPBACK_HOST,self.config.production.mcp.port,mcp_ingress_token)
             for attr in ("run","started","should_exit","force_exit"):
                 if not hasattr(mcp_server,attr): raise BridgeProductionServiceRuntimeError("MCP ASGI server factory returned an invalid server")
             self._mcp_server=mcp_server; self._mcp_error.clear()
@@ -175,7 +184,7 @@ class BridgeProductionServiceRuntime:
                 stop.wait(0.05)
             self._assert_local_runtime_healthy(mcp_thread,tls_runtime)
             if stop.is_set(): self.shutdown(); return False
-            tunnel=self.tunnel_runtime_factory(self.config)
+            tunnel=self.tunnel_runtime_factory(self.config,mcp_ingress_token)
             for attr in ("start","ready","assert_healthy","shutdown"):
                 if not hasattr(tunnel,attr): raise BridgeProductionServiceRuntimeError("tunnel runtime factory returned an invalid runtime")
             self._tunnel_runtime=tunnel

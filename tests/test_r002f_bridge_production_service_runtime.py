@@ -30,6 +30,7 @@ from hms_gpt_vps.pairing_exchange import PairingExchangeKey
 _SERVICE_SID = "S-1-5-80-123-456-789-1011-1213"
 _VM_ID = "12345678-1234-1234-1234-123456789abc"
 _TUNNEL_ID = "tunnel_" + "a" * 32
+_INGRESS_TOKEN = "d" * 64
 
 
 class _Verifier:
@@ -89,7 +90,7 @@ def test_factory_proves_identity_before_secret_load_and_after_assembly(tmp_path:
     monkeypatch.setattr(runtime_module,"prove_hms_bridge_runtime_identity",lambda sid:calls.append("identity") or {"process_sid":sid})
     monkeypatch.setattr(runtime_module,"load_bridge_service_secret_dependencies",lambda cfg:calls.append("secrets") or secret_dependencies)
     monkeypatch.setattr(runtime_module,"assemble_production_bridge",lambda cfg,deps:calls.append("assemble") or assembly)
-    runtime=build_bridge_production_service_runtime(config,_Verifier(),mcp_server_factory=lambda *a:object(),tunnel_runtime_factory=lambda c:object())
+    runtime=build_bridge_production_service_runtime(config,_Verifier(),mcp_server_factory=lambda *a:object(),tunnel_runtime_factory=lambda c, token:object())
     assert isinstance(runtime,BridgeProductionServiceRuntime)
     assert calls==["identity","secrets","assemble","identity"]
 
@@ -130,7 +131,7 @@ def test_runtime_starts_tls_then_mcp_then_tunnel_and_shutdowns_in_reverse_ingres
     config=_config(tmp_path); assembly=_assembly(config.production); calls=[]; tls=_FakeTlsRuntime(calls); mcp=_FakeMcpServer(calls=calls); tunnel=_FakeTunnel(calls=calls)
     monkeypatch.setattr(runtime_module,"prove_hms_bridge_runtime_identity",lambda sid:calls.append("identity") or {"process_sid":sid})
     monkeypatch.setattr(runtime_module,"start_agent_bridge_production_tls",lambda *a:calls.append("tls") or tls)
-    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:calls.append("mcp-build") or mcp,tunnel_runtime_factory=lambda c:calls.append("tunnel-build") or tunnel)
+    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:calls.append("mcp-build") or mcp,tunnel_runtime_factory=lambda c, token:calls.append("tunnel-build") or tunnel)
     stop=threading.Event(); assert runtime.start(stop) is True; assert runtime.ready is True
     assert calls[:9]==["identity","tls","mcp-build","mcp-run","tunnel-build","tunnel-start","tunnel-health","identity"][:9]
     runtime.shutdown()
@@ -138,11 +139,26 @@ def test_runtime_starts_tls_then_mcp_then_tunnel_and_shutdowns_in_reverse_ingres
     assert mcp.should_exit is True and tls.shutdown_count==1 and tunnel.shutdown_count==1
 
 
+def test_runtime_passes_one_generated_ingress_token_to_mcp_and_tunnel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config=_config(tmp_path); assembly=_assembly(config.production); tls=_FakeTlsRuntime(); mcp=_FakeMcpServer(); tunnel=_FakeTunnel(); observed={}
+    monkeypatch.setattr(runtime_module,"generate_mcp_tunnel_ingress_token",lambda:_INGRESS_TOKEN)
+    monkeypatch.setattr(runtime_module,"prove_hms_bridge_runtime_identity",lambda sid:{"process_sid":sid})
+    monkeypatch.setattr(runtime_module,"start_agent_bridge_production_tls",lambda *a:tls)
+    def mcp_factory(server,host,port,token):
+        observed["mcp_token"]=token; return mcp
+    def tunnel_factory(runtime_config,token):
+        observed["tunnel_token"]=token; return tunnel
+    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=mcp_factory,tunnel_runtime_factory=tunnel_factory)
+    assert runtime.start(threading.Event()) is True
+    assert observed=={"mcp_token":_INGRESS_TOKEN,"tunnel_token":_INGRESS_TOKEN}
+    runtime.shutdown()
+
+
 def test_runtime_rejects_mcp_early_exit_and_never_starts_tunnel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config=_config(tmp_path); assembly=_assembly(config.production); tls=_FakeTlsRuntime(); mcp=_FakeMcpServer(exit_early=True); tunnel=_FakeTunnel()
     monkeypatch.setattr(runtime_module,"prove_hms_bridge_runtime_identity",lambda sid:{"process_sid":sid})
     monkeypatch.setattr(runtime_module,"start_agent_bridge_production_tls",lambda *a:tls)
-    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:mcp,tunnel_runtime_factory=lambda c:tunnel)
+    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:mcp,tunnel_runtime_factory=lambda c, token:tunnel)
     with pytest.raises(BridgeProductionServiceRuntimeError,match="exited before"): runtime.run(threading.Event())
     assert tls.shutdown_count==1 and tunnel.shutdown_count==0
 
@@ -151,7 +167,7 @@ def test_tunnel_start_failure_rolls_back_tunnel_mcp_and_tls(tmp_path: Path, monk
     config=_config(tmp_path); assembly=_assembly(config.production); calls=[]; tls=_FakeTlsRuntime(calls); mcp=_FakeMcpServer(calls=calls); tunnel=_FakeTunnel(start_value=False,calls=calls)
     monkeypatch.setattr(runtime_module,"prove_hms_bridge_runtime_identity",lambda sid:None)
     monkeypatch.setattr(runtime_module,"start_agent_bridge_production_tls",lambda *a:tls)
-    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:mcp,tunnel_runtime_factory=lambda c:tunnel)
+    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:mcp,tunnel_runtime_factory=lambda c, token:tunnel)
     assert runtime.start(threading.Event()) is False
     assert calls.index("tunnel-down") < calls.index("tls-down")
     assert mcp.should_exit is True and runtime.ready is False
@@ -162,7 +178,7 @@ def test_wait_detects_tunnel_health_loss_and_fails_closed(tmp_path: Path, monkey
     monkeypatch.setattr(runtime_module,"_TUNNEL_HEALTH_INTERVAL_SECONDS",0.0)
     monkeypatch.setattr(runtime_module,"prove_hms_bridge_runtime_identity",lambda sid:None)
     monkeypatch.setattr(runtime_module,"start_agent_bridge_production_tls",lambda *a:tls)
-    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:mcp,tunnel_runtime_factory=lambda c:tunnel)
+    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:mcp,tunnel_runtime_factory=lambda c, token:tunnel)
     stop=threading.Event(); assert runtime.start(stop); tunnel.fail=True
     with pytest.raises(BridgeProductionServiceRuntimeError,match="secure MCP tunnel failed"): runtime.wait(stop)
     runtime.shutdown()
@@ -171,26 +187,34 @@ def test_wait_detects_tunnel_health_loss_and_fails_closed(tmp_path: Path, monkey
 def test_runtime_with_preexisting_stop_opens_no_listener(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config=_config(tmp_path); assembly=_assembly(config.production)
     monkeypatch.setattr(runtime_module,"start_agent_bridge_production_tls",lambda *a:pytest.fail("pre-stopped runtime must not start TLS"))
-    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:pytest.fail("pre-stopped runtime must not build MCP"),tunnel_runtime_factory=lambda c:pytest.fail("pre-stopped runtime must not build tunnel"))
+    runtime=BridgeProductionServiceRuntime(config,assembly,mcp_server_factory=lambda *a:pytest.fail("pre-stopped runtime must not build MCP"),tunnel_runtime_factory=lambda c, token:pytest.fail("pre-stopped runtime must not build tunnel"))
     stop=threading.Event(); stop.set(); runtime.run(stop)
 
 
 def test_default_mcp_factory_pins_loopback_and_streamable_http(monkeypatch: pytest.MonkeyPatch) -> None:
     observed={}
     class FakeMcp:
-        def streamable_http_app(self,**kwargs): observed["app_kwargs"]=dict(kwargs); return "app"
+        def streamable_http_app(self,**kwargs):
+            observed["app_kwargs"]=dict(kwargs)
+            async def app(scope,receive,send): return None
+            observed["raw_app"]=app
+            return app
     class FakeConfig:
         def __init__(self,**kwargs): observed["uvicorn_config"]=dict(kwargs)
     class FakeServer:
         def __init__(self,config): self.config=config; self.started=False; self.should_exit=False; self.force_exit=False
         def run(self): return
     monkeypatch.setitem(sys.modules,"uvicorn",types.SimpleNamespace(Config=FakeConfig,Server=FakeServer))
-    server=_default_mcp_asgi_server_factory(FakeMcp(),"127.0.0.1",8765)
+    server=_default_mcp_asgi_server_factory(FakeMcp(),"127.0.0.1",8765,_INGRESS_TOKEN)
     assert isinstance(server,FakeServer)
     assert observed["app_kwargs"]=={"host":"127.0.0.1","streamable_http_path":"/mcp","stateless_http":True,"json_response":True}
-    assert observed["uvicorn_config"]=={"app":"app","host":"127.0.0.1","port":8765,"log_level":"warning","access_log":False,"lifespan":"on"}
+    protected=observed["uvicorn_config"]["app"]
+    assert isinstance(protected,runtime_module.McpTunnelIngressGate)
+    assert _INGRESS_TOKEN not in repr(protected)
+    expected={"app":protected,"host":"127.0.0.1","port":8765,"log_level":"warning","access_log":False,"lifespan":"on"}
+    assert observed["uvicorn_config"]==expected
 
 
 def test_default_mcp_factory_rejects_non_loopback() -> None:
     with pytest.raises(BridgeProductionServiceRuntimeError,match="exact loopback"):
-        _default_mcp_asgi_server_factory(object(),"0.0.0.0",8765)
+        _default_mcp_asgi_server_factory(object(),"0.0.0.0",8765,_INGRESS_TOKEN)

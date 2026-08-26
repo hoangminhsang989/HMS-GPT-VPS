@@ -13,6 +13,7 @@ from hms_gpt_vps.bridge_service_secret_storage import BridgeServiceSecretStorage
 
 SID = "S-1-5-80-1-2-3-4-5"
 TUNNEL_ID = "tunnel_" + "a" * 32
+INGRESS_TOKEN = "c" * 64
 
 
 class Stop:
@@ -122,6 +123,7 @@ def make_runtime(monkeypatch, tmp_path, *, responses=None, process=None):
         expected_service_sid=SID,
         secret_storage=secret,
         tunnel_id=TUNNEL_ID,
+        mcp_ingress_token=INGRESS_TOKEN,
         package=package,
         runtime_root=runtime_root,
         probe_interval_seconds=0.02,
@@ -195,10 +197,14 @@ def test_start_waits_through_503_then_commits_ready(monkeypatch, tmp_path):
     assert evidence.restart_policy == "fail-closed-to-HMSBridge-SCM"
     argv_text = " ".join(captured["argv"])
     assert "restricted_runtime_key" not in argv_text
+    assert INGRESS_TOKEN not in argv_text
+    assert INGRESS_TOKEN not in repr(runtime.config)
     assert "--health.listen-addr 127.0.0.1:0" in argv_text
     assert "--mcp.startup-wait-timeout 30s" in argv_text
     assert captured["environment"]["CONTROL_PLANE_API_KEY"] == "restricted_runtime_key"
     assert captured["environment"]["MCP_SERVER_URL"] == "http://127.0.0.1:8765/mcp"
+    assert captured["environment"]["HMS_TUNNEL_INGRESS_TOKEN"] == INGRESS_TOKEN
+    assert captured["environment"]["MCP_EXTRA_HEADERS"] == "X-HMS-Tunnel-Ingress: env:HMS_TUNNEL_INGRESS_TOKEN"
     runtime.shutdown()
     assert process.terminated == 1
 
@@ -216,6 +222,7 @@ def test_spawn_failure_scrubs_secret_and_cleans_handshake(monkeypatch, tmp_path)
     with pytest.raises(OSError, match="spawn failed"):
         runtime.start(Stop())
     assert captured["live_environment"]["CONTROL_PLANE_API_KEY"] == ""
+    assert captured["live_environment"]["HMS_TUNNEL_INGRESS_TOKEN"] == ""
     assert health_paths and not health_paths[0].exists()
     assert not health_paths[0].parent.exists()
 

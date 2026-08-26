@@ -12,6 +12,12 @@ from typing import Callable, Mapping, Protocol
 from .bridge_runtime_layout_provisioning import DEFAULT_BRIDGE_RUNTIME_ROOT
 from .bridge_service_identity import prove_hms_bridge_runtime_identity, require_hms_bridge_service_sid
 from .bridge_service_secret_storage import BridgeServiceSecretStorageConfig, prove_bridge_service_secret_storage
+from .mcp_tunnel_ingress import (
+    MCP_TUNNEL_INGRESS_TOKEN_ENV,
+    McpTunnelIngressError,
+    build_mcp_tunnel_ingress_child_environment,
+    require_mcp_tunnel_ingress_token,
+)
 from .qualification_file_authority import lexical_absolute, path_chain_has_redirect
 from .secure_mcp_tunnel import HMS_MCP_SERVER_URL, TunnelRuntimeApiKeyStore, build_tunnel_child_environment, build_tunnel_launch_spec
 from .secure_mcp_tunnel_health import TunnelHealthError, TunnelHealthResponse, default_health_probe, parse_health_base_url, readiness_response_is_ready
@@ -48,6 +54,7 @@ class SecureMcpTunnelRuntimeConfig:
     expected_service_sid: str
     secret_storage: BridgeServiceSecretStorageConfig
     tunnel_id: str
+    mcp_ingress_token: str = field(repr=False)
     package: TunnelRuntimePackageConfig = field(default_factory=TunnelRuntimePackageConfig)
     runtime_root: Path = DEFAULT_BRIDGE_RUNTIME_ROOT
     startup_timeout_seconds: float = 60.0
@@ -65,6 +72,8 @@ class SecureMcpTunnelRuntimeConfig:
         self.package.validate()
         if not isinstance(self.runtime_root,Path) or str(PureWindowsPath(str(self.runtime_root))).casefold()!=str(PureWindowsPath(str(DEFAULT_BRIDGE_RUNTIME_ROOT))).casefold(): raise SecureMcpTunnelRuntimeError("tunnel runtime_root differs from fixed Bridge runtime authority")
         if not isinstance(self.tunnel_id,str) or len(self.tunnel_id)!=39 or not self.tunnel_id.startswith("tunnel_") or any(c not in "0123456789abcdef" for c in self.tunnel_id[7:]): raise SecureMcpTunnelRuntimeError("CONTROL_PLANE_TUNNEL_ID is invalid")
+        try: require_mcp_tunnel_ingress_token(self.mcp_ingress_token)
+        except McpTunnelIngressError as exc: raise SecureMcpTunnelRuntimeError("MCP tunnel ingress token is invalid") from exc
         for value,name,low,high in ((self.startup_timeout_seconds,"startup_timeout_seconds",1,300),(self.shutdown_timeout_seconds,"shutdown_timeout_seconds",1,120),(self.probe_interval_seconds,"probe_interval_seconds",.02,5),(self.steady_probe_interval_seconds,"steady_probe_interval_seconds",.1,30)):
             if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(float(value)) or not low<=float(value)<=high: raise SecureMcpTunnelRuntimeError(f"{name} is outside bounded authority")
         if isinstance(self.mcp_startup_wait_seconds,bool) or not isinstance(self.mcp_startup_wait_seconds,int) or not 1<=self.mcp_startup_wait_seconds<=120: raise SecureMcpTunnelRuntimeError("mcp_startup_wait_seconds is invalid")
@@ -159,6 +168,7 @@ class SecureMcpTunnelRuntime:
         executable=lexical_absolute(Path(package.executable_path)); launch=build_tunnel_launch_spec(executable,self.config.tunnel_id)
         api_key=TunnelRuntimeApiKeyStore(self.config.secret_storage).load()
         child_env=build_tunnel_child_environment(os.environ,tunnel_id=self.config.tunnel_id,api_key=api_key)
+        child_env=build_mcp_tunnel_ingress_child_environment(child_env,token=self.config.mcp_ingress_token)
         try:
             url_file=self._prepare_handshake()
             argv=launch.argv+("--health.listen-addr",_HEALTH_LISTEN,"--health.url-file",str(url_file),"--mcp.startup-wait-timeout",f"{self.config.mcp_startup_wait_seconds}s")
@@ -183,7 +193,7 @@ class SecureMcpTunnelRuntime:
             except Exception as exc: raise SecureMcpTunnelRuntimeError("tunnel startup failed and shutdown also failed") from exc
             raise
         finally:
-            child_env["CONTROL_PLANE_API_KEY"]=""; api_key=""
+            child_env["CONTROL_PLANE_API_KEY"]=""; child_env[MCP_TUNNEL_INGRESS_TOKEN_ENV]=""; api_key=""
 
     def evidence(self) -> SecureMcpTunnelRuntimeEvidence:
         if not self.ready: raise SecureMcpTunnelRuntimeError("tunnel runtime is not ready")
