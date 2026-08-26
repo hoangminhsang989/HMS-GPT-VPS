@@ -62,4 +62,6 @@ def test_external_launcher_contract_keeps_stage0_handle_open_across_execution() 
     assert "FileShare]::Read" in doc
     assert "keep the stage-0 FileStream open" in doc
     assert "-NoProfile -NonInteractive" in doc
+    assert "$hostExe = [System.IO.Path]::Combine($env:SystemRoot" in doc
+    assert "& $hostExe @childArgs" in doc
     assert "external_preexecution_pin_self_proven=false" in doc

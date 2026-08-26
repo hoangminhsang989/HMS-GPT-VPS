@@ -43,7 +43,9 @@ try {
     $observed = (($sha.ComputeHash($hold) | ForEach-Object { $_.ToString('x2') }) -join '')
   } finally { $sha.Dispose(); $hold.Position = 0 }
   if ($observed -cne $expected) { throw 'external stage-0 SHA-256 mismatch' }
-  & $stage0 -Stage0ExternalSha256 $expected <PINNED-PYTHON/GIT/REVIEWED-COMMIT/TARGET-ARGS>
+  $hostExe = [System.IO.Path]::Combine($env:SystemRoot,'System32\WindowsPowerShell\v1.0\powershell.exe')
+  $childArgs = @('-NoProfile','-NonInteractive','-File',$stage0,'-Stage0ExternalSha256',$expected) + @(<PINNED-PYTHON/GIT/REVIEWED-COMMIT/TARGET-ARGS>)
+  & $hostExe @childArgs
   $code = $LASTEXITCODE
   if ($code -ne 0 -and $code -ne 2) { throw "stage-0 failed: $code" }
   exit $code
@@ -52,7 +54,7 @@ try {
 }
 ```
 
-The placeholder arguments are deployment values and must not contain secrets. Python and Git are absolute-path + SHA-256 authorities passed to stage-0. The target path and Git blob SHA-1 must identify the exact reviewed target entrypoint.
+The parent launcher keeps the verified stage-0 handle open while a child absolute-path System32 PowerShell executes the stage-0 file. The placeholder arguments are deployment values and must not contain secrets. Python and Git are absolute-path + SHA-256 authorities passed to stage-0. The target path and Git blob SHA-1 must identify the exact reviewed target entrypoint.
 
 ## Stage-0 guarantees
 
