@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 import hms_gpt_vps.bridge_service_entrypoint as entry_module
 from hms_gpt_vps.bridge_cli import build_parser
+from hms_gpt_vps.bridge_pairing_surface_runtime import BridgePairingSurfaceRuntime
+from hms_gpt_vps.bridge_production_service_runtime import BridgeProductionServiceRuntime
 from hms_gpt_vps.bridge_service_entrypoint import (
     _default_oauth_verifier_loader,
     build_hms_bridge_runtime_factory,
@@ -51,13 +54,14 @@ def _config(tmp_path: Path) -> BridgeServiceRuntimeConfig:
     )
 
 
-def test_runtime_factory_is_lazy_and_preserves_security_ordering(
+def test_runtime_factory_is_lazy_and_wraps_pairing_surface_after_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
     events: list[str] = []
-    sentinel = object()
+    base_runtime = object.__new__(BridgeProductionServiceRuntime)
+    wrapped_runtime = object.__new__(BridgePairingSurfaceRuntime)
 
     monkeypatch.setattr(
         entry_module,
@@ -67,7 +71,7 @@ def test_runtime_factory_is_lazy_and_preserves_security_ordering(
     monkeypatch.setattr(
         entry_module,
         "build_bridge_production_service_runtime",
-        lambda runtime_config, verifier: events.append("build") or sentinel,
+        lambda runtime_config, verifier: events.append("build") or base_runtime,
     )
 
     def load_config() -> BridgeServiceRuntimeConfig:
@@ -79,14 +83,21 @@ def test_runtime_factory_is_lazy_and_preserves_security_ordering(
         events.append("verifier")
         return _Verifier()
 
+    def wrap(inner: BridgeProductionServiceRuntime, sid: str):
+        assert inner is base_runtime
+        assert sid == _SERVICE_SID
+        events.append("wrap")
+        return wrapped_runtime
+
     factory = build_hms_bridge_runtime_factory(
         _SERVICE_SID,
         config_loader=load_config,
         verifier_loader=load_verifier,
+        runtime_wrapper=wrap,
     )
     assert events == []
-    assert factory() is sentinel
-    assert events == ["identity", "config", "verifier", "build"]
+    assert factory() is wrapped_runtime
+    assert events == ["identity", "config", "verifier", "build", "wrap"]
 
 
 def test_service_entrypoint_passes_lazy_factory_before_config_read(
@@ -113,6 +124,7 @@ def test_service_entrypoint_passes_lazy_factory_before_config_read(
         sid_resolver=lambda: events.append("sid") or _SERVICE_SID,
         config_loader=config_loader,
         verifier_loader=lambda config: _Verifier(),
+        runtime_wrapper=lambda inner, sid: pytest.fail("factory must stay lazy"),
     )
     assert events == ["sid", "host"]
 
@@ -158,9 +170,40 @@ def test_service_sid_resolver_requires_exact_virtual_account_evidence(
     assert resolve_hms_bridge_service_sid() == _SERVICE_SID
 
 
-def test_bridge_cli_has_no_config_override() -> None:
+def test_pairing_link_cli_uses_pid_pinned_ipc_and_prints_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import sys
+    import hms_gpt_vps.bridge_cli as cli_module
+    import hms_gpt_vps.bridge_pairing_link_ipc as ipc_module
+    from hms_gpt_vps.bridge_pairing_link_ipc import PairingLinkIpcResult
+
+    monkeypatch.setattr(
+        ipc_module,
+        "request_pairing_link_from_running_hms_bridge",
+        lambda: PairingLinkIpcResult(
+            "pair-1",
+            "2026-08-26T01:02:03Z",
+            "https://bridge.example.test/pair/pair-1#token=abc",
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["hms-bridge", "pairing-link"])
+    assert cli_module.main() == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "pair_id": "pair-1",
+        "expires_at": "2026-08-26T01:02:03Z",
+        "pairing_link": "https://bridge.example.test/pair/pair-1#token=abc",
+    }
+
+
+def test_bridge_cli_has_no_config_or_pid_override() -> None:
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["service", "--config", "attacker.json"])
-    args = parser.parse_args(["service"])
-    assert args.command == "service"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pairing-link", "--pid", "1234"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pairing-link", "--config", "attacker.json"])
+    assert parser.parse_args(["service"]).command == "service"
+    assert parser.parse_args(["pairing-link"]).command == "pairing-link"
