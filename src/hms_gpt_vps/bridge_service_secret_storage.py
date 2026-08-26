@@ -11,6 +11,7 @@ from .qualification_file_authority import lexical_absolute, path_chain_has_redir
 _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
 _PAIRING_KEY_FILENAME = "pairing-exchange-key.service-machine.dpapi"
+_TUNNEL_API_KEY_FILENAME = "openai-tunnel-runtime-api-key.service-machine.dpapi"
 _CREDENTIALS_DIRNAME = "agent-credentials"
 _CREDENTIAL_SUFFIX = ".service-machine.dpapi"
 _RESULT_KEYS = frozenset(
@@ -71,6 +72,10 @@ class BridgeServiceSecretStorageConfig:
     def pairing_key_path(self) -> Path:
         return self.authority_root / _PAIRING_KEY_FILENAME
 
+    @property
+    def tunnel_api_key_path(self) -> Path:
+        return self.authority_root / _TUNNEL_API_KEY_FILENAME
+
 
 def service_agent_credential_filename(instance_id: str) -> str:
     import hashlib
@@ -105,6 +110,7 @@ def build_bridge_service_secret_storage_script(
     root = ps_literal(str(config.authority_root))
     credentials_dir = ps_literal(str(config.credentials_dir))
     pairing_key = ps_literal(str(config.pairing_key_path))
+    tunnel_api_key = ps_literal(str(config.tunnel_api_key_path))
     reader_sid = ps_literal(config.bridge_reader_sid)
     system_sid = ps_literal(_SYSTEM_SID)
     administrators_sid = ps_literal(_ADMINISTRATORS_SID)
@@ -115,6 +121,7 @@ $ErrorActionPreference = 'Stop'
 $root = [System.IO.Path]::GetFullPath({root})
 $credentialsDir = [System.IO.Path]::GetFullPath({credentials_dir})
 $pairingKey = [System.IO.Path]::GetFullPath({pairing_key})
+$tunnelApiKey = [System.IO.Path]::GetFullPath({tunnel_api_key})
 $readerSidText = {reader_sid}
 $systemSidText = {system_sid}
 $administratorsSidText = {administrators_sid}
@@ -228,8 +235,17 @@ if (Ensure-DirectoryAcl $root) {{ $changed = $true }}
 if (Ensure-DirectoryAcl $credentialsDir) {{ $changed = $true }}
 
 $rootEntries = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)
-$unknown = @($rootEntries | Where-Object {{ $_.Name -ne 'agent-credentials' -and $_.Name -ne 'pairing-exchange-key.service-machine.dpapi' }})
+$unknown = @($rootEntries | Where-Object {{
+  $_.Name -ne 'agent-credentials' -and
+  $_.Name -ne 'pairing-exchange-key.service-machine.dpapi' -and
+  $_.Name -ne 'openai-tunnel-runtime-api-key.service-machine.dpapi'
+}})
 if ($unknown.Count -ne 0) {{ throw 'Bridge service secret root contains unknown entries' }}
+foreach ($reservedSecretPath in @($pairingKey, $tunnelApiKey)) {{
+  if ((Test-Path -LiteralPath $reservedSecretPath) -and -not (Test-Path -LiteralPath $reservedSecretPath -PathType Leaf)) {{
+    throw 'Bridge service reserved secret entry is not a regular file'
+  }}
+}}
 
 $credentialFiles = @(Get-ChildItem -LiteralPath $credentialsDir -Force -ErrorAction Stop)
 foreach ($entry in $credentialFiles) {{
@@ -241,6 +257,8 @@ foreach ($entry in $credentialFiles) {{
 $secretFiles = @()
 $pairingPresent = Test-Path -LiteralPath $pairingKey -PathType Leaf
 if ($pairingPresent) {{ $secretFiles += Get-Item -LiteralPath $pairingKey -Force -ErrorAction Stop }}
+$tunnelApiKeyPresent = Test-Path -LiteralPath $tunnelApiKey -PathType Leaf
+if ($tunnelApiKeyPresent) {{ $secretFiles += Get-Item -LiteralPath $tunnelApiKey -Force -ErrorAction Stop }}
 $secretFiles += $credentialFiles
 foreach ($file in $secretFiles) {{
   Assert-NoReparseChain $file.FullName

@@ -13,11 +13,19 @@ def test_script_has_exact_principals_machine_secret_shape_and_observer_mode(tmp_
     script=module.build_bridge_service_secret_storage_script(c,reconcile=False)
     assert 'S-1-5-18' in script and 'S-1-5-32-544' in script and SID in script
     assert 'pairing-exchange-key.service-machine.dpapi' in script
+    assert 'openai-tunnel-runtime-api-key.service-machine.dpapi' in script
     assert 'agent-credentials' in script
     assert 'Synchronize' in script
     assert '$reconcile = $false' in script
     assert 'unknown entries' in script
     assert 'reparse point' in script
+    assert 'reserved secret entry is not a regular file' in script
+    assert '$tunnelApiKey' in script
+    assert '$secretFiles += Get-Item -LiteralPath $tunnelApiKey' in script
+
+def test_tunnel_api_key_path_is_fixed_inside_service_runtime(tmp_path):
+    c=cfg(tmp_path)
+    assert c.tunnel_api_key_path == c.authority_root/'openai-tunnel-runtime-api-key.service-machine.dpapi'
 
 def test_instance_credential_filename_is_deterministic_and_nonrevealing(tmp_path):
     a=module.service_agent_credential_filename('HMS-000001')
