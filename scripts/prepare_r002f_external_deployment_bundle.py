@@ -25,8 +25,9 @@ from hms_gpt_vps.r002f_external_deployment_bundle_types import PreflightAuthorit
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify reviewed R002F project/Python/Git authorities and publish "
-            "one canonical external deployment bundle create-only."
+            "Verify reviewed R002F project/Python/Git authorities, re-bind the "
+            "project manifest to the exact reviewed Git tree, and publish one "
+            "canonical external deployment bundle create-only."
         )
     )
     add = parser.add_argument
@@ -44,6 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     add("--git-manifest", required=True, type=Path)
     add("--git-runtime-root", required=True, type=Path)
     add("--repo-evidence-root", required=True, type=Path)
+    add("--reviewed-git-executable", required=True, type=Path)
+    add("--reviewed-git-executable-sha256", required=True)
     add("--preflight-proof", required=True, type=Path)
     add("--stage0-proof", required=True, type=Path)
     add("--launcher-proof", required=True, type=Path)
@@ -95,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         git_manifest_path=args.git_manifest,
         git_destination_root=args.git_runtime_root,
         repo_evidence_root=args.repo_evidence_root,
+        reviewed_git_executable=args.reviewed_git_executable,
+        reviewed_git_executable_sha256=args.reviewed_git_executable_sha256,
         preflight_proof_path=args.preflight_proof,
         stage0_proof_path=args.stage0_proof,
         launcher_proof_path=args.launcher_proof,

@@ -68,6 +68,8 @@ def _request() -> R002FExternalDeploymentPreparationRequest:
         git_manifest_path=Path(r"C:\authority\git.manifest.json"),
         git_destination_root=Path(r"C:\authority\git-runtime"),
         repo_evidence_root=Path(r"C:\source\repo-evidence"),
+        reviewed_git_executable=Path(r"C:\toolchain\git.exe"),
+        reviewed_git_executable_sha256=SHA,
         preflight_proof_path=Path(r"C:\authority\preflight.proof.json"),
         stage0_proof_path=Path(r"C:\authority\stage0.proof.json"),
         launcher_proof_path=Path(r"C:\authority\launcher.proof.json"),
@@ -109,6 +111,9 @@ def _runtime_manifest(role: str) -> SealedRuntimeManifest:
 def _install_success_stubs(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(prep, "_require_windows_host", lambda: None)
     monkeypatch.setattr(prep, "_require_reviewed_artifact", lambda *a, **k: b"x")
+    monkeypatch.setattr(
+        prep, "verify_project_manifest_against_reviewed_git_tree", lambda *a, **k: None
+    )
     project = _project_manifest()
     python = _runtime_manifest(ROLE_PYTHON_RUNTIME)
     git = _runtime_manifest(ROLE_GIT_RUNTIME)
@@ -154,6 +159,40 @@ def test_preparation_publishes_canonical_bundle_and_keeps_execution_false(monkey
     assert result.to_dict()["hyperv_mutated"] is False
 
 
+def test_project_manifest_git_rebind_precedes_source_verification(monkeypatch):
+    _install_success_stubs(monkeypatch)
+    calls = []
+
+    def rebind(manifest, **kwargs):
+        calls.append(
+            (
+                "git-tree",
+                manifest.reviewed_commit,
+                str(kwargs["repo_root"]),
+                str(kwargs["git_executable"]),
+                kwargs["git_executable_sha256"],
+            )
+        )
+
+    monkeypatch.setattr(prep, "verify_project_manifest_against_reviewed_git_tree", rebind)
+    monkeypatch.setattr(
+        prep,
+        "verify_sealed_execution_tree",
+        lambda root, manifest: calls.append(("project-source", str(root))),
+    )
+    prepare_r002f_external_deployment_bundle(_request())
+    assert calls == [
+        (
+            "git-tree",
+            COMMIT,
+            r"C:\source\repo-evidence",
+            r"C:\toolchain\git.exe",
+            SHA,
+        ),
+        ("project-source", r"C:\source\project"),
+    ]
+
+
 def test_preparation_verifies_all_three_source_trees_before_publication(monkeypatch):
     _install_success_stubs(monkeypatch)
     calls = []
@@ -169,6 +208,25 @@ def test_preparation_verifies_all_three_source_trees_before_publication(monkeypa
         (ROLE_PYTHON_RUNTIME, r"C:\source\python"),
         (ROLE_GIT_RUNTIME, r"C:\source\git"),
     ]
+
+
+def test_project_manifest_git_tree_mismatch_is_rejected_before_source_or_write(monkeypatch):
+    _, published = _install_success_stubs(monkeypatch)
+    source_calls = []
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Git blob mapping differs")
+
+    monkeypatch.setattr(prep, "verify_project_manifest_against_reviewed_git_tree", fail)
+    monkeypatch.setattr(
+        prep,
+        "verify_sealed_execution_tree",
+        lambda *args: source_calls.append(True),
+    )
+    with pytest.raises(RuntimeError, match="Git blob mapping differs"):
+        prepare_r002f_external_deployment_bundle(_request())
+    assert source_calls == []
+    assert published == {}
 
 
 def test_project_manifest_commit_mismatch_is_rejected_before_write(monkeypatch):

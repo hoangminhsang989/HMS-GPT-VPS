@@ -29,6 +29,9 @@ from .r002f_external_deployment_bundle_types import (
     same,
     windows_absolute,
 )
+from .r002f_reviewed_git_tree_authority import (
+    verify_project_manifest_against_reviewed_git_tree,
+)
 from .r002f_sealed_execution_manifest import (
     MAX_MANIFEST_BYTES as MAX_PROJECT_MANIFEST_BYTES,
     SealedExecutionTreeManifest,
@@ -66,6 +69,8 @@ class R002FExternalDeploymentPreparationRequest:
     git_manifest_path: Path
     git_destination_root: Path
     repo_evidence_root: Path
+    reviewed_git_executable: Path
+    reviewed_git_executable_sha256: str
     preflight_proof_path: Path
     stage0_proof_path: Path
     launcher_proof_path: Path
@@ -94,12 +99,12 @@ class R002FExternalDeploymentPreparationResult:
         }
 
 
-
 def _require_windows_host() -> None:
     if os.name != "nt":
         raise R002FExternalDeploymentPreparationError(
             "R002F deployment bundle preparation is Windows-only"
         )
+
 
 def _absolute(path: Path, label: str) -> Path:
     if not isinstance(path, Path):
@@ -191,7 +196,10 @@ def _validate_bundle_output_path(
         request.stage0_proof_path,
         request.launcher_proof_path,
     )
-    if any(same(str(output), str(_absolute(path, "reserved authority path"))) for path in reserved):
+    if any(
+        same(str(output), str(_absolute(path, "reserved authority path")))
+        for path in reserved
+    ):
         raise R002FExternalDeploymentPreparationError(
             "bundle_path must be distinct from deployment authority paths"
         )
@@ -251,6 +259,11 @@ def prepare_r002f_external_deployment_bundle(
     )
     output = _validate_bundle_output_path(request, authority_parent=authority)
 
+    repo_evidence = _absolute(request.repo_evidence_root, "repo_evidence_root")
+    reviewed_git = _absolute(
+        request.reviewed_git_executable,
+        "reviewed_git_executable",
+    )
     project_source = _absolute(request.project_source_root, "project_source_root")
     project_manifest_path = _absolute(
         request.project_manifest_path, "project_manifest_path"
@@ -262,6 +275,13 @@ def prepare_r002f_external_deployment_bundle(
         raise R002FExternalDeploymentPreparationError(
             "project manifest reviewed_commit differs from requested authority"
         )
+    verify_project_manifest_against_reviewed_git_tree(
+        project_manifest,
+        repo_root=repo_evidence,
+        expected_commit=request.reviewed_commit,
+        git_executable=reviewed_git,
+        git_executable_sha256=request.reviewed_git_executable_sha256,
+    )
     verify_sealed_execution_tree(project_source, project_manifest)
 
     python_source = _absolute(request.python_source_root, "python_source_root")
@@ -293,7 +313,6 @@ def prepare_r002f_external_deployment_bundle(
     git_destination = _absolute(
         request.git_destination_root, "git_destination_root"
     )
-    repo_evidence = _absolute(request.repo_evidence_root, "repo_evidence_root")
     preflight_proof = _absolute(
         request.preflight_proof_path, "preflight_proof_path"
     )
