@@ -49,8 +49,8 @@ function No-Reparse([string]$Path,[string]$Label){
   foreach($part in $full.Substring($root.Length).Split([IO.Path]::DirectorySeparatorChar,[StringSplitOptions]::RemoveEmptyEntries)){
     $current=[IO.Path]::Combine($current,$part)
     if([IO.File]::Exists($current) -or [IO.Directory]::Exists($current)){
-      $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop
-      if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw "$Label traverses reparse point"}
+      $attributes=[IO.File]::GetAttributes($current)
+      if(($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw "$Label traverses reparse point"}
     }
   }
 }
@@ -87,9 +87,30 @@ function Write-Proof([string]$Path,[System.Collections.IDictionary]$Payload){
   $s=[IO.FileStream]::new($full,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
   try{$s.Write($bytes,0,$bytes.Length);$s.Flush($true)}finally{$s.Dispose()}
 }
-function Add-Optional([Collections.Generic.List[string]]$List,[string]$Name,[object]$Value){if($null -ne $Value -and [string]$Value -ne ''){$List.Add($Name);$List.Add([string]$Value)}}
+function Add-Optional([Collections.Generic.List[string]]$List,[string]$Name,[object]$Value){
+  if($null -eq $Value -or [string]$Value -eq ''){return}
+  $text=[string]$Value
+  if($text.StartsWith('-',[StringComparison]::Ordinal)){throw 'optional preflight value must not begin with option prefix'}
+  $List.Add($Name);$List.Add($text)
+}
 
 if([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT){throw 'R002F external sealed launcher is Windows-only'}
+$startupSystem=Full ([Environment]::SystemDirectory)
+if([string]::IsNullOrWhiteSpace($startupSystem) -or -not [IO.Directory]::Exists($startupSystem)){throw 'OS System32 authority unavailable'}
+$startupPowerShellDir=Full ([IO.Path]::Combine($startupSystem,'WindowsPowerShell','v1.0'))
+[Environment]::SetEnvironmentVariable('PATH',([string]::Join([IO.Path]::PathSeparator,@($startupPowerShellDir,$startupSystem))),'Process')
+[Environment]::SetEnvironmentVariable('SystemRoot',[IO.Path]::GetDirectoryName($startupSystem),'Process')
+[Environment]::SetEnvironmentVariable('windir',[IO.Path]::GetDirectoryName($startupSystem),'Process')
+[Environment]::SetEnvironmentVariable('COMSPEC',[IO.Path]::Combine($startupSystem,'cmd.exe'),'Process')
+[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($startupSystem,'WindowsPowerShell','v1.0','Modules'),'Process')
+[Environment]::SetEnvironmentVariable('PATHEXT','.EXE','Process')
+foreach($nameObject in @([Environment]::GetEnvironmentVariables().Keys)){
+  $name=[string]$nameObject
+  if($name.StartsWith('PYTHON',[StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith('GIT_',[StringComparison]::OrdinalIgnoreCase)){
+    [Environment]::SetEnvironmentVariable($name,$null,'Process')
+  }
+}
+[Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE','1','Process')
 $LauncherExternalSha256=Sha256 $LauncherExternalSha256 'launcher external SHA-256'
 $ReviewedCommit=Sha1 $ReviewedCommit 'reviewed commit'
 $ProjectManifestSha256=Sha256 $ProjectManifestSha256 'project manifest SHA-256'

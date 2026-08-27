@@ -21,6 +21,7 @@ def test_launcher_has_no_raw_remaining_arguments_channel() -> None:
     assert "PreflightArgs" not in text
     assert "--execution-root" not in " ".join(line for line in text.splitlines() if "Add-Optional $forward" in line)
     assert "Add-Optional $forward '--external-timeout'" in text
+    assert "optional preflight value must not begin with option prefix" in text
 
 def test_launcher_independently_checks_preflight_type_exactness() -> None:
     text = source()
@@ -61,3 +62,13 @@ def test_launcher_type_exactly_validates_stage0_proof_too() -> None:
     assert "stage0 proof manifest digest differs" in text
     assert "stage0 proof path binding differs" in text
     assert "project_tree_sealed','python_runtime_sealed','git_runtime_sealed','external_preexecution_pin_required" in text
+
+
+def test_launcher_sanitizes_host_search_path_before_any_pinned_child_or_json_parse() -> None:
+    text = source()
+    sanitize = text.index("[Environment]::SetEnvironmentVariable('PSModulePath'")
+    first_pin = text.index("$launcherPin=Open-Pin")
+    first_proof_read = text.index("$p=Read-Proof")
+    assert sanitize < first_pin < first_proof_read
+    assert "Get-Item" not in text
+    assert "[IO.File]::GetAttributes($current)" in text
