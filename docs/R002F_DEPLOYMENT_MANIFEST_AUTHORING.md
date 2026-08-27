@@ -2,44 +2,58 @@
 
 Status: `STAGED_NOT_EXECUTED`.
 
-This tranche supplies the missing authoring boundary for the sealed deployment
-manifests without allowing the authoring process to self-promote runtime bytes
-into external authority.
+This authoring module produces **manifest observations only**. No manifest hash
+printed by the same Python process is allowed to self-promote into external
+deployment authority.
 
-## Reviewed project manifest
+## Project manifest correction
 
-The `project` command accepts separate authorities:
+The legacy `project` command still performs useful defense-in-depth checks:
 
-- `repo_evidence_root`: exact clean Git checkout used only for Git evidence;
-- `project_source_root`: exported project tree without `.git`;
-- reviewed 40-hex commit;
-- absolute reviewed Git executable;
-- externally approved Git executable SHA-256.
+- exact clean checkout checks around Git-tree collection;
+- exact `git ls-tree -r -z --full-tree` parsing;
+- project export namespace/byte verification;
+- Git blob SHA-1 binding for every project file;
+- create-only canonical manifest publication with pinned readback.
 
-The command validates the checkout, derives the exact `git ls-tree -r -z
---full-tree` path/blob mapping through the existing reviewed Git-tree authority,
-re-validates the checkout, builds the project manifest against the separate
-export tree, verifies that tree, then publishes the canonical manifest
-create-only with pinned readback.
+However, fresh review found that this path pins only the reviewed `git.exe` bytes.
+It does **not** independently seal/prove the complete Git DLL/dependency runtime
+closure before executing Git. Therefore the generated project-manifest digest is
+an **observation candidate**, not a root of trust.
 
-The project manifest is therefore rooted in the reviewed Git commit rather than
-in whatever files happen to exist in the export directory.
-
-## Python and Git runtime manifests
-
-The `python-runtime` and `git-runtime` commands deliberately produce
-**observation manifests only**.
-
-They verify the complete source namespace and bytes using the existing
-`SealedRuntimeManifest` builder/verifier and publish canonical create-only
-manifests, but the result always states:
+The project result now always states:
 
 - `external_approval_required=true`
 - `external_approval_self_proven=false`
 
-A later deployment gate must receive the manifest SHA-256 from an independent
-deployment/review authority. Merely generating a runtime manifest and then
-trusting the hash printed by the same process is not sufficient provenance.
+The old classification `external_approval_required=false` is rejected and must
+not be used for production qualification.
+
+## Python and Git runtime manifests
+
+The `python-runtime` and `git-runtime` commands remain observation-only. They
+verify complete source namespace/bytes using `SealedRuntimeManifest` and publish
+canonical create-only manifests, but also always state:
+
+- `external_approval_required=true`
+- `external_approval_self_proven=false`
+
+## Production authority path
+
+For production qualification, use an independent external authority that does
+not execute the unsealed Python/Git preparation toolchain before stage-0. The
+current frozen architecture is:
+
+1. external PowerShell/.NET authority derives/reviews the exact project manifest
+   from GitHub committed object bytes and observes complete Python/Git closures;
+2. an independent review pins the project/Python/Git manifest SHA-256 values;
+3. bundle + rendered-command candidates are produced and independently pinned;
+4. the target-side execution handoff verifies/pins exact approved bytes;
+5. only OS-backed Windows PowerShell starts launcher -> stage-0;
+6. stage-0 creates/seals project/Python/Git roots before sealed Python preflight.
+
+The legacy Python project/Git checks may remain as defense-in-depth evidence, but
+their output cannot by itself satisfy external approval.
 
 ## Commands
 
@@ -67,5 +81,6 @@ python scripts/author_r002f_deployment_manifests.py git-runtime `
   --output <git.manifest.json>
 ```
 
-No command starts Hyper-V, HMSBridge, HMSAgent, the tunnel, or any production
-qualification flow. All live proof booleans remain false.
+All three commands are observation/preparation only. They do not start Hyper-V,
+HMSBridge, HMSAgent, the tunnel, or any production qualification flow. All live
+proof booleans remain false.

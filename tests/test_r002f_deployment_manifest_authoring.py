@@ -119,7 +119,8 @@ def test_project_authoring_uses_reviewed_mapping_before_publish(monkeypatch, tmp
     assert checkout_calls == ["checkout", "checkout"]
     assert events == ["git-tree", "build", "verify", "write"]
     assert result.reviewed_commit == COMMIT
-    assert result.external_approval_required is False
+    assert result.external_approval_required is True
+    assert result.external_approval_self_proven is False
 
 
 @pytest.mark.parametrize("role,entrypoint", [

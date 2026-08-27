@@ -124,7 +124,13 @@ def author_reviewed_project_manifest(
     checkout_validator: Callable[..., None] = require_reviewed_clean_checkout,
     command_runner: Callable[..., object] = subprocess.run,
 ) -> ManifestAuthoringResult:
-    """Create a project manifest only from an independently reviewed Git tree."""
+    """Observe a project-manifest candidate through the legacy Git helper.
+
+    The helper pins only the reviewed ``git.exe`` bytes, not the complete Git
+    dependency/runtime closure. Therefore this function may provide
+    defense-in-depth evidence for a candidate manifest, but it MUST NOT promote
+    the generated digest into external deployment authority by itself.
+    """
 
     expected = canonical_git_sha1(reviewed_commit)
     git_sha = canonical_sha256(
@@ -184,14 +190,14 @@ def author_reviewed_project_manifest(
         output_path.expanduser().absolute(),
         data,
         max_bytes=MAX_PROJECT_MANIFEST_BYTES,
-        label="R002F reviewed project manifest",
+        label="R002F reviewed project manifest observation",
     )
     return ManifestAuthoringResult(
         manifest_path=str(output_path.expanduser().absolute()),
         manifest_sha256=digest,
         manifest_role="reviewed-project",
         reviewed_commit=expected,
-        external_approval_required=False,
+        external_approval_required=True,
         external_approval_self_proven=False,
     )
 
