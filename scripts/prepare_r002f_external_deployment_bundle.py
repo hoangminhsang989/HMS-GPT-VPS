@@ -25,9 +25,10 @@ from hms_gpt_vps.r002f_external_deployment_bundle_types import PreflightAuthorit
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify reviewed R002F project/Python/Git authorities, re-bind the "
-            "project manifest to the exact reviewed Git tree, and publish one "
-            "canonical external deployment bundle create-only."
+            "Verify reviewed R002F project/Python/Git authorities, require "
+            "externally-approved runtime manifest digests, re-bind the project "
+            "manifest to the exact reviewed Git tree, and publish one canonical "
+            "external deployment bundle create-only."
         )
     )
     add = parser.add_argument
@@ -40,9 +41,11 @@ def main(argv: list[str] | None = None) -> int:
     add("--execution-root", required=True, type=Path)
     add("--python-source-root", required=True, type=Path)
     add("--python-manifest", required=True, type=Path)
+    add("--python-manifest-sha256", required=True)
     add("--python-runtime-root", required=True, type=Path)
     add("--git-source-root", required=True, type=Path)
     add("--git-manifest", required=True, type=Path)
+    add("--git-manifest-sha256", required=True)
     add("--git-runtime-root", required=True, type=Path)
     add("--repo-evidence-root", required=True, type=Path)
     add("--reviewed-git-executable", required=True, type=Path)
@@ -93,9 +96,11 @@ def main(argv: list[str] | None = None) -> int:
         project_destination_root=args.execution_root,
         python_source_root=args.python_source_root,
         python_manifest_path=args.python_manifest,
+        python_manifest_sha256=args.python_manifest_sha256,
         python_destination_root=args.python_runtime_root,
         git_source_root=args.git_source_root,
         git_manifest_path=args.git_manifest,
+        git_manifest_sha256=args.git_manifest_sha256,
         git_destination_root=args.git_runtime_root,
         repo_evidence_root=args.repo_evidence_root,
         reviewed_git_executable=args.reviewed_git_executable,

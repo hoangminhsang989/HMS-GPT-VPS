@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -47,37 +48,6 @@ def _preflight() -> PreflightAuthority:
     )
 
 
-def _request() -> R002FExternalDeploymentPreparationRequest:
-    a = Path(r"C:\authority")
-    return R002FExternalDeploymentPreparationRequest(
-        reviewed_commit=COMMIT,
-        authority_parent=a,
-        launcher_path=Path(
-            r"C:\authority\run_r002f_external_sealed_preparation_launcher.ps1"
-        ),
-        stage0_path=Path(
-            r"C:\authority\run_r002f_external_sealed_preparation_stage0.ps1"
-        ),
-        project_source_root=Path(r"C:\source\project"),
-        project_manifest_path=Path(r"C:\authority\project.manifest.json"),
-        project_destination_root=Path(r"C:\authority\execution"),
-        python_source_root=Path(r"C:\source\python"),
-        python_manifest_path=Path(r"C:\authority\python.manifest.json"),
-        python_destination_root=Path(r"C:\authority\python-runtime"),
-        git_source_root=Path(r"C:\source\git"),
-        git_manifest_path=Path(r"C:\authority\git.manifest.json"),
-        git_destination_root=Path(r"C:\authority\git-runtime"),
-        repo_evidence_root=Path(r"C:\source\repo-evidence"),
-        reviewed_git_executable=Path(r"C:\toolchain\git.exe"),
-        reviewed_git_executable_sha256=SHA,
-        preflight_proof_path=Path(r"C:\authority\preflight.proof.json"),
-        stage0_proof_path=Path(r"C:\authority\stage0.proof.json"),
-        launcher_proof_path=Path(r"C:\authority\launcher.proof.json"),
-        bundle_path=Path(r"C:\authority\deployment.bundle.json"),
-        preflight=_preflight(),
-    )
-
-
 def _project_manifest(commit: str = COMMIT) -> SealedExecutionTreeManifest:
     return SealedExecutionTreeManifest(
         reviewed_commit=commit,
@@ -105,6 +75,43 @@ def _runtime_manifest(role: str) -> SealedRuntimeManifest:
         directory_count=0,
         total_size=1,
         files=(SealedRuntimeFile(path=name, size=1, sha256="3" * 64),),
+    )
+
+
+def _runtime_sha(role: str) -> str:
+    return hashlib.sha256(_runtime_manifest(role).to_bytes()).hexdigest()
+
+
+def _request() -> R002FExternalDeploymentPreparationRequest:
+    a = Path(r"C:\authority")
+    return R002FExternalDeploymentPreparationRequest(
+        reviewed_commit=COMMIT,
+        authority_parent=a,
+        launcher_path=Path(
+            r"C:\authority\run_r002f_external_sealed_preparation_launcher.ps1"
+        ),
+        stage0_path=Path(
+            r"C:\authority\run_r002f_external_sealed_preparation_stage0.ps1"
+        ),
+        project_source_root=Path(r"C:\source\project"),
+        project_manifest_path=Path(r"C:\authority\project.manifest.json"),
+        project_destination_root=Path(r"C:\authority\execution"),
+        python_source_root=Path(r"C:\source\python"),
+        python_manifest_path=Path(r"C:\authority\python.manifest.json"),
+        python_manifest_sha256=_runtime_sha(ROLE_PYTHON_RUNTIME),
+        python_destination_root=Path(r"C:\authority\python-runtime"),
+        git_source_root=Path(r"C:\source\git"),
+        git_manifest_path=Path(r"C:\authority\git.manifest.json"),
+        git_manifest_sha256=_runtime_sha(ROLE_GIT_RUNTIME),
+        git_destination_root=Path(r"C:\authority\git-runtime"),
+        repo_evidence_root=Path(r"C:\source\repo-evidence"),
+        reviewed_git_executable=Path(r"C:\toolchain\git.exe"),
+        reviewed_git_executable_sha256=SHA,
+        preflight_proof_path=Path(r"C:\authority\preflight.proof.json"),
+        stage0_proof_path=Path(r"C:\authority\stage0.proof.json"),
+        launcher_proof_path=Path(r"C:\authority\launcher.proof.json"),
+        bundle_path=Path(r"C:\authority\deployment.bundle.json"),
+        preflight=_preflight(),
     )
 
 
@@ -146,7 +153,8 @@ def _install_success_stubs(monkeypatch: pytest.MonkeyPatch):
 
 def test_preparation_publishes_canonical_bundle_and_keeps_execution_false(monkeypatch):
     _, published = _install_success_stubs(monkeypatch)
-    result = prepare_r002f_external_deployment_bundle(_request())
+    request = _request()
+    result = prepare_r002f_external_deployment_bundle(request)
     raw = published[r"C:\authority\deployment.bundle.json"]
     bundle = prep.R002FExternalDeploymentAuthorityBundle.from_bytes(raw)
 
@@ -155,6 +163,8 @@ def test_preparation_publishes_canonical_bundle_and_keeps_execution_false(monkey
     assert bundle.project.manifest_sha256 == prep._sha256_bytes(
         _project_manifest().to_bytes()
     )
+    assert bundle.python_runtime.manifest_sha256 == request.python_manifest_sha256
+    assert bundle.git_runtime.manifest_sha256 == request.git_manifest_sha256
     assert result.to_dict()["execution_started"] is False
     assert result.to_dict()["hyperv_mutated"] is False
 
@@ -237,12 +247,90 @@ def test_project_manifest_commit_mismatch_is_rejected_before_write(monkeypatch):
     assert published == {}
 
 
+def test_python_runtime_manifest_external_hash_mismatch_blocks_before_runtime_verify_or_write(monkeypatch):
+    _, published = _install_success_stubs(monkeypatch)
+    runtime_calls = []
+    monkeypatch.setattr(
+        prep, "verify_sealed_runtime_tree", lambda *args: runtime_calls.append(True)
+    )
+    request = _request()
+    request = R002FExternalDeploymentPreparationRequest(
+        **{**request.__dict__, "python_manifest_sha256": "0" * 64}
+    )
+    with pytest.raises(
+        R002FExternalDeploymentPreparationError,
+        match="Python runtime manifest SHA-256 differs from external authority",
+    ):
+        prepare_r002f_external_deployment_bundle(request)
+    assert runtime_calls == []
+    assert published == {}
+
+
+def test_git_runtime_manifest_external_hash_mismatch_blocks_before_git_verify_or_write(monkeypatch):
+    _, published = _install_success_stubs(monkeypatch)
+    runtime_calls = []
+    monkeypatch.setattr(
+        prep,
+        "verify_sealed_runtime_tree",
+        lambda root, manifest: runtime_calls.append(manifest.runtime_role),
+    )
+    request = _request()
+    request = R002FExternalDeploymentPreparationRequest(
+        **{**request.__dict__, "git_manifest_sha256": "0" * 64}
+    )
+    with pytest.raises(
+        R002FExternalDeploymentPreparationError,
+        match="Git runtime manifest SHA-256 differs from external authority",
+    ):
+        prepare_r002f_external_deployment_bundle(request)
+    assert runtime_calls == [ROLE_PYTHON_RUNTIME]
+    assert published == {}
+
+
+def test_runtime_manifest_path_replacement_after_pinned_read_cannot_change_bundle_digest(monkeypatch):
+    payloads, published = _install_success_stubs(monkeypatch)
+    original_python = payloads[r"C:\authority\python.manifest.json"]
+    approved = hashlib.sha256(original_python).hexdigest()
+
+    def verify(root, manifest):
+        if manifest.runtime_role == ROLE_PYTHON_RUNTIME:
+            payloads[r"C:\authority\python.manifest.json"] = b"replacement"
+
+    monkeypatch.setattr(prep, "verify_sealed_runtime_tree", verify)
+    result = prepare_r002f_external_deployment_bundle(_request())
+    bundle = prep.R002FExternalDeploymentAuthorityBundle.from_bytes(
+        published[r"C:\authority\deployment.bundle.json"]
+    )
+    assert result.bundle_sha256 == bundle.sha256
+    assert bundle.python_runtime.manifest_sha256 == approved
+    assert payloads[r"C:\authority\python.manifest.json"] == b"replacement"
+
+
 def test_swapped_runtime_role_is_rejected(monkeypatch):
     payloads, published = _install_success_stubs(monkeypatch)
-    payloads[r"C:\authority\python.manifest.json"] = _runtime_manifest(
-        ROLE_GIT_RUNTIME
-    ).to_bytes()
+    wrong = _runtime_manifest(ROLE_GIT_RUNTIME).to_bytes()
+    payloads[r"C:\authority\python.manifest.json"] = wrong
+    request = _request()
+    request = R002FExternalDeploymentPreparationRequest(
+        **{
+            **request.__dict__,
+            "python_manifest_sha256": hashlib.sha256(wrong).hexdigest(),
+        }
+    )
     with pytest.raises(R002FExternalDeploymentPreparationError, match="runtime role differs"):
+        prepare_r002f_external_deployment_bundle(request)
+    assert published == {}
+
+
+def test_external_hash_correct_but_runtime_source_drift_blocks_bundle_write(monkeypatch):
+    _, published = _install_success_stubs(monkeypatch)
+
+    def fail(root, manifest):
+        if manifest.runtime_role == ROLE_PYTHON_RUNTIME:
+            raise RuntimeError("runtime source drift")
+
+    monkeypatch.setattr(prep, "verify_sealed_runtime_tree", fail)
+    with pytest.raises(RuntimeError, match="runtime source drift"):
         prepare_r002f_external_deployment_bundle(_request())
     assert published == {}
 
@@ -253,6 +341,26 @@ def test_noncanonical_manifest_bytes_are_rejected(monkeypatch):
     payloads[r"C:\authority\project.manifest.json"] = canonical[:-1] + b" \n"
     with pytest.raises(R002FExternalDeploymentPreparationError, match="canonical"):
         prepare_r002f_external_deployment_bundle(_request())
+    assert published == {}
+
+
+def test_noncanonical_runtime_external_sha_is_rejected_before_runtime_manifest_read(monkeypatch):
+    payloads, published = _install_success_stubs(monkeypatch)
+    reads = []
+    original_read = prep.read_file_pinned
+
+    def read(path, **kwargs):
+        reads.append(str(path))
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(prep, "read_file_pinned", read)
+    request = _request()
+    request = R002FExternalDeploymentPreparationRequest(
+        **{**request.__dict__, "python_manifest_sha256": "B" * 64}
+    )
+    with pytest.raises(Exception, match="SHA-256"):
+        prepare_r002f_external_deployment_bundle(request)
+    assert r"C:\authority\python.manifest.json" not in reads
     assert published == {}
 
 

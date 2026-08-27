@@ -32,6 +32,7 @@ from .r002f_external_deployment_bundle_types import (
 from .r002f_reviewed_git_tree_authority import (
     verify_project_manifest_against_reviewed_git_tree,
 )
+from .r002f_reviewed_toolchain_authority import canonical_sha256
 from .r002f_sealed_execution_manifest import (
     MAX_MANIFEST_BYTES as MAX_PROJECT_MANIFEST_BYTES,
     SealedExecutionTreeManifest,
@@ -64,9 +65,11 @@ class R002FExternalDeploymentPreparationRequest:
     project_destination_root: Path
     python_source_root: Path
     python_manifest_path: Path
+    python_manifest_sha256: str
     python_destination_root: Path
     git_source_root: Path
     git_manifest_path: Path
+    git_manifest_sha256: str
     git_destination_root: Path
     repo_evidence_root: Path
     reviewed_git_executable: Path
@@ -136,13 +139,22 @@ def _read_canonical_runtime_manifest(
     path: Path,
     *,
     expected_role: str,
+    expected_sha256: str,
     label: str,
-) -> tuple[SealedRuntimeManifest, bytes]:
+) -> tuple[SealedRuntimeManifest, bytes, str]:
+    approved_sha256 = canonical_sha256(
+        expected_sha256,
+        f"{label} external SHA-256",
+    )
     data = read_file_pinned(
         path,
         max_bytes=MAX_RUNTIME_MANIFEST_BYTES,
         label=label,
     )
+    if _sha256_bytes(data) != approved_sha256:
+        raise R002FExternalDeploymentPreparationError(
+            f"{label} SHA-256 differs from external authority"
+        )
     manifest = SealedRuntimeManifest.from_bytes(data)
     if manifest.to_bytes() != data:
         raise R002FExternalDeploymentPreparationError(
@@ -152,7 +164,7 @@ def _read_canonical_runtime_manifest(
         raise R002FExternalDeploymentPreparationError(
             f"{label} runtime role differs"
         )
-    return manifest, data
+    return manifest, data, approved_sha256
 
 
 def _require_reviewed_artifact(
@@ -288,18 +300,22 @@ def prepare_r002f_external_deployment_bundle(
     python_manifest_path = _absolute(
         request.python_manifest_path, "python_manifest_path"
     )
-    python_manifest, python_bytes = _read_canonical_runtime_manifest(
-        python_manifest_path,
-        expected_role=ROLE_PYTHON_RUNTIME,
-        label="R002F Python runtime manifest",
+    python_manifest, python_bytes, python_manifest_sha256 = (
+        _read_canonical_runtime_manifest(
+            python_manifest_path,
+            expected_role=ROLE_PYTHON_RUNTIME,
+            expected_sha256=request.python_manifest_sha256,
+            label="R002F Python runtime manifest",
+        )
     )
     verify_sealed_runtime_tree(python_source, python_manifest)
 
     git_source = _absolute(request.git_source_root, "git_source_root")
     git_manifest_path = _absolute(request.git_manifest_path, "git_manifest_path")
-    git_manifest, git_bytes = _read_canonical_runtime_manifest(
+    git_manifest, git_bytes, git_manifest_sha256 = _read_canonical_runtime_manifest(
         git_manifest_path,
         expected_role=ROLE_GIT_RUNTIME,
+        expected_sha256=request.git_manifest_sha256,
         label="R002F Git runtime manifest",
     )
     verify_sealed_runtime_tree(git_source, git_manifest)
@@ -337,13 +353,13 @@ def prepare_r002f_external_deployment_bundle(
         python_runtime=SealedTreeAuthority(
             source_root=str(python_source),
             manifest_path=str(python_manifest_path),
-            manifest_sha256=_sha256_bytes(python_bytes),
+            manifest_sha256=python_manifest_sha256,
             destination_root=str(python_destination),
         ),
         git_runtime=SealedTreeAuthority(
             source_root=str(git_source),
             manifest_path=str(git_manifest_path),
-            manifest_sha256=_sha256_bytes(git_bytes),
+            manifest_sha256=git_manifest_sha256,
             destination_root=str(git_destination),
         ),
         repo_evidence_root=str(repo_evidence),
